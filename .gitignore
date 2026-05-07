@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Xcode
+*.xcodeproj/
+!*.xcodeproj/project.xcworkspace/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+DerivedData/
+build/
+.build/
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.resolved
+
+# Generated
+*.pbxproj.bak
+
+# Editor
+.vscode/
+.idea/
+
+# Secrets
+*.env
+.env.local
+secrets.json
+
+# Logs
+*.log

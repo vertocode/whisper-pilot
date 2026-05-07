@@ -1,0 +1,58 @@
+name: WhisperPilot
+options:
+  bundleIdPrefix: com.whisperpilot
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  WhisperPilot:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/WhisperPilot
+    resources:
+      - path: Resources/Assets.xcassets
+        optional: true
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleName: Whisper Pilot
+        CFBundleDisplayName: Whisper Pilot
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSApplicationCategoryType: public.app-category.productivity
+        LSUIElement: true
+        NSMicrophoneUsageDescription: "Whisper Pilot listens to your microphone so you can include your own voice in the conversation transcript. You can disable this in Settings."
+        NSSpeechRecognitionUsageDescription: "Whisper Pilot transcribes meetings on-device so it can help you respond in realtime."
+        NSScreenCaptureUsageDescription: "Whisper Pilot captures system audio (not video) from your meetings so it can hear what others are saying."
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+        NSHumanReadableCopyright: "Whisper Pilot is open source under the MIT license."
+    entitlements:
+      path: Resources/WhisperPilot.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.device.audio-input: true
+        com.apple.security.device.microphone: true
+        com.apple.security.network.client: true
+        com.apple.security.files.user-selected.read-write: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.whisperpilot.app
+        PRODUCT_NAME: WhisperPilot
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        COMBINE_HIDPI_IMAGES: YES
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
