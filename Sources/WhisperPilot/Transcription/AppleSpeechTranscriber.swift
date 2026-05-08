@@ -84,6 +84,9 @@ private final class ChannelPipe {
     private var segmentId = UUID()
     private var buffersAppended: Int = 0
     private var transcriptsEmitted: Int = 0
+    private var restartCount: Int = 0
+    private var isFinished: Bool = false
+    private let mutex = NSLock()
 
     init(channel: AudioChannel, locale: Locale, sink: AsyncStream<TranscriptUpdate>.Continuation, log: Logger) throws {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
@@ -111,14 +114,19 @@ private final class ChannelPipe {
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
-        request.append(buffer)
+        mutex.lock()
+        let currentRequest = request
+        let finished = isFinished
+        mutex.unlock()
+        guard !finished else { return }
+        currentRequest.append(buffer)
         buffersAppended += 1
         if buffersAppended == 1 {
             let rms = computeRMS(buffer)
             wpInfo("Transcriber.\(channel) FIRST buffer (frames=\(buffer.frameLength), rms=\(String(format: "%.5f", rms)))")
         } else if buffersAppended % 100 == 0 {
             let rms = computeRMS(buffer)
-            wpInfo("Transcriber.\(channel) appended=\(buffersAppended) emitted=\(transcriptsEmitted) rms=\(String(format: "%.5f", rms))")
+            wpInfo("Transcriber.\(channel) appended=\(buffersAppended) emitted=\(transcriptsEmitted) rms=\(String(format: "%.5f", rms)) restarts=\(restartCount)")
         }
     }
 
@@ -133,10 +141,15 @@ private final class ChannelPipe {
     }
 
     func finish() {
-        request.endAudio()
-        task?.cancel()
+        mutex.lock()
+        isFinished = true
+        let oldRequest = request
+        let oldTask = task
         task = nil
-        log.info("[\(String(describing: self.channel), privacy: .public)] ChannelPipe finished. Appended=\(self.buffersAppended), emitted=\(self.transcriptsEmitted)")
+        mutex.unlock()
+        oldRequest.endAudio()
+        oldTask?.cancel()
+        log.info("[\(String(describing: self.channel), privacy: .public)] ChannelPipe finished. Appended=\(self.buffersAppended), emitted=\(self.transcriptsEmitted), restarts=\(self.restartCount)")
     }
 
     private func startTask() {
@@ -166,11 +179,31 @@ private final class ChannelPipe {
                 }
             }
             if let error {
-                wpError("Transcriber.\(channel) recognition error: \(error.localizedDescription)")
+                wpError("Transcriber.\(channel) recognition error: \(error.localizedDescription) — restarting recognizer")
                 segmentId = UUID()
+                self.restartIfNeeded()
             }
         }
-        wpInfo("Transcriber.\(channel) recognitionTask started")
+        wpInfo("Transcriber.\(channel) recognitionTask started (restart#\(restartCount))")
+    }
+
+    /// `SFSpeechRecognitionTask` enters a terminal state after errors like "No speech
+    /// detected" — every subsequent `request.append(buffer:)` is silently ignored.
+    /// Recovery is to drop the request, build a fresh one, and start a new task. Called
+    /// from the recognition callback (background queue), so we serialize via `mutex`.
+    private func restartIfNeeded() {
+        mutex.lock()
+        guard !isFinished else { mutex.unlock(); return }
+        restartCount += 1
+        let next = SFSpeechAudioBufferRecognitionRequest()
+        next.shouldReportPartialResults = true
+        next.requiresOnDeviceRecognition = false
+        next.taskHint = .dictation
+        request = next
+        task?.cancel()
+        task = nil
+        mutex.unlock()
+        startTask()
     }
 }
 

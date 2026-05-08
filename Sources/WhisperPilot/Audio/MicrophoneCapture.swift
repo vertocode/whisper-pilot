@@ -76,12 +76,46 @@ final class MicrophoneCapture {
             return
         }
         framesEmitted += 1
-        if framesEmitted == 1 {
-            print("[WP][Microphone] FIRST frame emitted")
-        } else if framesEmitted % 200 == 0 {
-            print("[WP][Microphone] frames emitted: \(framesEmitted)")
+        if framesEmitted < 5 || framesEmitted % 200 == 0 {
+            let inRMS = Self.computeRMSAny(buffer)
+            let outRMS = Self.computeRMSAny(output)
+            wpInfo("Microphone frame#\(framesEmitted) inFrames=\(buffer.frameLength) outFrames=\(output.frameLength) inRMS=\(String(format: "%.5f", inRMS)) outRMS=\(String(format: "%.5f", outRMS))")
         }
         continuation.yield(AudioFrame(buffer: output, channel: .microphone, timestamp: Date()))
+    }
+
+    private static func computeRMSAny(_ buffer: AVAudioPCMBuffer) -> Float {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return 0 }
+        if let floatChannelData = buffer.floatChannelData {
+            let channels = Int(buffer.format.channelCount)
+            var sum: Float = 0
+            var count = 0
+            for c in 0..<channels {
+                let ptr = floatChannelData[c]
+                for i in 0..<frames {
+                    let s = ptr[i]
+                    sum += s * s
+                    count += 1
+                }
+            }
+            return count > 0 ? (sum / Float(count)).squareRoot() : 0
+        }
+        if let int16ChannelData = buffer.int16ChannelData {
+            let channels = Int(buffer.format.channelCount)
+            var sum: Double = 0
+            var count = 0
+            for c in 0..<channels {
+                let ptr = int16ChannelData[c]
+                for i in 0..<frames {
+                    let s = Double(ptr[i]) / 32768.0
+                    sum += s * s
+                    count += 1
+                }
+            }
+            return count > 0 ? Float((sum / Double(count)).squareRoot()) : 0
+        }
+        return 0
     }
 }
 
