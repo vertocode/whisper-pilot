@@ -2,6 +2,15 @@ import AppKit
 import Combine
 import SwiftUI
 
+/// Closures the overlay invokes on the coordinator. Passed in at construction time so the
+/// SwiftUI overlay never directly imports the coordinator.
+@MainActor
+struct OverlayActions {
+    var toggleListening: () -> Void
+    var openSettings: () -> Void
+    var hideOverlay: () -> Void
+}
+
 /// Translucent floating panel. Borderless so we don't have traffic lights or an empty
 /// title-bar strip; the SwiftUI content provides its own controls and is draggable via
 /// the window background.

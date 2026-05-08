@@ -1,5 +1,18 @@
 import AppKit
 
+/// Convenience for opening the SwiftUI `Settings` scene from anywhere on the main actor.
+@MainActor
+enum SettingsLauncher {
+    static func open() {
+        NSApp.activate(ignoringOtherApps: true)
+        if #available(macOS 14, *) {
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        } else {
+            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        }
+    }
+}
+
 @MainActor
 final class MenuBarController {
     private let coordinator: AppCoordinator
