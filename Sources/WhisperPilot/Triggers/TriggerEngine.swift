@@ -97,6 +97,7 @@ actor TriggerEngine {
             firedAt: now
         )
         triggerLog.info("🔔 FIRE: \"\(candidate.text, privacy: .public)\" (score=\(event.score, privacy: .public))")
+        print("[WP][Trigger] 🔔 FIRE: \"\(candidate.text)\" (score=\(event.score))")
         continuation.yield(event)
     }
 

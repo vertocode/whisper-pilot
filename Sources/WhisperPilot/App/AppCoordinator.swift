@@ -71,39 +71,40 @@ final class AppCoordinator {
     // MARK: - Lifecycle
 
     func startListening() async {
-        guard !isRunning else { log.info("startListening: already running"); return }
-        log.info("▶ startListening")
+        guard !isRunning else {
+            print("[WP][Coordinator] startListening: already running, skipping")
+            return
+        }
+        print("[WP][Coordinator] ▶ startListening")
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
-        // Probe Screen Recording via the actual ScreenCaptureKit API (the legacy
-        // `CGPreflightScreenCaptureAccess` caches at process launch and can stay stuck on
-        // "denied").
         do {
             _ = try await SCShareableContent.current
             permissions.markScreenRecordingGranted()
             overlayState.permissionStatus = permissions.snapshot
-            log.info("✓ Screen Recording probe passed")
+            print("[WP][Coordinator] ✓ Screen Recording probe passed")
         } catch {
-            log.error("✘ Screen Recording probe failed: \(String(describing: error), privacy: .public)")
+            print("[WP][Coordinator] ✘ Screen Recording probe failed: \(error.localizedDescription)")
             overlayState.status = .needsPermission(.screenRecording)
             await permissions.requestScreenRecording()
             return
         }
 
         if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
-            log.info("Microphone capture requested but not authorized; prompting")
+            print("[WP][Coordinator] microphone requested, not authorized — prompting")
             overlayState.status = .needsPermission(.microphone)
             await permissions.requestMicrophone()
             return
         }
 
         guard let key = settings.geminiAPIKey, !key.isEmpty else {
-            log.error("✘ No Gemini API key configured")
+            print("[WP][Coordinator] ✘ no Gemini API key")
             overlayState.status = .needsAPIKey
             return
         }
 
+        print("[WP][Coordinator] all gates passed, starting modules")
         let transcriber = AppleSpeechTranscriber(locale: settings.locale)
         let ai = GeminiProvider(apiKey: key, model: settings.geminiModel)
         self.transcriber = transcriber
@@ -111,14 +112,17 @@ final class AppCoordinator {
 
         do {
             try await transcriber.start()
+            print("[WP][Coordinator] transcriber.start OK")
             try await systemCapture.start()
+            print("[WP][Coordinator] systemCapture.start OK")
             if settings.captureMicrophone {
                 try await micCapture.start()
+                print("[WP][Coordinator] micCapture.start OK")
             } else {
-                log.info("Microphone capture disabled in settings")
+                print("[WP][Coordinator] microphone capture disabled in settings")
             }
         } catch {
-            log.error("✘ Pipeline start failed: \(String(describing: error), privacy: .public)")
+            print("[WP][Coordinator] ✘ Pipeline start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             return
         }
@@ -127,7 +131,7 @@ final class AppCoordinator {
 
         isRunning = true
         overlayState.status = .listening
-        log.info("✓ Listening")
+        print("[WP][Coordinator] ✓ Listening")
     }
 
     func stopListening() async {
@@ -160,7 +164,6 @@ final class AppCoordinator {
         let buffer = transcriptBuffer
         let context = context
         let engine = triggerEngine
-        let log = log
 
         let systemStream = systemCapture.frames
         let micStream = micCapture.frames
@@ -174,16 +177,18 @@ final class AppCoordinator {
             for await frame in mixer.output {
                 framesProcessed += 1
                 if framesProcessed == 1 {
-                    log.info("Pipeline: first mixer frame received (channel=\(String(describing: frame.channel), privacy: .public))")
+                    print("[WP][Pipeline] FIRST mixer frame received (channel=\(frame.channel))")
+                } else if framesProcessed % 200 == 0 {
+                    print("[WP][Pipeline] mixer frames forwarded: \(framesProcessed)")
                 }
                 let event = await vad.feed(frame)
                 transcriber.feed(frame.buffer, channel: frame.channel)
                 if let event {
-                    log.info("VAD event: \(String(describing: event), privacy: .public)")
+                    print("[WP][VAD] \(event)")
                     await self?.handleVADEvent(event)
                 }
             }
-            log.info("Pipeline: mixer stream ended after \(framesProcessed) frames")
+            print("[WP][Pipeline] mixer stream ended after \(framesProcessed) frames")
         })
 
         consumerTasks.append(Task { [weak self] in

@@ -28,12 +28,14 @@ final class SystemAudioCapture: NSObject {
 
     func start() async throws {
         log.info("Starting system audio capture…")
+        print("[WP][SystemAudio] start() begin")
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
             log.error("No display available for capture")
             throw SystemAudioError.noDisplay
         }
         log.info("Using display \(display.displayID, privacy: .public) (\(display.width)x\(display.height))")
+        print("[WP][SystemAudio] using display \(display.displayID) \(display.width)x\(display.height)")
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let config = SCStreamConfiguration()
@@ -56,6 +58,7 @@ final class SystemAudioCapture: NSObject {
         try await stream.startCapture()
         self.stream = stream
         log.info("✓ System audio capture started; awaiting frames")
+        print("[WP][SystemAudio] startCapture returned; awaiting frames")
     }
 
     func stop() async {
@@ -87,8 +90,9 @@ extension SystemAudioCapture: SCStreamOutput {
         framesEmitted += 1
         if framesEmitted == 1 {
             log.info("First system audio frame received (sampleRate=\(pcm.format.sampleRate), channels=\(pcm.format.channelCount), frameLength=\(pcm.frameLength))")
+            print("[WP][SystemAudio] FIRST frame received sampleRate=\(pcm.format.sampleRate) frames=\(pcm.frameLength)")
         } else if framesEmitted % 200 == 0 {
-            log.debug("System audio frames emitted: \(self.framesEmitted, privacy: .public)")
+            print("[WP][SystemAudio] frames emitted: \(framesEmitted)")
         }
         continuation.yield(frame)
     }

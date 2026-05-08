@@ -38,6 +38,7 @@ final class MicrophoneCapture {
 
         try engine.start()
         log.info("✓ Microphone capture started at \(inputFormat.sampleRate, privacy: .public) Hz, \(inputFormat.channelCount, privacy: .public) ch")
+        print("[WP][Microphone] started @ \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch")
     }
 
     func stop() async {
@@ -76,9 +77,9 @@ final class MicrophoneCapture {
         }
         framesEmitted += 1
         if framesEmitted == 1 {
-            log.info("First microphone frame emitted")
+            print("[WP][Microphone] FIRST frame emitted")
         } else if framesEmitted % 200 == 0 {
-            log.debug("Microphone frames emitted: \(self.framesEmitted, privacy: .public)")
+            print("[WP][Microphone] frames emitted: \(framesEmitted)")
         }
         continuation.yield(AudioFrame(buffer: output, channel: .microphone, timestamp: Date()))
     }

@@ -25,12 +25,13 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
     }
 
     func start() async throws {
+        print("[WP][Transcriber] start() begin (locale=\(locale.identifier))")
         log.info("Starting transcriber for locale=\(self.locale.identifier, privacy: .public)…")
         try await ensureAuthorization()
-        log.info("✓ Speech recognition authorized")
+        print("[WP][Transcriber] auth ok")
         systemPipe = try ChannelPipe(channel: .system, locale: locale, sink: continuation, log: log)
         micPipe = try ChannelPipe(channel: .microphone, locale: locale, sink: continuation, log: log)
-        log.info("✓ Both channel pipes started")
+        print("[WP][Transcriber] both channel pipes ready")
     }
 
     func stop() {
@@ -110,9 +111,9 @@ private final class ChannelPipe {
         request.append(buffer)
         buffersAppended += 1
         if buffersAppended == 1 {
-            log.info("[\(String(describing: self.channel), privacy: .public)] First buffer appended to recognizer")
+            print("[WP][Transcriber.\(channel)] FIRST buffer appended")
         } else if buffersAppended % 200 == 0 {
-            log.debug("[\(String(describing: self.channel), privacy: .public)] Buffers appended: \(self.buffersAppended, privacy: .public), transcripts emitted: \(self.transcriptsEmitted, privacy: .public)")
+            print("[WP][Transcriber.\(channel)] appended=\(buffersAppended) emitted=\(transcriptsEmitted)")
         }
     }
 
@@ -137,15 +138,15 @@ private final class ChannelPipe {
                 sink.yield(update)
                 transcriptsEmitted += 1
                 if transcriptsEmitted == 1 {
-                    log.info("[\(String(describing: self.channel), privacy: .public)] First transcript: \"\(update.text, privacy: .public)\" final=\(update.isFinal)")
+                    print("[WP][Transcriber.\(channel)] FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
                 }
                 if result.isFinal {
-                    log.info("[\(String(describing: self.channel), privacy: .public)] Final segment: \"\(update.text, privacy: .public)\"")
+                    print("[WP][Transcriber.\(channel)] FINAL: \"\(update.text)\"")
                     segmentId = UUID()
                 }
             }
             if let error {
-                log.error("[\(String(describing: self.channel), privacy: .public)] Recognition error: \(String(describing: error), privacy: .public)")
+                print("[WP][Transcriber.\(channel)] error: \(error.localizedDescription)")
                 segmentId = UUID()
             }
         }
