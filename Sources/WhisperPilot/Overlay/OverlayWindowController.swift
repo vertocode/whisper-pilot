@@ -11,9 +11,10 @@ struct OverlayActions {
     var hideOverlay: () -> Void
 }
 
-/// Translucent floating panel. Borderless so we don't have traffic lights or an empty
-/// title-bar strip; the SwiftUI content provides its own controls and is draggable via
-/// the window background.
+/// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers
+/// like BetterSnapTool, Rectangle, and macOS's own snap-to-edge can manage and resize it.
+/// The chrome is hidden (transparent title bar, all traffic lights hidden) so it still looks
+/// like a borderless overlay, but the OS treats it as a first-class window.
 @MainActor
 final class OverlayWindowController: NSWindowController {
     private let state: OverlayState
@@ -24,29 +25,32 @@ final class OverlayWindowController: NSWindowController {
         self.state = state
         self.settings = settings
 
-        let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 360),
-            styleMask: [.borderless, .nonactivatingPanel, .resizable],
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 380),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        panel.isMovableByWindowBackground = true
-        panel.isFloatingPanel = true
-        panel.becomesKeyOnlyIfNeeded = true
-        panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = true
-        panel.appearance = NSAppearance(named: .vibrantDark)
+        window.title = "Whisper Pilot"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.minSize = NSSize(width: 320, height: 220)
 
         let host = NSHostingView(rootView: OverlayView(state: state, actions: actions))
         host.translatesAutoresizingMaskIntoConstraints = false
-        panel.contentView = host
+        window.contentView = host
 
-        super.init(window: panel)
+        super.init(window: window)
 
-        positionInTopRight(panel)
+        positionInTopRight(window)
         applyAlwaysOnTop(settings.alwaysOnTop)
         applyClickThrough(settings.clickThrough)
 
@@ -70,19 +74,22 @@ final class OverlayWindowController: NSWindowController {
         }
     }
 
-    private func positionInTopRight(_ panel: NSPanel) {
+    private func positionInTopRight(_ window: NSWindow) {
         guard let screen = NSScreen.main else { return }
         let visible = screen.visibleFrame
-        let size = panel.frame.size
+        let size = window.frame.size
         let origin = NSPoint(
             x: visible.maxX - size.width - 24,
             y: visible.maxY - size.height - 24
         )
-        panel.setFrameOrigin(origin)
+        window.setFrameOrigin(origin)
     }
 
     private func applyAlwaysOnTop(_ on: Bool) {
-        window?.level = on ? .statusBar : .floating
+        // We use `.floating` (3) rather than `.statusBar` (25) so the Settings window at
+        // `.popUpMenu` still wins z-order, AND so window managers like BetterSnapTool can
+        // still manipulate the window (they often refuse to touch windows above .modalPanel).
+        window?.level = on ? .floating : .normal
     }
 
     private func applyClickThrough(_ on: Bool) {

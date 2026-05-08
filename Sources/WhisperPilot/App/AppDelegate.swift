@@ -11,15 +11,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        print("[WP] applicationDidFinishLaunching")
 
         let actions = OverlayActions(
             toggleListening: { [weak self] in
+                print("[WP] action.toggleListening fired")
                 Task { await self?.coordinator.toggleListening() }
             },
             openSettings: { [weak self] in
+                print("[WP] action.openSettings fired")
                 self?.showSettings()
             },
             hideOverlay: { [weak self] in
+                print("[WP] action.hideOverlay fired")
                 self?.overlay?.window?.orderOut(nil)
             }
         )
