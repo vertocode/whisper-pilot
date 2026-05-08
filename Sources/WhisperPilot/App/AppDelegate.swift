@@ -56,10 +56,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.title = "Whisper Pilot Settings"
             window.isReleasedWhenClosed = false
             window.center()
+            // The overlay panel runs at `.statusBar` level (25) when Always-on-Top is on,
+            // so a default-level Settings window (.normal = 0) opens *underneath* the
+            // overlay and looks like nothing happened. We pin Settings above the overlay.
+            window.level = .popUpMenu
             window.contentView = NSHostingView(rootView: SettingsView(store: coordinator.settings))
             settingsWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+        settingsWindow?.orderFrontRegardless()
     }
 }
