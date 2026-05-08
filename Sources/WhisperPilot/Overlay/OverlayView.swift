@@ -51,6 +51,14 @@ struct OverlayView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
+            Button(action: actions.goToSessions) {
+                Image(systemName: "chevron.left.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Back to Sessions (stops listening)")
+
             BrandLogo()
                 .frame(width: 18, height: 18)
 
@@ -179,7 +187,8 @@ struct OverlayView: View {
                     ChatLane(
                         messages: state.messages,
                         isAIPaused: state.isAIPaused,
-                        onToggleAI: actions.toggleAIPaused
+                        onToggleAI: actions.toggleAIPaused,
+                        onDismissMessage: actions.dismissMessage
                     )
                     .id("chat")
 
@@ -369,6 +378,7 @@ private struct ChatLane: View {
     let messages: [ChatMessage]
     let isAIPaused: Bool
     let onToggleAI: () -> Void
+    let onDismissMessage: (UUID) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -390,7 +400,7 @@ private struct ChatLane: View {
                     .padding(.vertical, 4)
             } else {
                 ForEach(messages) { message in
-                    MessageBubble(message: message)
+                    MessageBubble(message: message, onDismiss: { onDismissMessage(message.id) })
                         .id(message.id)
                 }
             }
@@ -438,6 +448,7 @@ private struct AIToggleButton: View {
 
 private struct MessageBubble: View {
     let message: ChatMessage
+    var onDismiss: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -457,6 +468,17 @@ private struct MessageBubble: View {
                     TypingIndicator()
                 }
                 Spacer()
+                // System notes are informational — the user should be able to clear them
+                // when they've read them. Other roles persist (chat history is meaningful).
+                if message.role == .system, let onDismiss {
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
+                }
             }
             Text(message.text.isEmpty ? "…" : message.text)
                 .font(.system(size: 12))

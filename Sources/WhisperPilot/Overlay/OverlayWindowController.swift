@@ -14,6 +14,11 @@ struct OverlayActions {
     /// (text, withScreenshot) — when `withScreenshot` is true, the coordinator captures
     /// the current display and ships it as multimodal input.
     var sendUserPrompt: (String, Bool) -> Void
+    /// Stops listening, hides the overlay, brings the Sessions window back to front so
+    /// the user can pick a different session or start a new one.
+    var goToSessions: () -> Void
+    /// Dismiss a chat message by id (used by the close button on system notes).
+    var dismissMessage: (UUID) -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

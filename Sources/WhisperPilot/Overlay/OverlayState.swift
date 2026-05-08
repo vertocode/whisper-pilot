@@ -187,6 +187,10 @@ final class OverlayState: ObservableObject {
         messages.removeAll()
     }
 
+    func removeMessage(id: UUID) {
+        messages.removeAll { $0.id == id }
+    }
+
     private func trim() {
         if messages.count > maxMessages {
             messages.removeFirst(messages.count - maxMessages)

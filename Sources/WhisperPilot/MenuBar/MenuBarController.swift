@@ -25,9 +25,15 @@ final class MenuBarController {
 
     private func configure() {
         if let button = item.button {
-            let symbol = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Whisper Pilot")
-                ?? NSImage(systemSymbolName: "waveform", accessibilityDescription: "Whisper Pilot")
-            if let symbol {
+            // Prefer the brand logo from the asset catalog so the status item visually
+            // matches the rest of the app. Fall back to an SF Symbol, then a text label,
+            // so something is always visible regardless of bundle state.
+            if let logo = NSImage(named: "WhisperPilotLogo") {
+                logo.size = NSSize(width: 18, height: 18)
+                button.image = logo
+                button.imagePosition = .imageOnly
+            } else if let symbol = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Whisper Pilot")
+                ?? NSImage(systemSymbolName: "waveform", accessibilityDescription: "Whisper Pilot") {
                 button.image = symbol
                 button.imagePosition = .imageOnly
             } else {

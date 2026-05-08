@@ -39,6 +39,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sendUserPrompt: { [weak self] text, withScreenshot in
                 print("[WP] action.sendUserPrompt fired (\(text.count) chars, screenshot=\(withScreenshot))")
                 self?.coordinator.sendUserPrompt(text, withScreenshot: withScreenshot)
+            },
+            goToSessions: { [weak self] in
+                print("[WP] action.goToSessions fired")
+                Task { [weak self] in
+                    await self?.coordinator.stopListening()
+                    self?.overlay?.window?.orderOut(nil)
+                    self?.showSessionsWindow()
+                }
+            },
+            dismissMessage: { [weak self] id in
+                self?.coordinator.overlayState.removeMessage(id: id)
             }
         )
 
