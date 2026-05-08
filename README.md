@@ -1,6 +1,10 @@
-# Whisper Pilot
+<p align="center">
+  <img src="Resources/Branding/whisper-logo-nobg.png" alt="Whisper Pilot" width="180" />
+</p>
 
-An invisible, realtime AI sidekick for conversations on macOS.
+<h1 align="center">Whisper Pilot</h1>
+
+<p align="center">An invisible, realtime AI sidekick for conversations on macOS.</p>
 
 Whisper Pilot listens to your meetings (Teams, Meet, Slack, Zoom, Discord, browser calls) and your microphone, transcribes the conversation in realtime, detects when someone asks **you** a question, and quietly streams a contextual answer into a translucent floating overlay. No prompts. No copy/paste. No "Ask AI" button.
 

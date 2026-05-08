@@ -20,6 +20,10 @@ struct OverlayView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
+            Image("WhisperPilotLogo")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 18, height: 18)
             StatusDot(status: state.status)
             Text(state.status.label)
                 .font(.system(size: 11, weight: .medium))

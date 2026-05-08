@@ -6,13 +6,31 @@ struct SettingsView: View {
     @State private var apiKeySaved: Bool = false
 
     var body: some View {
-        TabView {
-            generalTab.tabItem { Label("General", systemImage: "gearshape") }
-            providerTab.tabItem { Label("AI Provider", systemImage: "brain") }
-            captureTab.tabItem { Label("Capture", systemImage: "waveform") }
-            overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
+        VStack(spacing: 12) {
+            HStack(spacing: 10) {
+                Image("WhisperPilotLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 44, height: 44)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Whisper Pilot")
+                        .font(.system(size: 16, weight: .semibold))
+                    Text("Ambient AI for live conversations")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 4)
+
+            TabView {
+                generalTab.tabItem { Label("General", systemImage: "gearshape") }
+                providerTab.tabItem { Label("AI Provider", systemImage: "brain") }
+                captureTab.tabItem { Label("Capture", systemImage: "waveform") }
+                overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
+            }
         }
-        .frame(width: 520, height: 360)
+        .frame(width: 520, height: 420)
         .padding()
         .onAppear {
             apiKeyDraft = store.geminiAPIKey ?? ""
