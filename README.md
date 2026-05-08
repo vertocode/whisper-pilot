@@ -43,7 +43,7 @@ open WhisperPilot.xcodeproj
 
 Then in Xcode: select the **WhisperPilot** scheme and run (`⌘R`).
 
-> A `Package.swift` is also committed for contributor convenience — `swift build` will type-check the whole module without Xcode. It does not produce a runnable `.app` (entitlements and `Info.plist` live in `Project.yml`).
+> A `Package.swift` is also committed for contributor convenience — `swift build` will type-check the whole module without Xcode, and `swift run SmokeTests` runs the pure-logic test suite. It does not produce a runnable `.app` (entitlements and `Info.plist` live in `Project.yml`), and you should **not** open `Package.swift` in Xcode to run the app — always go through `xcodegen` + the generated `.xcodeproj`.
 
 On first launch:
 1. Grant **Microphone** permission (optional — only if you want to capture your own voice)
