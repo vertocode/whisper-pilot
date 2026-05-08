@@ -73,7 +73,22 @@ final class AppCoordinator {
     }
 
     private func refreshDerivedState() {
-        if isRunning { return }
+        // While running, sync the live `aiProvider` reference with the current API key so
+        // adding/removing the key in Settings takes effect immediately on the next trigger
+        // / auto-send / composer submission.
+        if isRunning {
+            let key = settings.geminiAPIKey ?? ""
+            if !key.isEmpty {
+                if aiProvider == nil {
+                    aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
+                    overlayState.appendSystemNote("✅ AI is now active. Key detected.")
+                }
+            } else if aiProvider != nil {
+                aiProvider = nil
+                overlayState.appendSystemNote("ℹ️ AI disabled — Gemini key removed. Transcription still running.")
+            }
+            return
+        }
         switch overlayState.status {
         case .needsAPIKey:
             if let key = settings.geminiAPIKey, !key.isEmpty {
@@ -118,17 +133,22 @@ final class AppCoordinator {
             return
         }
 
-        guard let key = settings.geminiAPIKey, !key.isEmpty else {
-            wpError("No Gemini API key configured. Open Settings to add one.")
-            overlayState.status = .needsAPIKey
-            return
-        }
-
-        wpInfo("[Coordinator] all gates passed, starting modules")
+        // Transcription does NOT depend on the LLM — it runs locally via SFSpeechRecognizer.
+        // We deliberately allow listening without a Gemini API key so users can use the
+        // app as a standalone transcriber, or debug the audio pipeline independently of
+        // any AI integration. AI features (detected-question triggers, auto-send, the
+        // composer) noop until a key is present.
+        wpInfo("[Coordinator] starting modules")
         let transcriber = AppleSpeechTranscriber(locale: settings.locale)
-        let ai = GeminiProvider(apiKey: key, model: settings.geminiModel)
         self.transcriber = transcriber
-        self.aiProvider = ai
+
+        if let key = settings.geminiAPIKey, !key.isEmpty {
+            self.aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
+        } else {
+            self.aiProvider = nil
+            wpInfo("[Coordinator] no Gemini key — transcription-only mode")
+            overlayState.appendSystemNote("ℹ️ Transcription is running. Add a Gemini API key in Settings to enable AI suggestions and the composer.")
+        }
 
         do {
             try await transcriber.start()
@@ -147,7 +167,7 @@ final class AppCoordinator {
             return
         }
 
-        startPipeline(transcriber: transcriber, ai: ai)
+        startPipeline(transcriber: transcriber, ai: aiProvider)
         restartAutoSendTimer()
 
         isRunning = true
@@ -341,7 +361,7 @@ final class AppCoordinator {
 
     // MARK: - Wiring
 
-    private func startPipeline(transcriber: TranscriptionProvider, ai: AIProvider) {
+    private func startPipeline(transcriber: TranscriptionProvider, ai: AIProvider?) {
         let mixer = audioMixer
         let vad = vad
         let buffer = transcriptBuffer
@@ -409,6 +429,10 @@ final class AppCoordinator {
                     wpInfo("[Coordinator] trigger fired but AI is paused — skipping")
                     continue
                 }
+                guard let liveAI = self.aiProvider else {
+                    wpInfo("[Coordinator] trigger fired but no Gemini key — skipping")
+                    continue
+                }
                 self.log.info("→ Trigger fired, building prompt")
                 self.overlayState.status = .thinking
                 let snapshot = await self.context.snapshotWithPrior()
@@ -420,7 +444,7 @@ final class AppCoordinator {
                     question: trigger.text,
                     style: style
                 )
-                await self.runCompletion(prompt: prompt, ai: ai, origin: .detectedQuestion)
+                await self.runCompletion(prompt: prompt, ai: liveAI, origin: .detectedQuestion)
             }
         })
     }
