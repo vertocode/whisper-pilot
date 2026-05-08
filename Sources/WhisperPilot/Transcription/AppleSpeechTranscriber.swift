@@ -51,6 +51,13 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
         }
     }
 
+    func notifyVADBoundary(channel: AudioChannel) {
+        switch channel {
+        case .system: systemPipe?.cycleAtBoundary()
+        case .microphone: micPipe?.cycleAtBoundary()
+        }
+    }
+
     deinit {
         continuation.finish()
     }
@@ -160,6 +167,31 @@ private final class ChannelPipe {
         oldRequest.endAudio()
         oldTask?.cancel()
         log.info("[\(String(describing: self.channel), privacy: .public)] ChannelPipe finished. Appended=\(self.buffersAppended), emitted=\(self.transcriptsEmitted), restarts=\(self.restartCount)")
+    }
+
+    /// Called by the coordinator on VAD speech-end events. Finalizes the current segment
+    /// (its text persists in the transcript buffer) and starts a fresh request + task
+    /// with a new segment id — so the next utterance becomes its own transcript line.
+    /// Without this, dictation-mode SFSpeech keeps overwriting one segment with the
+    /// running cumulative text, which is what the user was seeing.
+    func cycleAtBoundary() {
+        mutex.lock()
+        guard !isFinished else { mutex.unlock(); return }
+        // Skip if no audio has been appended yet — nothing to cycle.
+        guard buffersAppended > 0 else { mutex.unlock(); return }
+        let oldRequest = request
+        let oldTask = task
+        let next = SFSpeechAudioBufferRecognitionRequest()
+        next.shouldReportPartialResults = true
+        next.requiresOnDeviceRecognition = false
+        next.taskHint = .dictation
+        request = next
+        segmentId = UUID()
+        task = nil
+        mutex.unlock()
+        oldRequest.endAudio()
+        oldTask?.cancel()
+        startTask()
     }
 
     private func startTask() {

@@ -34,6 +34,10 @@ final class AppCoordinator {
 
     private var consumerTasks: [Task<Void, Never>] = []
     private var inFlightCompletion: Task<Void, Never>?
+    /// IDs of currently-displayed watchdog warnings, so we can dismiss them when the
+    /// underlying problem resolves itself (e.g. audio frames start flowing).
+    private var noFramesWarningID: UUID?
+    private var noTranscriptsWarningID: UUID?
     private var settingsObserver: AnyCancellable?
     private var pausedObserver: AnyCancellable?
     private var intervalObserver: AnyCancellable?
@@ -234,11 +238,11 @@ final class AppCoordinator {
                 let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
                 let message = "No audio frames after 6 seconds. \(method) started but isn't delivering audio. Default output device is “\(outName)”. Check that audio is actually playing through that device — virtual / aggregate / Bluetooth devices sometimes bypass the macOS audio mixdown that we capture from."
                 wpWarn(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
+                self.noFramesWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             } else if self.overlayState.transcriptCount == 0 {
                 let message = "Audio is flowing (\(self.overlayState.audioFrameCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video."
                 wpWarn(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
+                self.noTranscriptsWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             }
         }
 
@@ -249,8 +253,24 @@ final class AppCoordinator {
                 let locale = self.settings.localeIdentifier
                 let message = "Still no transcripts after 14 seconds (locale=\(locale)). Likely causes: (a) Speech Recognition not authorized — check System Settings → Privacy & Security → Speech Recognition; (b) wrong locale — open Settings → General → Locale and try \"en-US\"; (c) the audio is silent or non-speech. Open the 🐞 Diagnostics panel to see RMS values per buffer."
                 wpWarn(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
+                self.noTranscriptsWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             }
+        }
+    }
+
+    /// Dismiss the audio-not-flowing warning, if any. Called when the first frame arrives.
+    private func dismissNoFramesWarning() {
+        if let id = noFramesWarningID {
+            overlayState.removeMessage(id: id)
+            noFramesWarningID = nil
+        }
+    }
+
+    /// Dismiss the no-transcripts warning, if any. Called when the first transcript arrives.
+    private func dismissNoTranscriptsWarning() {
+        if let id = noTranscriptsWarningID {
+            overlayState.removeMessage(id: id)
+            noTranscriptsWarningID = nil
         }
     }
 
@@ -747,6 +767,7 @@ final class AppCoordinator {
                     wpInfo("Pipeline: first audio frame received (channel=\(frame.channel))")
                     Task { @MainActor [weak self] in
                         self?.overlayState.audioFrameCount = 1
+                        self?.dismissNoFramesWarning()
                     }
                 }
                 if framesProcessed % 25 == 0 {
@@ -790,6 +811,7 @@ final class AppCoordinator {
                 self?.overlayState.transcriptCount = transcriptsSeen
                 if transcriptsSeen == 1 {
                     wpInfo("First transcript update received")
+                    self?.dismissNoTranscriptsWarning()
                 }
 
                 // Persist finalized transcript lines to the active session's transcript.md
@@ -837,6 +859,12 @@ final class AppCoordinator {
 
     private func handleVADEvent(_ event: VoiceActivityEvent) async {
         await triggerEngine.absorb(event)
+        // On speech-end, tell the transcriber to cycle to a fresh segment for that
+        // channel. Without this, SFSpeech keeps overwriting one cumulative segment
+        // and earlier utterances visually disappear when a new one starts.
+        if case .speechEnded(let channel, _, _, _) = event {
+            transcriber?.notifyVADBoundary(channel: channel)
+        }
         if let last = await transcriptBuffer.lastFinalized() {
             await triggerEngine.consider(segment: last)
         }

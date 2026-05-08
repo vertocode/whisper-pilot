@@ -13,6 +13,12 @@ struct TranscriptLane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if !segments.isEmpty {
+                    Text("\(segments.count) line\(segments.count == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                }
             }
 
             if segments.isEmpty {
@@ -20,15 +26,13 @@ struct TranscriptLane: View {
                     .font(.callout)
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(visible) { segment in
+                // Show every segment. Each utterance is its own row (VAD-driven). The
+                // parent ScrollView in OverlayView handles overflow.
+                ForEach(segments) { segment in
                     TranscriptRow(segment: segment)
                 }
             }
         }
-    }
-
-    private var visible: [TranscriptSegment] {
-        Array(segments.suffix(8))
     }
 }
 

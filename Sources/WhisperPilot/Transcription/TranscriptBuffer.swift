@@ -15,7 +15,7 @@ struct TranscriptSegment: Sendable, Hashable, Identifiable {
 actor TranscriptBuffer {
     private var segments: [UUID: TranscriptSegment] = [:]
     private var order: [UUID] = []
-    private let retentionSeconds: TimeInterval = 180
+    private let retentionSeconds: TimeInterval = 1800
 
     func apply(_ update: TranscriptUpdate) {
         if var existing = segments[update.id] {

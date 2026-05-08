@@ -193,10 +193,12 @@ final class OverlayState: ObservableObject {
         messages[idx].isStreaming = false
     }
 
-    func appendSystemNote(_ text: String, category: ChatMessage.Category = .general) {
+    @discardableResult
+    func appendSystemNote(_ text: String, category: ChatMessage.Category = .general) -> UUID {
         let msg = ChatMessage(id: UUID(), role: .system, origin: .system, text: text, timestamp: Date(), isStreaming: false, category: category)
         messages.append(msg)
         trim()
+        return msg.id
     }
 
     func clearChat() {
