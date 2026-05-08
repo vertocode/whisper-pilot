@@ -11,6 +11,7 @@ final class MicrophoneCapture {
     private let engine = AVAudioEngine()
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
+    private var framesEmitted: Int = 0
 
     init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
@@ -21,9 +22,11 @@ final class MicrophoneCapture {
     }
 
     func start() async throws {
+        log.info("Starting microphone capture…")
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
+            log.error("Microphone returned invalid format (sampleRate=0)")
             throw MicrophoneError.invalidFormat
         }
         sourceFormat = inputFormat
@@ -34,7 +37,7 @@ final class MicrophoneCapture {
         }
 
         try engine.start()
-        log.info("Microphone capture started at \(inputFormat.sampleRate, privacy: .public) Hz")
+        log.info("✓ Microphone capture started at \(inputFormat.sampleRate, privacy: .public) Hz, \(inputFormat.channelCount, privacy: .public) ch")
     }
 
     func stop() async {
@@ -42,6 +45,8 @@ final class MicrophoneCapture {
         engine.stop()
         converter = nil
         sourceFormat = nil
+        log.info("Microphone capture stopped after \(self.framesEmitted, privacy: .public) frames")
+        framesEmitted = 0
     }
 
     deinit {
@@ -68,6 +73,12 @@ final class MicrophoneCapture {
         if let error {
             log.error("Mic conversion error: \(String(describing: error), privacy: .public)")
             return
+        }
+        framesEmitted += 1
+        if framesEmitted == 1 {
+            log.info("First microphone frame emitted")
+        } else if framesEmitted % 200 == 0 {
+            log.debug("Microphone frames emitted: \(self.framesEmitted, privacy: .public)")
         }
         continuation.yield(AudioFrame(buffer: output, channel: .microphone, timestamp: Date()))
     }

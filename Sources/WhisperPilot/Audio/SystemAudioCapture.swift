@@ -4,7 +4,6 @@ import OSLog
 import ScreenCaptureKit
 
 /// Captures system audio (everything macOS is playing) via ScreenCaptureKit.
-/// We don't capture video — `SCStreamConfiguration.capturesAudio = true` with `excludesCurrentProcessAudio = true`.
 /// Frames are converted to the canonical 16 kHz mono PCM format consumed by the rest of the pipeline.
 final class SystemAudioCapture: NSObject {
     let frames: AsyncStream<AudioFrame>
@@ -16,6 +15,7 @@ final class SystemAudioCapture: NSObject {
     private var stream: SCStream?
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
+    private var framesEmitted: Int = 0
 
     override init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
@@ -27,36 +27,49 @@ final class SystemAudioCapture: NSObject {
     }
 
     func start() async throws {
+        log.info("Starting system audio capture…")
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
+            log.error("No display available for capture")
             throw SystemAudioError.noDisplay
         }
+        log.info("Using display \(display.displayID, privacy: .public) (\(display.width)x\(display.height))")
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        config.sampleRate = Int(CanonicalAudioFormat.sampleRate)
-        config.channelCount = 1
+        // We deliberately leave sampleRate/channelCount at their ScreenCaptureKit defaults
+        // (48 kHz stereo on most hardware) and do the resample in `makePCMBuffer` via
+        // AVAudioConverter. Forcing low values here has been observed to silently produce
+        // zero audio frames on some macOS versions.
         config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        config.width = 2
-        config.height = 2
+        // Tiny dummy video size — we don't consume video, but ScreenCaptureKit requires a
+        // sane non-zero rect. Apple's audio-only sample uses 2x2; we use 100x100 because
+        // 2x2 has been known to silently drop audio frames on Sonoma+ on some hardware.
+        config.width = 100
+        config.height = 100
+        config.queueDepth = 5
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
         try await stream.startCapture()
         self.stream = stream
-        log.info("System audio capture started")
+        log.info("✓ System audio capture started; awaiting frames")
     }
 
     func stop() async {
         guard let stream else { return }
-        do { try await stream.stopCapture() } catch {
+        do {
+            try await stream.stopCapture()
+            log.info("System audio capture stopped after \(self.framesEmitted, privacy: .public) frames")
+        } catch {
             log.error("Stop error: \(String(describing: error), privacy: .public)")
         }
         self.stream = nil
         self.converter = nil
         self.sourceFormat = nil
+        self.framesEmitted = 0
     }
 
     deinit {
@@ -71,6 +84,12 @@ extension SystemAudioCapture: SCStreamOutput {
               let pcm = makePCMBuffer(from: sampleBuffer) else { return }
 
         let frame = AudioFrame(buffer: pcm, channel: .system, timestamp: Date())
+        framesEmitted += 1
+        if framesEmitted == 1 {
+            log.info("First system audio frame received (sampleRate=\(pcm.format.sampleRate), channels=\(pcm.format.channelCount), frameLength=\(pcm.frameLength))")
+        } else if framesEmitted % 200 == 0 {
+            log.debug("System audio frames emitted: \(self.framesEmitted, privacy: .public)")
+        }
         continuation.yield(frame)
     }
 
@@ -83,6 +102,7 @@ extension SystemAudioCapture: SCStreamOutput {
         if sourceFormat?.isEqual(inputFormat) != true {
             sourceFormat = inputFormat
             converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
+            log.info("System audio source format: \(inputFormat.sampleRate, privacy: .public) Hz, \(inputFormat.channelCount, privacy: .public) ch")
         }
         guard let converter else { return nil }
 
@@ -131,7 +151,7 @@ extension SystemAudioCapture: SCStreamOutput {
 
 extension SystemAudioCapture: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        log.error("SCStream stopped: \(String(describing: error), privacy: .public)")
+        log.error("SCStream stopped with error: \(String(describing: error), privacy: .public)")
     }
 }
 
