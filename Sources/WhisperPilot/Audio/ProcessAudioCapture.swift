@@ -93,14 +93,30 @@ final class ProcessAudioCapture {
         self.converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
 
         // 4. Create a private aggregate device backed by the tap.
+        // CRITICAL: anchor the aggregate to the system's default output device via
+        // `kAudioAggregateDeviceMainSubDeviceKey`. Without it, the aggregate has no clock
+        // source and the tap delivers silent buffers — that's exactly the symptom we hit:
+        // RMS=0 across thousands of frames despite Chrome playing audio.
+        // Apple's WWDC 2024 reference sample shows this is required.
+        guard let outputUID = Self.defaultOutputDeviceUID() else {
+            AudioHardwareDestroyProcessTap(tapID)
+            self.tapID = 0
+            throw ProcessAudioError.outputDeviceUnavailable
+        }
+        wpInfo("ProcessAudio: anchoring aggregate to output device UID=\(outputUID)")
+
         let aggregateUID = "com.whisperpilot.app.aggregate.\(UUID().uuidString)"
         let aggregateDict: [String: Any] = [
             kAudioAggregateDeviceUIDKey as String: aggregateUID,
             kAudioAggregateDeviceNameKey as String: "Whisper Pilot Aggregate",
+            kAudioAggregateDeviceMainSubDeviceKey as String: outputUID as String,
             kAudioAggregateDeviceIsPrivateKey as String: 1,
             kAudioAggregateDeviceIsStackedKey as String: 0,
             kAudioAggregateDeviceTapListKey as String: [
-                [kAudioSubTapUIDKey as String: uuid as String]
+                [
+                    kAudioSubTapUIDKey as String: uuid as String,
+                    kAudioSubTapDriftCompensationKey as String: 1
+                ]
             ],
             kAudioAggregateDeviceTapAutoStartKey as String: 1
         ]
@@ -290,6 +306,32 @@ final class ProcessAudioCapture {
 
     // MARK: - Helpers
 
+    /// Reads the system-default output device's UID. Required by `CATapDescription`
+    /// aggregate setups so the tap has a clock source — without anchoring to an actual
+    /// output device, the tap silently produces empty buffers.
+    private static func defaultOutputDeviceUID() -> CFString? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID: AudioObjectID = 0
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let getDevice = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil, &size, &deviceID
+        )
+        guard getDevice == noErr, deviceID != 0 else { return nil }
+
+        address.mSelector = kAudioDevicePropertyDeviceUID
+        var uid: CFString?
+        size = UInt32(MemoryLayout<CFString?>.size)
+        let getUID = withUnsafeMutablePointer(to: &uid) { ptr in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, ptr)
+        }
+        return getUID == noErr ? uid : nil
+    }
+
     private static func audioObjectID(forPID pid: pid_t) -> AudioObjectID {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
@@ -352,6 +394,7 @@ enum ProcessAudioError: LocalizedError {
     case deviceStartFailed(OSStatus)
     case formatConversionFailed
     case propertyReadFailed(selector: AudioObjectPropertySelector, status: OSStatus)
+    case outputDeviceUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -361,6 +404,7 @@ enum ProcessAudioError: LocalizedError {
         case .deviceStartFailed(let s): return "Couldn't start audio device (status=\(s))."
         case .formatConversionFailed: return "Couldn't translate Core Audio stream format to AVAudioFormat."
         case .propertyReadFailed(let selector, let s): return "Couldn't read Core Audio property 0x\(String(selector, radix: 16)) (status=\(s))."
+        case .outputDeviceUnavailable: return "Couldn't read default output device — Process Tap needs an output to anchor to."
         }
     }
 }
