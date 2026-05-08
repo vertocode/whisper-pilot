@@ -114,13 +114,20 @@ final class AppCoordinator {
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
+        let priorScreenRecording = permissions.snapshot.screenRecording
         do {
             _ = try await SCShareableContent.current
             permissions.markScreenRecordingGranted()
             overlayState.permissionStatus = permissions.snapshot
             wpInfo("[Coordinator] ✓ Screen Recording probe passed")
+            // Surface a resolution note only if we'd previously seen this denied — saves
+            // noise on every clean Play click.
+            if priorScreenRecording != .granted {
+                overlayState.appendSystemNote("✅ Screen Recording permission detected.")
+            }
         } catch {
             wpError("Screen Recording probe failed: \(error.localizedDescription)")
+            overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.")
             overlayState.status = .needsPermission(.screenRecording)
             await permissions.requestScreenRecording()
             return
@@ -128,9 +135,16 @@ final class AppCoordinator {
 
         if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
             wpInfo("[Coordinator] microphone requested, not authorized — prompting")
-            overlayState.status = .needsPermission(.microphone)
+            overlayState.appendSystemNote("ℹ️ Asking macOS for microphone permission…")
             await permissions.requestMicrophone()
-            return
+            if permissions.snapshot.microphone == .granted {
+                overlayState.appendSystemNote("✅ Microphone permission granted. Continuing…")
+                // fall through to start the pipeline so the user doesn't have to click Play again
+            } else {
+                overlayState.appendSystemNote("⚠️ Microphone permission was not granted. Either disable microphone capture in Settings or grant access via System Settings → Privacy & Security → Microphone.")
+                overlayState.status = .needsPermission(.microphone)
+                return
+            }
         }
 
         // Transcription does NOT depend on the LLM — it runs locally via SFSpeechRecognizer.
@@ -380,7 +394,11 @@ final class AppCoordinator {
             for await frame in mixer.output {
                 framesProcessed += 1
                 if framesProcessed == 1 {
-                    print("[WP][Pipeline] FIRST mixer frame received (channel=\(frame.channel))")
+                    wpInfo("Pipeline: first audio frame received (channel=\(frame.channel))")
+                    Task { @MainActor [weak self] in
+                        self?.overlayState.audioFrameCount = 1
+                        self?.overlayState.appendSystemNote("✅ Audio is flowing — first frame received.")
+                    }
                 }
                 if framesProcessed % 25 == 0 {
                     let count = framesProcessed
@@ -389,11 +407,11 @@ final class AppCoordinator {
                 let event = await vad.feed(frame)
                 transcriber.feed(frame.buffer, channel: frame.channel)
                 if let event {
-                    print("[WP][VAD] \(event)")
+                    wpInfo("VAD: \(event)")
                     await self?.handleVADEvent(event)
                 }
             }
-            print("[WP][Pipeline] mixer stream ended after \(framesProcessed) frames")
+            wpInfo("Pipeline: mixer stream ended after \(framesProcessed) frames")
         })
 
         consumerTasks.append(Task { [weak self] in
@@ -405,6 +423,10 @@ final class AppCoordinator {
                 self?.overlayState.transcript = snapshot
                 transcriptsSeen += 1
                 self?.overlayState.transcriptCount = transcriptsSeen
+                if transcriptsSeen == 1 {
+                    wpInfo("First transcript update received")
+                    self?.overlayState.appendSystemNote("✅ Transcription is producing output.")
+                }
 
                 // Persist finalized transcript lines to the active session's transcript.md
                 if update.isFinal,

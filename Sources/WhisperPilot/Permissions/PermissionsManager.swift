@@ -36,15 +36,22 @@ final class PermissionsManager: ObservableObject {
     }
 
     func requestMicrophone() async {
+        wpInfo("Requesting microphone permission")
         let granted = await withCheckedContinuation { continuation in
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 continuation.resume(returning: granted)
             }
         }
         snapshot.microphone = granted ? .granted : .denied
+        if granted {
+            wpInfo("Microphone permission granted")
+        } else {
+            wpWarn("Microphone permission denied")
+        }
     }
 
     func requestScreenRecording() async {
+        wpInfo("Requesting Screen Recording permission")
         // macOS does not surface an SPI for "request Screen Recording" — the OS shows the
         // permission prompt the first time a process tries to capture. We trigger that by
         // asking ScreenCaptureKit for shareable content; the prompt appears on first run,
@@ -52,8 +59,10 @@ final class PermissionsManager: ObservableObject {
         do {
             _ = try await SCShareableContent.current
             snapshot.screenRecording = .granted
+            wpInfo("Screen Recording permission granted")
         } catch {
             snapshot.screenRecording = .denied
+            wpWarn("Screen Recording permission still denied; opening System Settings")
             openScreenRecordingSettings()
         }
     }
