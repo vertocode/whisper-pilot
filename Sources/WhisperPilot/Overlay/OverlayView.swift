@@ -21,13 +21,19 @@ struct BrandLogo: View {
 struct OverlayView: View {
     @ObservedObject var state: OverlayState
     let actions: OverlayActions
+    @ObservedObject private var logBuffer = LogBuffer.shared
     @FocusState private var composerFocused: Bool
     @State private var includeScreenshot: Bool = false
+    @State private var showDebugPanel: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.25)
+            if showDebugPanel {
+                debugPanel
+                Divider().opacity(0.25)
+            }
             content
             Divider().opacity(0.25)
             composer
@@ -82,6 +88,27 @@ struct OverlayView: View {
             .buttonStyle(.plain)
             .help(state.isAIPaused ? "Resume AI (auto-suggestions)" : "Pause AI (no auto-calls; manual prompts still work)")
 
+            Button {
+                showDebugPanel.toggle()
+                if showDebugPanel { logBuffer.clearAlertBadge() }
+            } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: showDebugPanel ? "ladybug.fill" : "ladybug")
+                        .font(.system(size: 14))
+                        .foregroundStyle(showDebugPanel ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                    if logBuffer.unseenAlertCount > 0 {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 8, height: 8)
+                            .offset(x: 4, y: -2)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .help(logBuffer.unseenAlertCount > 0
+                  ? "Diagnostics (\(logBuffer.unseenAlertCount) new alert\(logBuffer.unseenAlertCount == 1 ? "" : "s"))"
+                  : "Diagnostics / debug log")
+
             Button(action: actions.openSettings) {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 14))
@@ -100,6 +127,50 @@ struct OverlayView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    // MARK: - Debug panel
+
+    private var debugPanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "ladybug.fill")
+                    .font(.caption)
+                    .foregroundStyle(.tint)
+                Text("Diagnostics")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Clear") { logBuffer.clearAll() }
+                    .controlSize(.small)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    let recent = logBuffer.entries.suffix(60)
+                    if recent.isEmpty {
+                        Text("No log entries yet — start listening to see audio + AI events.")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 4)
+                    } else {
+                        ForEach(recent) { entry in
+                            LogRow(entry: entry)
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
+            .frame(maxHeight: 160)
+        }
+        .background(Color.gray.opacity(0.06))
     }
 
     // MARK: - Content
@@ -397,6 +468,63 @@ private struct MessageBubble: View {
         case .system: return Color.gray.opacity(0.10)
         }
     }
+}
+
+private struct LogRow: View {
+    let entry: LogEntry
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(timeString)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .frame(width: 56, alignment: .leading)
+            Text(symbol)
+                .font(.system(size: 10))
+                .foregroundStyle(color)
+                .frame(width: 12)
+            Text(entry.message)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(textColor)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 1)
+    }
+
+    private var timeString: String {
+        Self.timeFormatter.string(from: entry.timestamp)
+    }
+
+    private var symbol: String {
+        switch entry.level {
+        case .info: return "•"
+        case .warn: return "⚠"
+        case .error: return "✘"
+        }
+    }
+
+    private var color: Color {
+        switch entry.level {
+        case .info: return .secondary
+        case .warn: return .orange
+        case .error: return .red
+        }
+    }
+
+    private var textColor: Color {
+        switch entry.level {
+        case .info: return .primary
+        case .warn: return .orange
+        case .error: return .red
+        }
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 }
 
 private struct TypingIndicator: View {

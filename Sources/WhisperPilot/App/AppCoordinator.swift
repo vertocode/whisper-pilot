@@ -92,10 +92,10 @@ final class AppCoordinator {
 
     func startListening() async {
         guard !isRunning else {
-            print("[WP][Coordinator] startListening: already running, skipping")
+            wpInfo("[Coordinator] startListening: already running, skipping")
             return
         }
-        print("[WP][Coordinator] ▶ startListening")
+        wpInfo("[Coordinator] ▶ startListening")
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
@@ -103,28 +103,28 @@ final class AppCoordinator {
             _ = try await SCShareableContent.current
             permissions.markScreenRecordingGranted()
             overlayState.permissionStatus = permissions.snapshot
-            print("[WP][Coordinator] ✓ Screen Recording probe passed")
+            wpInfo("[Coordinator] ✓ Screen Recording probe passed")
         } catch {
-            print("[WP][Coordinator] ✘ Screen Recording probe failed: \(error.localizedDescription)")
+            wpError("Screen Recording probe failed: \(error.localizedDescription)")
             overlayState.status = .needsPermission(.screenRecording)
             await permissions.requestScreenRecording()
             return
         }
 
         if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
-            print("[WP][Coordinator] microphone requested, not authorized — prompting")
+            wpInfo("[Coordinator] microphone requested, not authorized — prompting")
             overlayState.status = .needsPermission(.microphone)
             await permissions.requestMicrophone()
             return
         }
 
         guard let key = settings.geminiAPIKey, !key.isEmpty else {
-            print("[WP][Coordinator] ✘ no Gemini API key")
+            wpError("No Gemini API key configured. Open Settings to add one.")
             overlayState.status = .needsAPIKey
             return
         }
 
-        print("[WP][Coordinator] all gates passed, starting modules")
+        wpInfo("[Coordinator] all gates passed, starting modules")
         let transcriber = AppleSpeechTranscriber(locale: settings.locale)
         let ai = GeminiProvider(apiKey: key, model: settings.geminiModel)
         self.transcriber = transcriber
@@ -132,17 +132,17 @@ final class AppCoordinator {
 
         do {
             try await transcriber.start()
-            print("[WP][Coordinator] transcriber.start OK")
+            wpInfo("[Coordinator] transcriber.start OK")
             try await systemCapture.start()
-            print("[WP][Coordinator] systemCapture.start OK")
+            wpInfo("[Coordinator] systemCapture.start OK")
             if settings.captureMicrophone {
                 try await micCapture.start()
-                print("[WP][Coordinator] micCapture.start OK")
+                wpInfo("[Coordinator] micCapture.start OK")
             } else {
-                print("[WP][Coordinator] microphone capture disabled in settings")
+                wpInfo("[Coordinator] microphone capture disabled in settings")
             }
         } catch {
-            print("[WP][Coordinator] ✘ Pipeline start failed: \(error.localizedDescription)")
+            wpError("Pipeline start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             return
         }
@@ -152,7 +152,28 @@ final class AppCoordinator {
 
         isRunning = true
         overlayState.status = .listening
-        print("[WP][Coordinator] ✓ Listening")
+        wpInfo("[Coordinator] ✓ Listening")
+        startNoFramesWatchdog()
+    }
+
+    /// Surfaces a visible warning if SCStream + the microphone tap have started but no
+    /// audio frames have been observed after a few seconds. This is exactly the silent-
+    /// failure mode users hit when ScreenCaptureKit's filter or output routing produces
+    /// zero buffers.
+    private func startNoFramesWatchdog() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard let self, self.isRunning else { return }
+            if self.overlayState.audioFrameCount == 0 {
+                let message = "No audio frames after 6 seconds. ScreenCaptureKit started but isn't delivering audio. Try playing a video, switching audio output device, or stop and start listening again."
+                wpWarn(message)
+                self.overlayState.appendSystemNote("⚠️ \(message)")
+            } else if self.overlayState.transcriptCount == 0 {
+                let message = "Audio is flowing (\(self.overlayState.audioFrameCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video for a few seconds."
+                wpWarn(message)
+                self.overlayState.appendSystemNote("⚠️ \(message)")
+            }
+        }
     }
 
     func stopListening() async {
@@ -385,7 +406,7 @@ final class AppCoordinator {
             for await trigger in engine.events {
                 guard let self else { return }
                 if self.overlayState.isAIPaused {
-                    print("[WP][Coordinator] trigger fired but AI is paused — skipping")
+                    wpInfo("[Coordinator] trigger fired but AI is paused — skipping")
                     continue
                 }
                 self.log.info("→ Trigger fired, building prompt")
@@ -434,9 +455,11 @@ final class AppCoordinator {
             } catch is CancellationError {
                 self.overlayState.finishAssistant(id: messageId)
             } catch {
-                self.log.error("AI stream failed: \(String(describing: error), privacy: .public)")
+                let message = error.localizedDescription
+                wpError("AI stream failed: \(message)")
                 self.overlayState.finishAssistant(id: messageId)
-                self.overlayState.status = .error(error.localizedDescription)
+                self.overlayState.status = .error(message)
+                self.overlayState.appendSystemNote("⚠️ \(message)")
             }
         }
         inFlightCompletion = task
@@ -455,7 +478,7 @@ final class AppCoordinator {
         RunLoop.main.add(timer, forMode: .common)
         autoSendTimer = timer
         lastAutoSendTranscriptCount = overlayState.transcriptCount
-        print("[WP][Coordinator] auto-send timer scheduled every \(interval)s")
+        wpInfo("[Coordinator] auto-send timer scheduled every \(interval)s")
     }
 
     private func runAutoSend() {
@@ -464,11 +487,11 @@ final class AppCoordinator {
         // Skip the tick if no new transcript content has accumulated since the last send.
         let currentCount = overlayState.transcriptCount
         if currentCount <= lastAutoSendTranscriptCount {
-            print("[WP][Coordinator] auto-send tick skipped — no new transcripts since last send")
+            wpInfo("[Coordinator] auto-send tick skipped — no new transcripts since last send")
             return
         }
         lastAutoSendTranscriptCount = currentCount
-        print("[WP][Coordinator] auto-send tick firing")
+        wpInfo("[Coordinator] auto-send tick firing")
         Task { [weak self] in
             guard let self else { return }
             let snapshot = await self.context.snapshotWithPrior()

@@ -1,6 +1,71 @@
 import Combine
 import Foundation
 
+/// Severity for in-app log entries.
+enum LogLevel: String, Sendable, CaseIterable {
+    case info, warn, error
+}
+
+struct LogEntry: Identifiable, Sendable {
+    let id: UUID = UUID()
+    let level: LogLevel
+    let timestamp: Date
+    let message: String
+}
+
+/// In-app log/alert buffer. Anything funneled through `wpInfo` / `wpWarn` / `wpError`
+/// lands here, so users can see what's happening without an Xcode console attached.
+@MainActor
+final class LogBuffer: ObservableObject {
+    static let shared = LogBuffer()
+
+    @Published private(set) var entries: [LogEntry] = []
+    /// Increments whenever a `.warn` or `.error` is appended; the overlay watches this so
+    /// it can surface a numeric badge without re-rendering the full list.
+    @Published private(set) var unseenAlertCount: Int = 0
+
+    private let maxEntries = 500
+
+    private init() {}
+
+    func append(_ level: LogLevel, _ message: String) {
+        entries.append(LogEntry(level: level, timestamp: Date(), message: message))
+        if entries.count > maxEntries {
+            entries.removeFirst(entries.count - maxEntries)
+        }
+        if level == .warn || level == .error {
+            unseenAlertCount += 1
+        }
+    }
+
+    func clearAlertBadge() {
+        unseenAlertCount = 0
+    }
+
+    func clearAll() {
+        entries.removeAll()
+        unseenAlertCount = 0
+    }
+}
+
+/// Global helpers callable from any thread. Each one `print()`s (so the message reaches
+/// Xcode's console regardless of OSLog filtering) and posts an entry to `LogBuffer.shared`
+/// (so the message reaches the overlay even when no console is attached).
+nonisolated func wpInfo(_ message: String) {
+    print("[WP] \(message)")
+    Task { @MainActor in LogBuffer.shared.append(.info, message) }
+}
+
+nonisolated func wpWarn(_ message: String) {
+    print("[WP][WARN] \(message)")
+    Task { @MainActor in LogBuffer.shared.append(.warn, message) }
+}
+
+nonisolated func wpError(_ message: String) {
+    print("[WP][ERROR] \(message)")
+    Task { @MainActor in LogBuffer.shared.append(.error, message) }
+}
+
 enum OverlayStatus: Equatable, Sendable {
     case idle
     case listening

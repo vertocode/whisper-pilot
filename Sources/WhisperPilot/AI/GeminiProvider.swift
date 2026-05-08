@@ -228,8 +228,31 @@ enum GeminiError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .http(let status, let body):
-            if let body, !body.isEmpty { return "Gemini error \(status): \(body)" }
-            return "Gemini error \(status)"
+            switch status {
+            case 401, 403:
+                return "Gemini authentication failed (HTTP \(status)). Check your API key in Settings — it may be invalid or revoked."
+            case 429:
+                let detail = body.flatMap { extractMessage(from: $0) } ?? ""
+                let suffix = detail.isEmpty ? "" : " — \(detail)"
+                return "Gemini rate limit hit (HTTP 429). Free-tier quotas are tight; wait ~30s, switch to gemini-2.0-flash-lite in Settings, or add billing to your Google AI Studio key.\(suffix)"
+            case 400:
+                return "Gemini rejected the request (HTTP 400)\(body.map { ": \($0)" } ?? "")"
+            case 500..<600:
+                return "Gemini server error (HTTP \(status)). Usually transient — retry in a moment."
+            default:
+                if let body, !body.isEmpty { return "Gemini error \(status): \(body)" }
+                return "Gemini error \(status)"
+            }
         }
+    }
+
+    /// Best-effort extraction of the human-readable `error.message` from a Gemini error
+    /// body. Returns nil if the body isn't shaped like a Gemini error response.
+    private func extractMessage(from body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = json["error"] as? [String: Any],
+              let message = error["message"] as? String else { return nil }
+        return message
     }
 }
