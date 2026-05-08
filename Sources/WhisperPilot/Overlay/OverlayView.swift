@@ -1,4 +1,24 @@
+import AppKit
 import SwiftUI
+
+/// Renders the brand logo with a graceful fallback to an SF Symbol when the asset catalog
+/// hasn't been recompiled yet (e.g. stale DerivedData after a fresh imageset add). Avoids
+/// the `No image named 'WhisperPilotLogo' found in asset catalog` console warning that
+/// scares contributors.
+struct BrandLogo: View {
+    var body: some View {
+        if let nsImage = NSImage(named: "WhisperPilotLogo") {
+            Image(nsImage: nsImage)
+                .resizable()
+                .scaledToFit()
+        } else {
+            Image(systemName: "waveform.circle.fill")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.tint)
+        }
+    }
+}
 
 struct OverlayView: View {
     @ObservedObject var state: OverlayState
@@ -21,9 +41,7 @@ struct OverlayView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Image("WhisperPilotLogo")
-                .resizable()
-                .scaledToFit()
+            BrandLogo()
                 .frame(width: 18, height: 18)
 
             StatusDot(status: state.status)

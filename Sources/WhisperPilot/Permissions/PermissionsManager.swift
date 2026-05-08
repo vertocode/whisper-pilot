@@ -2,6 +2,7 @@ import AVFoundation
 import AppKit
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 
 enum PermissionStatus: Sendable, Equatable {
     case unknown
@@ -26,8 +27,12 @@ final class PermissionsManager: ObservableObject {
     func refresh() async {
         snapshot = PermissionsSnapshot(
             microphone: currentMicrophone(),
-            screenRecording: currentScreenRecording()
+            screenRecording: await currentScreenRecording()
         )
+    }
+
+    func markScreenRecordingGranted() {
+        snapshot.screenRecording = .granted
     }
 
     func requestMicrophone() async {
@@ -40,12 +45,15 @@ final class PermissionsManager: ObservableObject {
     }
 
     func requestScreenRecording() async {
-        // macOS does not surface an SPI for "request screen recording" — the OS shows the
+        // macOS does not surface an SPI for "request Screen Recording" — the OS shows the
         // permission prompt the first time a process tries to capture. We trigger that by
-        // calling `CGRequestScreenCaptureAccess`, which is the documented path.
-        let granted = CGRequestScreenCaptureAccess()
-        snapshot.screenRecording = granted ? .granted : .denied
-        if !granted {
+        // asking ScreenCaptureKit for shareable content; the prompt appears on first run,
+        // and on subsequent denied runs we deep-link to System Settings.
+        do {
+            _ = try await SCShareableContent.current
+            snapshot.screenRecording = .granted
+        } catch {
+            snapshot.screenRecording = .denied
             openScreenRecordingSettings()
         }
     }
@@ -64,7 +72,16 @@ final class PermissionsManager: ObservableObject {
         }
     }
 
-    private func currentScreenRecording() -> PermissionStatus {
-        CGPreflightScreenCaptureAccess() ? .granted : .unknown
+    /// Live probe for Screen Recording permission. We deliberately do *not* call
+    /// `CGPreflightScreenCaptureAccess` — its result is cached at app launch and never
+    /// reflects permission grants made while the app is running, which produced "stuck on
+    /// needs-permission" reports from users who had already granted access.
+    private func currentScreenRecording() async -> PermissionStatus {
+        do {
+            _ = try await SCShareableContent.current
+            return .granted
+        } catch {
+            return .unknown
+        }
     }
 }

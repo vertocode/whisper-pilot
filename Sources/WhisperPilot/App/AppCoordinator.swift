@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import OSLog
+import ScreenCaptureKit
 
 /// Owns every long-lived module. The only place that knows about concrete types.
 /// Public surface is intentionally small; views and the menu bar talk through `OverlayState`,
@@ -46,7 +47,17 @@ final class AppCoordinator {
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
-        guard permissions.snapshot.screenRecording == .granted else {
+        // Probe Screen Recording via the actual ScreenCaptureKit API. The legacy
+        // `CGPreflightScreenCaptureAccess` caches at process launch and stays stuck on
+        // "denied" even after the user grants permission in System Settings, which is
+        // exactly the trap we used to fall into. `SCShareableContent.current` is the
+        // authoritative live probe.
+        do {
+            _ = try await SCShareableContent.current
+            permissions.markScreenRecordingGranted()
+            overlayState.permissionStatus = permissions.snapshot
+        } catch {
+            log.info("Screen Recording probe failed: \(String(describing: error), privacy: .public)")
             overlayState.status = .needsPermission(.screenRecording)
             await permissions.requestScreenRecording()
             return

@@ -8,9 +8,7 @@ struct SettingsView: View {
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 10) {
-                Image("WhisperPilotLogo")
-                    .resizable()
-                    .scaledToFit()
+                BrandLogo()
                     .frame(width: 44, height: 44)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Whisper Pilot")
