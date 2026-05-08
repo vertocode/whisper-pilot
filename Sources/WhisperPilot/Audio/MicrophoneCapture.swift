@@ -68,6 +68,9 @@ final class MicrophoneCapture {
         let outputCapacity = AVAudioFrameCount(Double(buffer.frameLength) * outputFormat.sampleRate / buffer.format.sampleRate) + 1024
         guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else { return }
 
+        // Reset before each conversion — without this the converter enters a terminal
+        // "stream ended" state after the first endOfStream and produces 0 frames forever.
+        converter.reset()
         var error: NSError?
         var consumed = false
         converter.convert(to: output, error: &error) { _, status in

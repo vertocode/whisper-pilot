@@ -203,9 +203,11 @@ final class ProcessAudioCapture {
         let outputCapacity = AVAudioFrameCount(Double(frameCount) * outputFormat.sampleRate / inputFormat.sampleRate) + 1024
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else { return }
 
-        // Streaming convert — verified by synthetic test to produce ~170 frames for 512
-        // frames of 48 kHz input. The earlier failure was in the wrapping, not the
-        // converter.
+        // CRITICAL: reset the converter before each call. Without this, AVAudioConverter
+        // enters a "stream ended" state after the first `endOfStream` signal and produces
+        // 0 output frames for every subsequent convert(). Verified by synthetic test:
+        // without reset, calls 2..N return 0 frames. With reset, all calls work.
+        converter.reset()
         var convertError: NSError?
         var consumed = false
         converter.convert(to: outputBuffer, error: &convertError) { _, status in

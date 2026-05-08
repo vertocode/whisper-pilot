@@ -145,6 +145,9 @@ extension SystemAudioCapture: SCStreamOutput {
             return nil
         }
 
+        // Reset before each conversion — without this the converter enters a terminal
+        // "stream ended" state after the first endOfStream and produces 0 frames forever.
+        converter.reset()
         var error: NSError?
         var consumed = false
         converter.convert(to: outputBuffer, error: &error) { _, status in
