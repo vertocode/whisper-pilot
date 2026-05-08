@@ -211,19 +211,21 @@ private final class ChannelPipe {
         guard !isFinished else { mutex.unlock(); return }
         let now = Date()
         recentRestartTimestamps = recentRestartTimestamps.filter { now.timeIntervalSince($0) < Self.restartWindow }
-        if recentRestartTimestamps.count >= Self.maxRestartsPerWindow {
-            wpError("Transcriber.\(self.channel) too many recognizer restarts (\(Self.maxRestartsPerWindow) in \(Int(Self.restartWindow))s) — giving up. Stop and start listening to retry.")
-            isFinished = true
-            mutex.unlock()
-            return
-        }
+        let recentCount = recentRestartTimestamps.count
         recentRestartTimestamps.append(now)
         restartCount += 1
         mutex.unlock()
 
-        // Defer the actual restart so we don't tail-call into another error callback.
+        // Don't permanently give up. SFSpeech's "No speech detected" can fire repeatedly
+        // during silence; once audio resumes we should still recognize. Slow down restart
+        // attempts when the error rate is high but never close the door.
+        let delay: TimeInterval = recentCount >= Self.maxRestartsPerWindow ? 5.0 : Self.restartDelay
+        if recentCount >= Self.maxRestartsPerWindow {
+            wpInfo("Transcriber.\(self.channel) backing off restart attempts (rate cap hit, retrying in \(Int(delay))s)")
+        }
+
         Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.restartDelay * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             self?.actuallyRestart()
         }
     }

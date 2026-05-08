@@ -59,6 +59,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             runAudioTest: { [weak self] in
                 Task { await self?.coordinator.runSystemAudioTest() }
+            },
+            toggleMicMute: { [weak self] in
+                self?.coordinator.overlayState.isMicrophoneMuted.toggle()
+            },
+            toggleSystemAudioMute: { [weak self] in
+                self?.coordinator.overlayState.isSystemAudioMuted.toggle()
             }
         )
 

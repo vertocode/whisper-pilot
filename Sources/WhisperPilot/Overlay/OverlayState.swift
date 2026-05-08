@@ -149,6 +149,11 @@ final class OverlayState: ObservableObject {
     @Published var audioFrameCount: Int = 0
     @Published var transcriptCount: Int = 0
 
+    /// Per-channel mute. When true, captured frames for that channel are dropped before
+    /// reaching VAD/transcription. Capture itself keeps running so the resume is instant.
+    @Published var isMicrophoneMuted: Bool = false
+    @Published var isSystemAudioMuted: Bool = false
+
     nonisolated let statusStream: AsyncStream<OverlayStatus>
     nonisolated private let statusContinuation: AsyncStream<OverlayStatus>.Continuation
 

@@ -25,6 +25,10 @@ struct OverlayActions {
     var runMicTest: () -> Void
     /// System Audio Test: Process Tap captures system audio, reports RMS over 3 seconds.
     var runAudioTest: () -> Void
+    /// Toggle the microphone mute state.
+    var toggleMicMute: () -> Void
+    /// Toggle the system audio mute state.
+    var toggleSystemAudioMute: () -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

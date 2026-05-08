@@ -106,12 +106,20 @@ final class ProcessAudioCapture {
         wpInfo("ProcessAudio: anchoring aggregate to output device UID=\(outputUID)")
 
         let aggregateUID = "com.whisperpilot.app.aggregate.\(UUID().uuidString)"
+        // The output device must be present in BOTH `MainSubDeviceKey` AND
+        // `SubDeviceListKey`. The tap by itself doesn't run a clock — it needs to be
+        // attached to a real device that's producing audio. Apple's WWDC24 reference
+        // and `AudioCap` both include both keys; missing `SubDeviceListKey` was why
+        // the tap was still silent on this user's machine.
         let aggregateDict: [String: Any] = [
             kAudioAggregateDeviceUIDKey as String: aggregateUID,
             kAudioAggregateDeviceNameKey as String: "Whisper Pilot Aggregate",
             kAudioAggregateDeviceMainSubDeviceKey as String: outputUID as String,
             kAudioAggregateDeviceIsPrivateKey as String: 1,
             kAudioAggregateDeviceIsStackedKey as String: 0,
+            kAudioAggregateDeviceSubDeviceListKey as String: [
+                [kAudioSubDeviceUIDKey as String: outputUID as String]
+            ],
             kAudioAggregateDeviceTapListKey as String: [
                 [
                     kAudioSubTapUIDKey as String: uuid as String,
@@ -235,6 +243,25 @@ final class ProcessAudioCapture {
         if let convertError {
             wpError("ProcessAudio convert error: \(convertError.localizedDescription)")
             return
+        }
+
+        // Apply 5× gain to system audio. The macOS audio mixdown that Process Tap
+        // captures is typically much quieter than microphone input — usually below
+        // SFSpeech's internal speech-detection threshold (verified: live RMS ≈ 0.0067
+        // vs typical mic speech RMS ≈ 0.05). Boosting the signal so the recognizer
+        // actually treats it as speech.
+        if let outputData = outputBuffer.floatChannelData {
+            let gain: Float = 5.0
+            let frames = Int(outputBuffer.frameLength)
+            let channels = Int(outputBuffer.format.channelCount)
+            for c in 0..<channels {
+                let ptr = outputData[c]
+                for i in 0..<frames {
+                    let amplified = ptr[i] * gain
+                    // Clamp to [-1, 1] to avoid wraparound distortion on transients.
+                    ptr[i] = max(-1.0, min(1.0, amplified))
+                }
+            }
         }
 
         framesEmitted += 1

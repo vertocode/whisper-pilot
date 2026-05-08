@@ -88,6 +88,26 @@ struct OverlayView: View {
             .buttonStyle(.plain)
             .help(state.status.isActive ? "Stop listening" : "Start listening")
 
+            Button(action: actions.toggleMicMute) {
+                Image(systemName: state.isMicrophoneMuted ? "mic.slash.fill" : "mic.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(state.isMicrophoneMuted ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+            }
+            .buttonStyle(.plain)
+            .help(state.isMicrophoneMuted
+                  ? "Microphone is muted — no transcription of your voice. Click to resume."
+                  : "Microphone is being transcribed. Click to mute (capture continues but isn't transcribed).")
+
+            Button(action: actions.toggleSystemAudioMute) {
+                Image(systemName: state.isSystemAudioMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(state.isSystemAudioMuted ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+            }
+            .buttonStyle(.plain)
+            .help(state.isSystemAudioMuted
+                  ? "System audio is muted — no transcription of meeting/video audio. Click to resume."
+                  : "System audio is being transcribed. Click to mute (capture continues but isn't transcribed).")
+
             Button {
                 showDebugPanel.toggle()
                 if showDebugPanel { logBuffer.clearAlertBadge() }

@@ -752,6 +752,22 @@ final class AppCoordinator {
                     let count = framesProcessed
                     Task { @MainActor [weak self] in self?.overlayState.audioFrameCount = count }
                 }
+                // Per-channel mute gate. When muted, the captured frame is dropped before
+                // VAD/transcription so the recognizer doesn't waste cycles on audio the
+                // user has explicitly silenced.
+                let isMuted: Bool
+                if let strongSelf = self {
+                    let channel = frame.channel
+                    isMuted = await MainActor.run { [strongSelf] in
+                        switch channel {
+                        case .microphone: return strongSelf.overlayState.isMicrophoneMuted
+                        case .system: return strongSelf.overlayState.isSystemAudioMuted
+                        }
+                    }
+                } else {
+                    isMuted = false
+                }
+                if isMuted { continue }
                 let event = await vad.feed(frame)
                 transcriber.feed(frame.buffer, channel: frame.channel)
                 if let event {
