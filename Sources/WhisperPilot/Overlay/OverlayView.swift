@@ -86,8 +86,8 @@ struct OverlayView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let banner = bannerMessage {
-                        BannerView(message: banner, actionTitle: bannerAction, action: actions.openSettings)
+                    if let banner = bannerSpec {
+                        BannerView(spec: banner)
                             .id("banner")
                     }
                     if !state.responseText.isEmpty || state.isResponseStreaming {
@@ -107,34 +107,50 @@ struct OverlayView: View {
         }
     }
 
-    private var bannerMessage: String? {
+    private var bannerSpec: BannerSpec? {
         switch state.status {
         case .needsAPIKey:
-            return "Add your Gemini API key in Settings to start receiving suggestions."
+            return BannerSpec(
+                message: "Add your Gemini API key in Settings to start receiving suggestions.",
+                button: BannerButton(title: "Open Settings", action: actions.openSettings)
+            )
         case .needsPermission(.microphone):
-            return "Microphone permission is required for the option you enabled. Grant it in System Settings."
+            return BannerSpec(
+                message: "Microphone permission is required. Grant it in System Settings → Privacy & Security → Microphone.",
+                button: nil
+            )
         case .needsPermission(.screenRecording):
-            return "Screen Recording permission is required to capture meeting audio. Grant it in System Settings → Privacy & Security."
+            return BannerSpec(
+                message: "Screen Recording permission is required to capture meeting audio. macOS may have recorded a previous denial — open System Settings, remove any 'Whisper Pilot' entries, then run again.",
+                button: BannerButton(title: "Open Privacy Settings", action: actions.openScreenRecordingPrivacy)
+            )
         case .error(let message):
-            return message
+            // -3801 specifically means TCC denied. Steer the user to the same recovery path.
+            if message.contains("-3801") || message.contains("declined TCCs") {
+                return BannerSpec(
+                    message: "macOS denied screen recording. Open Privacy Settings, remove any 'Whisper Pilot' entries, then run again.",
+                    button: BannerButton(title: "Open Privacy Settings", action: actions.openScreenRecordingPrivacy)
+                )
+            }
+            return BannerSpec(message: message, button: nil)
         default:
             return nil
         }
     }
+}
 
-    private var bannerAction: String? {
-        switch state.status {
-        case .needsAPIKey: return "Open Settings"
-        case .needsPermission, .error: return nil
-        default: return nil
-        }
-    }
+struct BannerSpec {
+    let message: String
+    let button: BannerButton?
+}
+
+struct BannerButton {
+    let title: String
+    let action: () -> Void
 }
 
 private struct BannerView: View {
-    let message: String
-    let actionTitle: String?
-    let action: () -> Void
+    let spec: BannerSpec
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -142,11 +158,12 @@ private struct BannerView: View {
                 .foregroundStyle(.orange)
                 .font(.callout)
             VStack(alignment: .leading, spacing: 6) {
-                Text(message)
+                Text(spec.message)
                     .font(.system(size: 12))
                     .foregroundStyle(.primary)
-                if let actionTitle {
-                    Button(actionTitle, action: action)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let button = spec.button {
+                    Button(button.title, action: button.action)
                         .controlSize(.small)
                         .buttonStyle(.borderedProminent)
                 }

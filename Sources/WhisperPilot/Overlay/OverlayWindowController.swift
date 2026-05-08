@@ -9,6 +9,7 @@ struct OverlayActions {
     var toggleListening: () -> Void
     var openSettings: () -> Void
     var hideOverlay: () -> Void
+    var openScreenRecordingPrivacy: () -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

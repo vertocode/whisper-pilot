@@ -25,6 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hideOverlay: { [weak self] in
                 print("[WP] action.hideOverlay fired")
                 self?.overlay?.window?.orderOut(nil)
+            },
+            openScreenRecordingPrivacy: { [weak self] in
+                print("[WP] action.openScreenRecordingPrivacy fired")
+                self?.coordinator.permissions.openScreenRecordingSettings()
             }
         )
 
