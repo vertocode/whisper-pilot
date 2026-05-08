@@ -185,10 +185,10 @@ final class AppCoordinator {
         startNoFramesWatchdog()
     }
 
-    /// Surfaces a visible warning if SCStream + the microphone tap have started but no
-    /// audio frames have been observed after a few seconds. This is exactly the silent-
-    /// failure mode users hit when ScreenCaptureKit's filter or output routing produces
-    /// zero buffers.
+    /// Surfaces visible warnings when the audio or transcription pipeline is silent. Two
+    /// staged checks: 6 seconds for "is audio flowing at all", then 14 seconds to confirm
+    /// transcripts started. The 14s gate fires only if audio is flowing — that's the case
+    /// where SFSpeechRecognizer is the bottleneck and the user needs a concrete next step.
     private func startNoFramesWatchdog() {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 6_000_000_000)
@@ -198,7 +198,18 @@ final class AppCoordinator {
                 wpWarn(message)
                 self.overlayState.appendSystemNote("⚠️ \(message)")
             } else if self.overlayState.transcriptCount == 0 {
-                let message = "Audio is flowing (\(self.overlayState.audioFrameCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video for a few seconds."
+                let message = "Audio is flowing (\(self.overlayState.audioFrameCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video."
+                wpWarn(message)
+                self.overlayState.appendSystemNote("⚠️ \(message)")
+            }
+        }
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 14_000_000_000)
+            guard let self, self.isRunning else { return }
+            if self.overlayState.audioFrameCount > 0, self.overlayState.transcriptCount == 0 {
+                let locale = self.settings.localeIdentifier
+                let message = "Still no transcripts after 14 seconds (locale=\(locale)). Likely causes: (a) Speech Recognition not authorized — check System Settings → Privacy & Security → Speech Recognition; (b) wrong locale — open Settings → General → Locale and try \"en-US\"; (c) the audio is silent or non-speech. Open the 🐞 Diagnostics panel to see RMS values per buffer."
                 wpWarn(message)
                 self.overlayState.appendSystemNote("⚠️ \(message)")
             }

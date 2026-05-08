@@ -87,11 +87,11 @@ private final class ChannelPipe {
 
     init(channel: AudioChannel, locale: Locale, sink: AsyncStream<TranscriptUpdate>.Continuation, log: Logger) throws {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
-            log.error("[\(String(describing: channel), privacy: .public)] No SFSpeechRecognizer for locale \(locale.identifier, privacy: .public)")
+            wpError("Transcriber.\(channel): no SFSpeechRecognizer for locale \(locale.identifier)")
             throw TranscriberError.unavailable(locale.identifier)
         }
         guard recognizer.isAvailable else {
-            log.error("[\(String(describing: channel), privacy: .public)] SFSpeechRecognizer not currently available for \(locale.identifier, privacy: .public)")
+            wpError("Transcriber.\(channel): SFSpeechRecognizer not currently available for \(locale.identifier)")
             throw TranscriberError.unavailable(locale.identifier)
         }
         self.channel = channel
@@ -100,10 +100,13 @@ private final class ChannelPipe {
         self.log = log
         self.request = SFSpeechAudioBufferRecognitionRequest()
         self.request.shouldReportPartialResults = true
-        // Only require on-device when the recognizer actually supports it for this locale.
-        self.request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
+        // Permissive: prefer on-device, but allow server fallback. Setting this to `true`
+        // when the locale's on-device model isn't fully ready causes the task to silently
+        // produce no output — exactly the symptom we kept hitting. Always-false here means
+        // recognition will use on-device when available, and Apple's servers when not.
+        self.request.requiresOnDeviceRecognition = false
         self.request.taskHint = .dictation
-        log.info("[\(String(describing: channel), privacy: .public)] ChannelPipe ready (onDevice=\(recognizer.supportsOnDeviceRecognition))")
+        wpInfo("Transcriber.\(channel) ready (locale=\(locale.identifier), onDeviceSupported=\(recognizer.supportsOnDeviceRecognition), requiresOnDevice=false)")
         startTask()
     }
 
@@ -111,10 +114,22 @@ private final class ChannelPipe {
         request.append(buffer)
         buffersAppended += 1
         if buffersAppended == 1 {
-            print("[WP][Transcriber.\(channel)] FIRST buffer appended")
-        } else if buffersAppended % 200 == 0 {
-            print("[WP][Transcriber.\(channel)] appended=\(buffersAppended) emitted=\(transcriptsEmitted)")
+            let rms = computeRMS(buffer)
+            wpInfo("Transcriber.\(channel) FIRST buffer (frames=\(buffer.frameLength), rms=\(String(format: "%.5f", rms)))")
+        } else if buffersAppended % 100 == 0 {
+            let rms = computeRMS(buffer)
+            wpInfo("Transcriber.\(channel) appended=\(buffersAppended) emitted=\(transcriptsEmitted) rms=\(String(format: "%.5f", rms))")
         }
+    }
+
+    private func computeRMS(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData else { return 0 }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return 0 }
+        let pointer = channelData.pointee
+        var sum: Float = 0
+        for i in 0..<frames { sum += pointer[i] * pointer[i] }
+        return (sum / Float(frames)).squareRoot()
     }
 
     func finish() {
@@ -125,8 +140,13 @@ private final class ChannelPipe {
     }
 
     private func startTask() {
+        var firstCallback = true
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
+            if firstCallback {
+                wpInfo("Transcriber.\(channel) recognitionTask first callback (result=\(result != nil), error=\(error != nil))")
+                firstCallback = false
+            }
             if let result {
                 let update = TranscriptUpdate(
                     id: segmentId,
@@ -138,18 +158,19 @@ private final class ChannelPipe {
                 sink.yield(update)
                 transcriptsEmitted += 1
                 if transcriptsEmitted == 1 {
-                    print("[WP][Transcriber.\(channel)] FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
+                    wpInfo("Transcriber.\(channel) FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
                 }
                 if result.isFinal {
-                    print("[WP][Transcriber.\(channel)] FINAL: \"\(update.text)\"")
+                    wpInfo("Transcriber.\(channel) FINAL: \"\(update.text)\"")
                     segmentId = UUID()
                 }
             }
             if let error {
-                print("[WP][Transcriber.\(channel)] error: \(error.localizedDescription)")
+                wpError("Transcriber.\(channel) recognition error: \(error.localizedDescription)")
                 segmentId = UUID()
             }
         }
+        wpInfo("Transcriber.\(channel) recognitionTask started")
     }
 }
 
