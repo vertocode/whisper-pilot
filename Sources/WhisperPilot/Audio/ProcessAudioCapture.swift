@@ -166,6 +166,12 @@ final class ProcessAudioCapture {
     /// canonical 16 kHz mono format, and yields to the pipeline.
     private func handle(_ bufferList: UnsafePointer<AudioBufferList>) {
         guard let inputFormat, let converter else { return }
+
+        // Compute RMS directly from the AudioBufferList memory before any
+        // AVAudioPCMBuffer wrapping. If this is non-zero but the wrapped buffer's RMS is
+        // zero, we know the wrapping (not the source) is the bug. Costs ~1 ms per call.
+        let rawRMS = framesEmitted < 5 ? Self.rawFloat32RMS(bufferList) : -1
+
         // Wrap the in-callback AudioBufferList without copying. The pointer is only valid
         // for the duration of this callback; we use it synchronously below so that's fine.
         guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, bufferListNoCopy: bufferList) else { return }
@@ -193,11 +199,33 @@ final class ProcessAudioCapture {
         if framesEmitted < 5 || framesEmitted % 200 == 0 {
             let inRMS = Self.computeRMSAny(inputBuffer)
             let outRMS = Self.computeRMSAny(outputBuffer)
-            wpInfo("ProcessAudio frame#\(framesEmitted) inFrames=\(frameCount) outFrames=\(outputBuffer.frameLength) inRMS=\(String(format: "%.5f", inRMS)) outRMS=\(String(format: "%.5f", outRMS))")
+            let rawTag = rawRMS >= 0 ? " rawRMS=\(String(format: "%.5f", rawRMS))" : ""
+            wpInfo("ProcessAudio frame#\(framesEmitted) inFrames=\(frameCount) outFrames=\(outputBuffer.frameLength) inRMS=\(String(format: "%.5f", inRMS)) outRMS=\(String(format: "%.5f", outRMS))\(rawTag)")
         }
 
         let frame = AudioFrame(buffer: outputBuffer, channel: .system, timestamp: Date())
         continuation.yield(frame)
+    }
+
+    /// RMS computed directly off the AudioBufferList memory, treating it as Float32. This
+    /// bypasses AVAudioPCMBuffer wrapping entirely — useful as ground truth for whether
+    /// the source is silent or our wrapping is misinterpreting layout.
+    private static func rawFloat32RMS(_ bufferList: UnsafePointer<AudioBufferList>) -> Float {
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: bufferList))
+        var sum: Double = 0
+        var count: Int = 0
+        for i in 0..<abl.count {
+            let buf = abl[i]
+            guard let data = buf.mData, buf.mDataByteSize > 0 else { continue }
+            let frameCount = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+            let ptr = data.assumingMemoryBound(to: Float.self)
+            for j in 0..<frameCount {
+                let s = Double(ptr[j])
+                sum += s * s
+            }
+            count += frameCount
+        }
+        return count > 0 ? Float((sum / Double(count)).squareRoot()) : 0
     }
 
     private static func computeRMSAny(_ buffer: AVAudioPCMBuffer) -> Float {

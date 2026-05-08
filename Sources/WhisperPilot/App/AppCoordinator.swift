@@ -557,6 +557,158 @@ final class AppCoordinator {
         """, category: .transcript)
     }
 
+    /// Mic Test — bypasses our pipeline entirely. Spins up an AVAudioEngine, taps the
+    /// input, records 3 seconds, and reports the RMS. If RMS≈0 here, the microphone is
+    /// genuinely delivering silent buffers (TCC denial / wrong device / muted input);
+    /// if RMS is healthy, our pipeline is at fault.
+    func runMicTest() async {
+        overlayState.appendSystemNote("🎤 Mic test running for 3 seconds — speak now.", category: .transcript)
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: break
+        case .notDetermined:
+            let granted: Bool = await withCheckedContinuation { cont in
+                AVCaptureDevice.requestAccess(for: .audio) { cont.resume(returning: $0) }
+            }
+            if !granted {
+                overlayState.appendSystemNote("❌ Mic test failed: microphone permission was not granted.", category: .transcript)
+                return
+            }
+        case .denied, .restricted:
+            overlayState.appendSystemNote("❌ Mic test failed: microphone permission is denied. Enable Whisper Pilot under System Settings → Privacy & Security → Microphone.", category: .transcript)
+            return
+        @unknown default: return
+        }
+
+        if let info = MicrophoneCapture.defaultInputDeviceInfo() {
+            wpInfo("Mic test: input device = \(info.name ?? "unknown") (id=\(info.id))")
+        }
+
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        wpInfo("Mic test: format \(format.sampleRate) Hz, \(format.channelCount) ch")
+
+        let lock = NSLock()
+        var sumSq: Double = 0
+        var sampleCount: Int = 0
+        var peakRMS: Float = 0
+
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            guard let channelData = buffer.floatChannelData else { return }
+            let channels = Int(buffer.format.channelCount)
+            let frames = Int(buffer.frameLength)
+            var localSum: Double = 0
+            var localCount = 0
+            for c in 0..<channels {
+                let ptr = channelData[c]
+                for i in 0..<frames {
+                    let s = Double(ptr[i])
+                    localSum += s * s
+                    localCount += 1
+                }
+            }
+            guard localCount > 0 else { return }
+            let chunkRMS = Float((localSum / Double(localCount)).squareRoot())
+            lock.lock()
+            sumSq += localSum
+            sampleCount += localCount
+            if chunkRMS > peakRMS { peakRMS = chunkRMS }
+            lock.unlock()
+        }
+
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            overlayState.appendSystemNote("❌ Mic test failed: engine.start threw \(error.localizedDescription)", category: .transcript)
+            return
+        }
+
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        input.removeTap(onBus: 0)
+        engine.stop()
+
+        let avgRMS = sampleCount > 0 ? sqrt(sumSq / Double(sampleCount)) : 0
+        let summary = "samples=\(sampleCount), avg RMS=\(String(format: "%.5f", avgRMS)), peak chunk RMS=\(String(format: "%.5f", peakRMS))"
+        wpInfo("Mic test: \(summary)")
+
+        if avgRMS < 0.001 {
+            overlayState.appendSystemNote("❌ Mic test FAILED — silent audio. \(summary). Microphone is delivering empty buffers. Likely cause: wrong input device. Open System Settings → Sound → Input, pick the right microphone, raise Input Volume.", category: .transcript)
+        } else if avgRMS < 0.005 {
+            overlayState.appendSystemNote("⚠️ Mic test BARELY THERE — \(summary). Mic is capturing but very quietly. Speak louder, raise Input Volume in Sound settings, or move closer.", category: .transcript)
+        } else {
+            overlayState.appendSystemNote("✅ Mic test PASSED — mic is capturing real audio. \(summary). If transcription still fails, the recognizer (not capture) is the bug.", category: .transcript)
+        }
+    }
+
+    /// System Audio Test — captures via Core Audio Process Tap for 3 seconds and reports
+    /// RMS. If RMS≈0, the audio you hear isn't actually going through the macOS audio
+    /// mixdown that taps and SCK both read from (typical with virtual / aggregate /
+    /// some Bluetooth devices).
+    func runSystemAudioTest() async {
+        overlayState.appendSystemNote("🔊 System audio test running for 3 seconds — make sure audio is playing.", category: .transcript)
+        if let out = MicrophoneCapture.defaultOutputDeviceInfo() {
+            wpInfo("Audio test: output device = \(out.name ?? "unknown") (id=\(out.id))")
+        }
+
+        guard #available(macOS 14.4, *) else {
+            overlayState.appendSystemNote("⚠️ System audio test requires macOS 14.4 or later (Process Tap). Falling back to ScreenCaptureKit isn't supported by this test.", category: .transcript)
+            return
+        }
+        let pt = ProcessAudioCapture()
+        do {
+            try await pt.start()
+        } catch {
+            overlayState.appendSystemNote("❌ Audio test failed at start: \(error.localizedDescription)", category: .transcript)
+            return
+        }
+
+        let lock = NSLock()
+        var sumSq: Double = 0
+        var sampleCount: Int = 0
+        var peakRMS: Float = 0
+
+        let frameTask = Task {
+            for await frame in pt.frames {
+                guard let channelData = frame.buffer.floatChannelData else { continue }
+                let channels = Int(frame.buffer.format.channelCount)
+                let frames = Int(frame.buffer.frameLength)
+                var localSum: Double = 0
+                var localCount = 0
+                for c in 0..<channels {
+                    let ptr = channelData[c]
+                    for i in 0..<frames {
+                        let s = Double(ptr[i])
+                        localSum += s * s
+                        localCount += 1
+                    }
+                }
+                guard localCount > 0 else { continue }
+                let chunkRMS = Float((localSum / Double(localCount)).squareRoot())
+                lock.lock()
+                sumSq += localSum
+                sampleCount += localCount
+                if chunkRMS > peakRMS { peakRMS = chunkRMS }
+                lock.unlock()
+            }
+        }
+
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        frameTask.cancel()
+        pt.stop()
+
+        let avgRMS = sampleCount > 0 ? sqrt(sumSq / Double(sampleCount)) : 0
+        let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
+        let summary = "samples=\(sampleCount), avg RMS=\(String(format: "%.5f", avgRMS)), peak chunk RMS=\(String(format: "%.5f", peakRMS)), default output=\"\(outName)\""
+        wpInfo("Audio test: \(summary)")
+
+        if avgRMS < 0.001 {
+            overlayState.appendSystemNote("❌ System audio test FAILED — silent capture. \(summary). The audio you're hearing isn't reaching the macOS mixdown we capture from. Common causes: Bluetooth headphones using a codec that bypasses the mix, BlackHole/Loopback/aggregate device set as default output, or HDMI display audio. Switch the default output to built-in speakers or wired headphones via System Settings → Sound → Output.", category: .transcript)
+        } else {
+            overlayState.appendSystemNote("✅ System audio test PASSED — audio is reaching us. \(summary). If transcription still fails on real meeting audio, the recognizer is the bug.", category: .transcript)
+        }
+    }
+
     /// RMS over a Float32 PCM buffer; used for self-test diagnostics only.
     private static func computeRMS(_ buffer: AVAudioPCMBuffer) -> Float {
         guard let channelData = buffer.floatChannelData else { return 0 }

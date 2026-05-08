@@ -141,11 +141,21 @@ struct OverlayView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button("Mic Test") { actions.runMicTest() }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                    .help("Records 3s from your microphone and reports RMS energy. Proves whether the mic captures real audio (independent of the recognizer).")
+                Button("Audio Test") { actions.runAudioTest() }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                    .help("Captures 3s of system audio via Process Tap and reports RMS energy. Proves whether your audio routing is going through the macOS mixdown we read from.")
                 Button("Self-Test") { actions.runSelfTest() }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
                     .font(.caption)
-                    .help("Synthesize speech and feed it directly into the recognizer. Proves whether transcription works in isolation from audio capture.")
+                    .help("Synthesizes speech and feeds it to the recognizer. Proves whether the recognition pipeline works in isolation from audio capture.")
                 Button("Clear") { logBuffer.clearAll() }
                     .controlSize(.small)
                     .buttonStyle(.plain)

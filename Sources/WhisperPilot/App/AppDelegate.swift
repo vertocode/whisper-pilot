@@ -53,6 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             runSelfTest: { [weak self] in
                 Task { await self?.coordinator.runRecognitionSelfTest() }
+            },
+            runMicTest: { [weak self] in
+                Task { await self?.coordinator.runMicTest() }
+            },
+            runAudioTest: { [weak self] in
+                Task { await self?.coordinator.runSystemAudioTest() }
             }
         )
 

@@ -21,6 +21,10 @@ struct OverlayActions {
     var dismissMessage: (UUID) -> Void
     /// Run the recognition self-test (synthesizes speech → feeds to recognizer → reports).
     var runSelfTest: () -> Void
+    /// Mic Test: spins up an AVAudioEngine, taps mic, reports RMS over 3 seconds.
+    var runMicTest: () -> Void
+    /// System Audio Test: Process Tap captures system audio, reports RMS over 3 seconds.
+    var runAudioTest: () -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers
