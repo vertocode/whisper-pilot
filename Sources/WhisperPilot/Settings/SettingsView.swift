@@ -101,6 +101,16 @@ struct SettingsView: View {
             Text("When AI is active and this is on, the assistant proactively summarizes the recent conversation at the chosen interval. Question detection still fires independently.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Picker("Transcript line break", selection: $store.utteranceBoundary) {
+                ForEach(UtteranceBoundary.allCases, id: \.self) { boundary in
+                    Text(boundary.displayName).tag(boundary)
+                }
+            }
+            Text(store.utteranceBoundary.description)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .formStyle(.grouped)
     }

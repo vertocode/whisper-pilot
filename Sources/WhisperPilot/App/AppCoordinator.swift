@@ -43,7 +43,6 @@ final class AppCoordinator {
     /// genuine end-of-utterance pauses should. A pending task is cancelled when speech
     /// resumes within the debounce window.
     private var pendingBoundaryTasks: [AudioChannel: Task<Void, Never>] = [:]
-    private static let utteranceBoundaryDelay: TimeInterval = 1.5
     private var settingsObserver: AnyCancellable?
     private var pausedObserver: AnyCancellable?
     private var intervalObserver: AnyCancellable?
@@ -868,22 +867,24 @@ final class AppCoordinator {
     private func handleVADEvent(_ event: VoiceActivityEvent) async {
         await triggerEngine.absorb(event)
 
-        // Debounced utterance-boundary cycling. Brief pauses between words shouldn't
-        // split a transcript line — only sustained silence should. Schedule the cycle
-        // for ~1.5 s out; cancel it if speech resumes within that window.
-        switch event {
-        case .speechStarted(let channel, _):
-            pendingBoundaryTasks[channel]?.cancel()
-            pendingBoundaryTasks[channel] = nil
-        case .speechEnded(let channel, _, _, _):
-            pendingBoundaryTasks[channel]?.cancel()
-            let task = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(Self.utteranceBoundaryDelay * 1_000_000_000))
-                guard !Task.isCancelled, let self else { return }
-                self.transcriber?.notifyVADBoundary(channel: channel)
-                self.pendingBoundaryTasks[channel] = nil
+        // Optional debounced utterance-boundary cycling. Default is `.auto` — no
+        // time-based cutting at all; we let SFSpeech finalize segments on its own.
+        // Users can opt into pause-driven line breaks via Settings → General.
+        if let delay = settings.utteranceBoundary.seconds {
+            switch event {
+            case .speechStarted(let channel, _):
+                pendingBoundaryTasks[channel]?.cancel()
+                pendingBoundaryTasks[channel] = nil
+            case .speechEnded(let channel, _, _, _):
+                pendingBoundaryTasks[channel]?.cancel()
+                let task = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    guard !Task.isCancelled, let self else { return }
+                    self.transcriber?.notifyVADBoundary(channel: channel)
+                    self.pendingBoundaryTasks[channel] = nil
+                }
+                pendingBoundaryTasks[channel] = task
             }
-            pendingBoundaryTasks[channel] = task
         }
 
         if let last = await transcriptBuffer.lastFinalized() {

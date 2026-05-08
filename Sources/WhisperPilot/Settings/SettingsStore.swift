@@ -1,6 +1,52 @@
 import Combine
 import Foundation
 
+/// When to start a new transcript line. `auto` lets the speech recognizer finalize on
+/// its own (no time-based cutting — long single utterances stay on one line). The other
+/// options force a line break after the chosen pause length.
+enum UtteranceBoundary: String, CaseIterable, Codable, Sendable {
+    case auto      // No time-based cycling. Trust SFSpeech's natural finalization.
+    case quick     // 1.5 s
+    case normal    // 3 s
+    case relaxed   // 5 s
+    case patient   // 10 s
+    case minute    // 60 s
+
+    /// Returns nil for `.auto` (no scheduled cycle).
+    var seconds: TimeInterval? {
+        switch self {
+        case .auto: return nil
+        case .quick: return 1.5
+        case .normal: return 3
+        case .relaxed: return 5
+        case .patient: return 10
+        case .minute: return 60
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .auto: return "Auto (no time-based cuts)"
+        case .quick: return "Quick (1.5 s pause)"
+        case .normal: return "Normal (3 s pause)"
+        case .relaxed: return "Relaxed (5 s pause)"
+        case .patient: return "Patient (10 s pause)"
+        case .minute: return "Every minute"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .auto: return "Default. Lines are split only when the speech recognizer naturally finishes — no artificial cutting on pauses."
+        case .quick: return "Snappy line breaks for crisp, fast-paced speech."
+        case .normal: return "Splits lines on a 3-second pause."
+        case .relaxed: return "Tolerates longer thinking pauses without splitting."
+        case .patient: return "For very slow speakers or long monologues."
+        case .minute: return "Forces a new line every 60 seconds, regardless of speech."
+        }
+    }
+}
+
 enum AutoSendInterval: String, CaseIterable, Codable, Sendable {
     case off
     case every30s
@@ -41,6 +87,7 @@ final class SettingsStore: ObservableObject {
         static let geminiAPIKey = "gemini.api_key"
         static let autoSendInterval = "ai.autoSendInterval"
         static let microphoneDeviceUID = "capture.microphoneDeviceUID"
+        static let utteranceBoundary = "transcription.utteranceBoundary"
     }
 
     private let defaults: UserDefaults
@@ -85,6 +132,10 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var utteranceBoundary: UtteranceBoundary {
+        didSet { defaults.set(utteranceBoundary.rawValue, forKey: Keys.utteranceBoundary) }
+    }
+
     var locale: Locale {
         Locale(identifier: localeIdentifier)
     }
@@ -107,5 +158,6 @@ final class SettingsStore: ObservableObject {
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier
         self.autoSendInterval = AutoSendInterval(rawValue: defaults.string(forKey: Keys.autoSendInterval) ?? "") ?? .off
         self.microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
+        self.utteranceBoundary = UtteranceBoundary(rawValue: defaults.string(forKey: Keys.utteranceBoundary) ?? "") ?? .auto
     }
 }
