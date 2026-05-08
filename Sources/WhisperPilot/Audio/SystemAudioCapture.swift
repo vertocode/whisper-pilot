@@ -148,15 +148,11 @@ extension SystemAudioCapture: SCStreamOutput {
         var error: NSError?
         var consumed = false
         converter.convert(to: outputBuffer, error: &error) { _, status in
-            if consumed {
-                status.pointee = .endOfStream
-                return nil
-            }
+            if consumed { status.pointee = .endOfStream; return nil }
             consumed = true
             status.pointee = .haveData
             return inputBuffer
         }
-
         if let error {
             log.error("Conversion error: \(String(describing: error), privacy: .public)")
             return nil

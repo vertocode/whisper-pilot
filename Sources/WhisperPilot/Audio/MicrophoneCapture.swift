@@ -71,10 +71,7 @@ final class MicrophoneCapture {
         var error: NSError?
         var consumed = false
         converter.convert(to: output, error: &error) { _, status in
-            if consumed {
-                status.pointee = .endOfStream
-                return nil
-            }
+            if consumed { status.pointee = .endOfStream; return nil }
             consumed = true
             status.pointee = .haveData
             return buffer

@@ -80,13 +80,16 @@ final class ProcessAudioCapture {
             objectID: tapID,
             selector: kAudioTapPropertyFormat
         )
-        wpInfo("ProcessAudio: tap format \(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch, formatID=0x\(String(asbd.mFormatID, radix: 16))")
+        let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        wpInfo("ProcessAudio: tap format \(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch, formatID=0x\(String(asbd.mFormatID, radix: 16)), bitsPerChannel=\(asbd.mBitsPerChannel), bytesPerFrame=\(asbd.mBytesPerFrame), isFloat=\(isFloat), nonInterleaved=\(isNonInterleaved)")
 
         var asbdCopy = asbd
         guard let inputFormat = AVAudioFormat(streamDescription: &asbdCopy) else {
             throw ProcessAudioError.formatConversionFailed
         }
         self.inputFormat = inputFormat
+        wpInfo("ProcessAudio: AVAudioFormat resolved — sampleRate=\(inputFormat.sampleRate), channels=\(inputFormat.channelCount), interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
         self.converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
 
         // 4. Create a private aggregate device backed by the tap.
@@ -168,30 +171,51 @@ final class ProcessAudioCapture {
         guard let inputFormat, let converter else { return }
 
         // Compute RMS directly from the AudioBufferList memory before any
-        // AVAudioPCMBuffer wrapping. If this is non-zero but the wrapped buffer's RMS is
-        // zero, we know the wrapping (not the source) is the bug. Costs ~1 ms per call.
+        // AVAudioPCMBuffer wrapping. Useful as ground truth.
         let rawRMS = framesEmitted < 5 ? Self.rawFloat32RMS(bufferList) : -1
 
-        // Wrap the in-callback AudioBufferList without copying. The pointer is only valid
-        // for the duration of this callback; we use it synchronously below so that's fine.
-        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, bufferListNoCopy: bufferList) else { return }
-        let frameCount = inputBuffer.frameLength
+        // Read frame count from the bufferList directly. We deliberately do NOT use
+        // `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:)` here — the converter was unable
+        // to consume the wrapped buffer correctly and produced 0 output frames despite
+        // valid input (confirmed by `inRMS=0.01 outRMS=0` logs). Allocating a fresh
+        // buffer and memcpy-ing the audio data costs ~10µs per buffer and gives us a
+        // properly-formed input that the converter handles.
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: bufferList))
+        guard abl.count > 0 else { return }
+        let bytesPerFrame = inputFormat.streamDescription.pointee.mBytesPerFrame
+        guard bytesPerFrame > 0 else { return }
+        let firstByteSize = Int(abl[0].mDataByteSize)
+        let frameCount = AVAudioFrameCount(firstByteSize / Int(bytesPerFrame))
         guard frameCount > 0 else { return }
+
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount) else { return }
+        inputBuffer.frameLength = frameCount
+        let dstABL = UnsafeMutableAudioBufferListPointer(inputBuffer.mutableAudioBufferList)
+        for i in 0..<min(abl.count, dstABL.count) {
+            let src = abl[i]
+            let dst = dstABL[i]
+            guard let srcData = src.mData, let dstData = dst.mData else { continue }
+            let copyBytes = min(Int(dst.mDataByteSize), Int(src.mDataByteSize))
+            memcpy(dstData, srcData, copyBytes)
+        }
 
         let outputFormat = CanonicalAudioFormat.make()
         let outputCapacity = AVAudioFrameCount(Double(frameCount) * outputFormat.sampleRate / inputFormat.sampleRate) + 1024
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else { return }
 
-        var error: NSError?
+        // Streaming convert — verified by synthetic test to produce ~170 frames for 512
+        // frames of 48 kHz input. The earlier failure was in the wrapping, not the
+        // converter.
+        var convertError: NSError?
         var consumed = false
-        converter.convert(to: outputBuffer, error: &error) { _, status in
+        converter.convert(to: outputBuffer, error: &convertError) { _, status in
             if consumed { status.pointee = .endOfStream; return nil }
             consumed = true
             status.pointee = .haveData
             return inputBuffer
         }
-        if let error {
-            wpError("ProcessAudio convert error: \(error.localizedDescription)")
+        if let convertError {
+            wpError("ProcessAudio convert error: \(convertError.localizedDescription)")
             return
         }
 
