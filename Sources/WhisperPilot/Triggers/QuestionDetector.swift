@@ -20,7 +20,7 @@ struct QuestionDetector: Sendable {
             score += 0.35
         }
         if Self.modalLeads.contains(where: { lower.hasPrefix($0 + " ") }) {
-            score += 0.3
+            score += 0.45
         }
 
         if lower.contains(" you ") || lower.hasPrefix("you ") || lower.hasSuffix(" you") {
