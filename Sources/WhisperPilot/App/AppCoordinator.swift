@@ -39,6 +39,12 @@ final class AppCoordinator {
     private(set) var currentSession: SessionMeta?
 
     init() {
+        // Wire up the AI provider eagerly if a key already exists, so the composer works
+        // before/without ever clicking ▶ Play. AI prompts are independent of listening.
+        if let key = settings.geminiAPIKey, !key.isEmpty {
+            aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
+        }
+
         settingsObserver = settings.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in self?.refreshDerivedState() }
         }
@@ -69,32 +75,29 @@ final class AppCoordinator {
     }
 
     private func refreshDerivedState() {
-        // While running, sync the live `aiProvider` reference with the current API key so
-        // adding/removing the key in Settings takes effect immediately on the next trigger
-        // / auto-send / composer submission.
-        if isRunning {
-            let key = settings.geminiAPIKey ?? ""
-            if !key.isEmpty {
-                if aiProvider == nil {
-                    aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
-                }
-            } else if aiProvider != nil {
-                aiProvider = nil
-                overlayState.appendSystemNote("ℹ️ Gemini key removed. Transcription still running; AI features disabled.")
+        // Sync the live `aiProvider` reference with the current API key. Runs whether or
+        // not we're actively listening — composer prompts work independently.
+        let key = settings.geminiAPIKey ?? ""
+        if !key.isEmpty {
+            if aiProvider == nil {
+                aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
             }
-            return
+        } else if aiProvider != nil {
+            aiProvider = nil
+            overlayState.appendSystemNote("ℹ️ Gemini key removed. Transcription still running; AI features disabled.", category: .general)
         }
-        switch overlayState.status {
-        case .needsAPIKey:
-            if let key = settings.geminiAPIKey, !key.isEmpty {
-                overlayState.status = .idle
+
+        if !isRunning {
+            switch overlayState.status {
+            case .needsAPIKey:
+                if !key.isEmpty { overlayState.status = .idle }
+            case .needsPermission(.microphone):
+                if !settings.captureMicrophone || permissions.snapshot.microphone == .granted {
+                    overlayState.status = .idle
+                }
+            default:
+                break
             }
-        case .needsPermission(.microphone):
-            if !settings.captureMicrophone || permissions.snapshot.microphone == .granted {
-                overlayState.status = .idle
-            }
-        default:
-            break
         }
     }
 
@@ -115,14 +118,14 @@ final class AppCoordinator {
             permissions.markScreenRecordingGranted()
             overlayState.permissionStatus = permissions.snapshot
             wpInfo("[Coordinator] ✓ Screen Recording probe passed")
-            // Surface a resolution note only if we'd previously seen this denied — saves
-            // noise on every clean Play click.
+            // Resolution success goes to diagnostics only — the user clicked Play and got
+            // green status. No need to clutter the chat lane.
             if priorScreenRecording != .granted {
-                overlayState.appendSystemNote("✅ Screen Recording permission detected.")
+                wpInfo("Screen Recording permission detected on this run")
             }
         } catch {
             wpError("Screen Recording probe failed: \(error.localizedDescription)")
-            overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.")
+            overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.", category: .general)
             overlayState.status = .needsPermission(.screenRecording)
             await permissions.requestScreenRecording()
             return
@@ -130,13 +133,12 @@ final class AppCoordinator {
 
         if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
             wpInfo("[Coordinator] microphone requested, not authorized — prompting")
-            overlayState.appendSystemNote("ℹ️ Asking macOS for microphone permission…")
             await permissions.requestMicrophone()
             if permissions.snapshot.microphone == .granted {
-                overlayState.appendSystemNote("✅ Microphone permission granted. Continuing…")
+                wpInfo("Microphone permission granted; continuing pipeline")
                 // fall through to start the pipeline so the user doesn't have to click Play again
             } else {
-                overlayState.appendSystemNote("⚠️ Microphone permission was not granted. Either disable microphone capture in Settings or grant access via System Settings → Privacy & Security → Microphone.")
+                overlayState.appendSystemNote("⚠️ Microphone permission was not granted. Either disable microphone capture in Settings or grant access via System Settings → Privacy & Security → Microphone.", category: .general)
                 overlayState.status = .needsPermission(.microphone)
                 return
             }
@@ -152,11 +154,10 @@ final class AppCoordinator {
         self.transcriber = transcriber
 
         if let key = settings.geminiAPIKey, !key.isEmpty {
-            self.aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
+            // refreshDerivedState already keeps aiProvider in sync; nothing to do here.
         } else {
-            self.aiProvider = nil
             wpInfo("[Coordinator] no Gemini key — transcription-only mode")
-            overlayState.appendSystemNote("ℹ️ Transcription is running. Add a Gemini API key in Settings to enable AI suggestions and the composer.")
+            overlayState.appendSystemNote("ℹ️ Transcription is running. Add a Gemini API key in Settings to enable AI suggestions.", category: .general)
         }
 
         do {
@@ -196,11 +197,11 @@ final class AppCoordinator {
             if self.overlayState.audioFrameCount == 0 {
                 let message = "No audio frames after 6 seconds. ScreenCaptureKit started but isn't delivering audio. Try playing a video, switching audio output device, or stop and start listening again."
                 wpWarn(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)")
+                self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             } else if self.overlayState.transcriptCount == 0 {
                 let message = "Audio is flowing (\(self.overlayState.audioFrameCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video."
                 wpWarn(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)")
+                self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             }
         }
 
@@ -211,7 +212,7 @@ final class AppCoordinator {
                 let locale = self.settings.localeIdentifier
                 let message = "Still no transcripts after 14 seconds (locale=\(locale)). Likely causes: (a) Speech Recognition not authorized — check System Settings → Privacy & Security → Speech Recognition; (b) wrong locale — open Settings → General → Locale and try \"en-US\"; (c) the audio is silent or non-speech. Open the 🐞 Diagnostics panel to see RMS values per buffer."
                 wpWarn(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)")
+                self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             }
         }
     }
@@ -271,7 +272,7 @@ final class AppCoordinator {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("Start listening first to enable the AI.")
+            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
             return
         }
         let displayedText = withScreenshot ? "\(text) 📸" : text
@@ -293,10 +294,10 @@ final class AppCoordinator {
             if withScreenshot {
                 if let imageData = await self.captureScreenJPEG() {
                     prompt.imageJPEGBase64 = imageData.base64EncodedString()
-                    print("[WP][Screenshot] captured \(imageData.count) bytes")
+                    wpInfo("Screenshot captured (\(imageData.count) bytes)")
                 } else {
-                    self.overlayState.appendSystemNote("Couldn't capture screen — sending without it.")
-                    print("[WP][Screenshot] capture failed; falling back to text-only")
+                    self.overlayState.appendSystemNote("⚠️ Couldn't capture screen — sending without it. Make sure Screen Recording permission is granted.", category: .ai)
+                    wpWarn("Screenshot capture failed; falling back to text-only")
                 }
             }
             await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
@@ -402,7 +403,6 @@ final class AppCoordinator {
                     wpInfo("Pipeline: first audio frame received (channel=\(frame.channel))")
                     Task { @MainActor [weak self] in
                         self?.overlayState.audioFrameCount = 1
-                        self?.overlayState.appendSystemNote("✅ Audio is flowing — first frame received.")
                     }
                 }
                 if framesProcessed % 25 == 0 {
@@ -430,7 +430,6 @@ final class AppCoordinator {
                 self?.overlayState.transcriptCount = transcriptsSeen
                 if transcriptsSeen == 1 {
                     wpInfo("First transcript update received")
-                    self?.overlayState.appendSystemNote("✅ Transcription is producing output.")
                 }
 
                 // Persist finalized transcript lines to the active session's transcript.md
@@ -510,7 +509,7 @@ final class AppCoordinator {
                 wpError("AI stream failed: \(message)")
                 self.overlayState.finishAssistant(id: messageId)
                 self.overlayState.status = .error(message)
-                self.overlayState.appendSystemNote("⚠️ \(message)")
+                self.overlayState.appendSystemNote("⚠️ \(message)", category: .ai)
             }
         }
         inFlightCompletion = task

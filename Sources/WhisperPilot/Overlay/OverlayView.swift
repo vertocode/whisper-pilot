@@ -184,8 +184,14 @@ struct OverlayView: View {
                             .id("banner")
                     }
 
+                    // General system notes — anything not specific to AI or transcript.
+                    ForEach(generalNotes) { note in
+                        MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
+                            .id(note.id)
+                    }
+
                     ChatLane(
-                        messages: state.messages,
+                        messages: aiMessages,
                         isAIPaused: state.isAIPaused,
                         onToggleAI: actions.toggleAIPaused,
                         onDismissMessage: actions.dismissMessage
@@ -194,6 +200,12 @@ struct OverlayView: View {
 
                     TranscriptLane(segments: state.transcript)
                         .id("transcript")
+
+                    // Transcript-related system notes (audio/recognition watchdog, …).
+                    ForEach(transcriptNotes) { note in
+                        MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
+                            .id(note.id)
+                    }
                 }
                 .padding(12)
             }
@@ -210,6 +222,18 @@ struct OverlayView: View {
                 }
             }
         }
+    }
+
+    private var generalNotes: [ChatMessage] {
+        state.messages.filter { $0.category == .general }
+    }
+
+    private var aiMessages: [ChatMessage] {
+        state.messages.filter { $0.category == .ai }
+    }
+
+    private var transcriptNotes: [ChatMessage] {
+        state.messages.filter { $0.category == .transcript }
     }
 
     // MARK: - Composer

@@ -108,6 +108,16 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// User-visible system note (e.g. "AI paused").
         case system
     }
+    /// Where the message renders in the overlay. User and assistant turns always go into
+    /// `.ai`; system notes use whichever section is closest to the issue they describe.
+    enum Category: String, Sendable {
+        /// Above both AI and transcript sections — general announcements.
+        case general
+        /// Inside the AI lane — assistant chat, user prompts, AI-related system notes.
+        case ai
+        /// Below the transcript lane — capture/recognition-related system notes.
+        case transcript
+    }
 
     let id: UUID
     let role: Role
@@ -115,6 +125,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var text: String
     let timestamp: Date
     var isStreaming: Bool
+    var category: Category
 }
 
 @MainActor
@@ -153,7 +164,7 @@ final class OverlayState: ObservableObject {
 
     @discardableResult
     func appendUserMessage(_ text: String) -> UUID {
-        let msg = ChatMessage(id: UUID(), role: .user, origin: .userPrompt, text: text, timestamp: Date(), isStreaming: false)
+        let msg = ChatMessage(id: UUID(), role: .user, origin: .userPrompt, text: text, timestamp: Date(), isStreaming: false, category: .ai)
         messages.append(msg)
         trim()
         return msg.id
@@ -161,7 +172,7 @@ final class OverlayState: ObservableObject {
 
     @discardableResult
     func beginAssistantStream(origin: ChatMessage.Origin) -> UUID {
-        let msg = ChatMessage(id: UUID(), role: .assistant, origin: origin, text: "", timestamp: Date(), isStreaming: true)
+        let msg = ChatMessage(id: UUID(), role: .assistant, origin: origin, text: "", timestamp: Date(), isStreaming: true, category: .ai)
         messages.append(msg)
         trim()
         return msg.id
@@ -177,8 +188,8 @@ final class OverlayState: ObservableObject {
         messages[idx].isStreaming = false
     }
 
-    func appendSystemNote(_ text: String) {
-        let msg = ChatMessage(id: UUID(), role: .system, origin: .system, text: text, timestamp: Date(), isStreaming: false)
+    func appendSystemNote(_ text: String, category: ChatMessage.Category = .general) {
+        let msg = ChatMessage(id: UUID(), role: .system, origin: .system, text: text, timestamp: Date(), isStreaming: false, category: category)
         messages.append(msg)
         trim()
     }
