@@ -52,6 +52,15 @@ struct SettingsView: View {
                     Text(Locale.current.localizedString(forIdentifier: id) ?? id).tag(id)
                 }
             }
+
+            Picker("Auto-send to AI", selection: $store.autoSendInterval) {
+                ForEach(AutoSendInterval.allCases, id: \.self) { interval in
+                    Text(interval.displayName).tag(interval)
+                }
+            }
+            Text("When AI is active and this is on, the assistant proactively summarizes the recent conversation at the chosen interval. Question detection still fires independently.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
     }

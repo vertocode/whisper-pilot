@@ -1,6 +1,34 @@
 import Combine
 import Foundation
 
+enum AutoSendInterval: String, CaseIterable, Codable, Sendable {
+    case off
+    case every30s
+    case every1m
+    case every2m
+    case every5m
+
+    var seconds: TimeInterval? {
+        switch self {
+        case .off: return nil
+        case .every30s: return 30
+        case .every1m: return 60
+        case .every2m: return 120
+        case .every5m: return 300
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .off: return "Off"
+        case .every30s: return "Every 30 seconds"
+        case .every1m: return "Every minute"
+        case .every2m: return "Every 2 minutes"
+        case .every5m: return "Every 5 minutes"
+        }
+    }
+}
+
 @MainActor
 final class SettingsStore: ObservableObject {
     private enum Keys {
@@ -11,6 +39,7 @@ final class SettingsStore: ObservableObject {
         static let clickThrough = "overlay.clickThrough"
         static let localeIdentifier = "transcription.locale"
         static let geminiAPIKey = "gemini.api_key"
+        static let autoSendInterval = "ai.autoSendInterval"
     }
 
     private let defaults: UserDefaults
@@ -39,6 +68,10 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(localeIdentifier, forKey: Keys.localeIdentifier) }
     }
 
+    @Published var autoSendInterval: AutoSendInterval {
+        didSet { defaults.set(autoSendInterval.rawValue, forKey: Keys.autoSendInterval) }
+    }
+
     var locale: Locale {
         Locale(identifier: localeIdentifier)
     }
@@ -59,5 +92,6 @@ final class SettingsStore: ObservableObject {
         self.alwaysOnTop = defaults.object(forKey: Keys.alwaysOnTop) as? Bool ?? true
         self.clickThrough = defaults.object(forKey: Keys.clickThrough) as? Bool ?? false
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier
+        self.autoSendInterval = AutoSendInterval(rawValue: defaults.string(forKey: Keys.autoSendInterval) ?? "") ?? .off
     }
 }

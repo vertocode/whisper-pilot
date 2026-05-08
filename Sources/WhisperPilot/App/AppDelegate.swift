@@ -29,6 +29,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openScreenRecordingPrivacy: { [weak self] in
                 print("[WP] action.openScreenRecordingPrivacy fired")
                 self?.coordinator.permissions.openScreenRecordingSettings()
+            },
+            toggleAIPaused: { [weak self] in
+                print("[WP] action.toggleAIPaused fired")
+                self?.coordinator.toggleAIPaused()
+            },
+            sendUserPrompt: { [weak self] text in
+                print("[WP] action.sendUserPrompt fired (\(text.count) chars)")
+                self?.coordinator.sendUserPrompt(text)
             }
         )
 

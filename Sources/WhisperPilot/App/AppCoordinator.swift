@@ -27,16 +27,32 @@ final class AppCoordinator {
     private var consumerTasks: [Task<Void, Never>] = []
     private var inFlightCompletion: Task<Void, Never>?
     private var settingsObserver: AnyCancellable?
+    private var pausedObserver: AnyCancellable?
+    private var intervalObserver: AnyCancellable?
+    private var autoSendTimer: Timer?
+    private var lastAutoSendTranscriptCount: Int = 0
 
     private(set) var isRunning = false
 
     init() {
-        // When the user types in their API key (or relevant settings change), recover from
-        // a stuck `.needsAPIKey` state so they don't have to click ▶ for the banner to clear.
         settingsObserver = settings.objectWillChange.sink { [weak self] in
-            // objectWillChange fires before the value is updated; defer to the next runloop tick.
             DispatchQueue.main.async { [weak self] in self?.refreshDerivedState() }
         }
+
+        intervalObserver = settings.$autoSendInterval
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.restartAutoSendTimer() }
+
+        pausedObserver = overlayState.$isAIPaused
+            .removeDuplicates()
+            .sink { [weak self] paused in
+                if paused {
+                    self?.overlayState.appendSystemNote("AI paused — only manual prompts will be sent.")
+                } else {
+                    self?.overlayState.appendSystemNote("AI active.")
+                }
+                self?.restartAutoSendTimer()
+            }
     }
 
     func bootstrap() async {
@@ -128,6 +144,7 @@ final class AppCoordinator {
         }
 
         startPipeline(transcriber: transcriber, ai: ai)
+        restartAutoSendTimer()
 
         isRunning = true
         overlayState.status = .listening
@@ -141,6 +158,8 @@ final class AppCoordinator {
         consumerTasks.removeAll()
         inFlightCompletion?.cancel()
         inFlightCompletion = nil
+        autoSendTimer?.invalidate()
+        autoSendTimer = nil
 
         await systemCapture.stop()
         await micCapture.stop()
@@ -156,6 +175,27 @@ final class AppCoordinator {
 
     func toggleListening() async {
         if isRunning { await stopListening() } else { await startListening() }
+    }
+
+    func toggleAIPaused() {
+        overlayState.isAIPaused.toggle()
+    }
+
+    /// User typed something in the composer. Always honored even when AI is paused.
+    func sendUserPrompt(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard let ai = aiProvider else {
+            overlayState.appendSystemNote("Start listening first to enable the AI.")
+            return
+        }
+        overlayState.appendUserMessage(text)
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await self.context.snapshot()
+            let prompt = PromptBuilder.buildUserQuery(context: snapshot, query: text, style: self.settings.responseStyle)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
+        }
     }
 
     // MARK: - Wiring
@@ -210,16 +250,20 @@ final class AppCoordinator {
         consumerTasks.append(Task { [weak self] in
             for await trigger in engine.events {
                 guard let self else { return }
+                if self.overlayState.isAIPaused {
+                    print("[WP][Coordinator] trigger fired but AI is paused — skipping")
+                    continue
+                }
                 self.log.info("→ Trigger fired, building prompt")
                 self.overlayState.status = .thinking
-                let snapshot = await context.snapshot()
+                let snapshot = await self.context.snapshot()
                 let style = self.settings.responseStyle
                 let prompt = PromptBuilder.build(
                     context: snapshot,
                     question: trigger.text,
                     style: style
                 )
-                await self.runCompletion(prompt: prompt, ai: ai)
+                await self.runCompletion(prompt: prompt, ai: ai, origin: .detectedQuestion)
             }
         })
     }
@@ -231,30 +275,65 @@ final class AppCoordinator {
         }
     }
 
-    private func runCompletion(prompt: Prompt, ai: AIProvider) async {
+    private func runCompletion(prompt: Prompt, ai: AIProvider, origin: ChatMessage.Origin) async {
         inFlightCompletion?.cancel()
         let task = Task { [weak self] in
             guard let self else { return }
-            self.overlayState.beginResponse()
+            let messageId = self.overlayState.beginAssistantStream(origin: origin)
+            self.overlayState.status = .streaming
             do {
                 var deltaCount = 0
                 for try await delta in ai.streamCompletion(prompt: prompt) {
                     if Task.isCancelled { break }
                     deltaCount += 1
-                    self.overlayState.appendResponse(delta)
+                    self.overlayState.appendDelta(to: messageId, delta)
                 }
                 self.log.info("Stream complete (\(deltaCount) deltas)")
-                self.overlayState.endResponse()
+                self.overlayState.finishAssistant(id: messageId)
                 self.overlayState.status = .listening
             } catch is CancellationError {
-                self.overlayState.endResponse()
+                self.overlayState.finishAssistant(id: messageId)
             } catch {
                 self.log.error("AI stream failed: \(String(describing: error), privacy: .public)")
-                self.overlayState.endResponse()
+                self.overlayState.finishAssistant(id: messageId)
                 self.overlayState.status = .error(error.localizedDescription)
             }
         }
         inFlightCompletion = task
         await task.value
+    }
+
+    // MARK: - Auto-send
+
+    private func restartAutoSendTimer() {
+        autoSendTimer?.invalidate()
+        autoSendTimer = nil
+        guard isRunning, !overlayState.isAIPaused, let interval = settings.autoSendInterval.seconds else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.runAutoSend() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autoSendTimer = timer
+        lastAutoSendTranscriptCount = overlayState.transcriptCount
+        print("[WP][Coordinator] auto-send timer scheduled every \(interval)s")
+    }
+
+    private func runAutoSend() {
+        guard isRunning, !overlayState.isAIPaused else { return }
+        guard let ai = aiProvider else { return }
+        // Skip the tick if no new transcript content has accumulated since the last send.
+        let currentCount = overlayState.transcriptCount
+        if currentCount <= lastAutoSendTranscriptCount {
+            print("[WP][Coordinator] auto-send tick skipped — no new transcripts since last send")
+            return
+        }
+        lastAutoSendTranscriptCount = currentCount
+        print("[WP][Coordinator] auto-send tick firing")
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await self.context.snapshot()
+            let prompt = PromptBuilder.buildAutoSend(context: snapshot, style: self.settings.responseStyle)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .autoSend)
+        }
     }
 }
