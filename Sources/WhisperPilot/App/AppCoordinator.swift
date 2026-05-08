@@ -19,6 +19,10 @@ final class AppCoordinator {
     private let audioMixer = AudioMixer()
     private let systemCapture = SystemAudioCapture()
     private let micCapture = MicrophoneCapture()
+    /// When Core Audio Process Tap is in use, this stream is its output. The pipeline
+    /// reads from whichever of `processTapFrames` or `systemCapture.frames` is active.
+    private var processTapFrames: AsyncStream<AudioFrame>?
+    private var processTapStop: (() -> Void)?
     private let vad = VoiceActivityDetector()
     private let transcriptBuffer = TranscriptBuffer()
     private let context = ConversationContext()
@@ -112,23 +116,40 @@ final class AppCoordinator {
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
-        let priorScreenRecording = permissions.snapshot.screenRecording
-        do {
-            _ = try await SCShareableContent.current
-            permissions.markScreenRecordingGranted()
-            overlayState.permissionStatus = permissions.snapshot
-            wpInfo("[Coordinator] ✓ Screen Recording probe passed")
-            // Resolution success goes to diagnostics only — the user clicked Play and got
-            // green status. No need to clutter the chat lane.
-            if priorScreenRecording != .granted {
-                wpInfo("Screen Recording permission detected on this run")
+        // Audio capture path. Prefer Core Audio Process Taps when available (macOS 14.4+):
+        // pure audio capture, no Screen Recording prompt, no "screen is being recorded"
+        // mode that breaks Live Captions and confuses some macOS audio routing setups.
+        // ScreenCaptureKit remains the fallback for older OSes or when the tap fails.
+        if #available(macOS 14.4, *) {
+            let pt = ProcessAudioCapture()
+            do {
+                try await pt.start()
+                processTapFrames = pt.frames
+                processTapStop = { pt.stop() }
+                wpInfo("[Coordinator] ✓ Using Core Audio Process Tap (audio-only, no screen recording)")
+            } catch {
+                wpWarn("Process Tap unavailable (\(error.localizedDescription)); falling back to ScreenCaptureKit")
             }
-        } catch {
-            wpError("Screen Recording probe failed: \(error.localizedDescription)")
-            overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.", category: .general)
-            overlayState.status = .needsPermission(.screenRecording)
-            await permissions.requestScreenRecording()
-            return
+        }
+
+        if processTapFrames == nil {
+            // SCK fallback path — needs Screen Recording permission.
+            let priorScreenRecording = permissions.snapshot.screenRecording
+            do {
+                _ = try await SCShareableContent.current
+                permissions.markScreenRecordingGranted()
+                overlayState.permissionStatus = permissions.snapshot
+                wpInfo("[Coordinator] ✓ Screen Recording probe passed (SCK fallback)")
+                if priorScreenRecording != .granted {
+                    wpInfo("Screen Recording permission detected on this run")
+                }
+            } catch {
+                wpError("Screen Recording probe failed: \(error.localizedDescription)")
+                overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.", category: .general)
+                overlayState.status = .needsPermission(.screenRecording)
+                await permissions.requestScreenRecording()
+                return
+            }
         }
 
         if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
@@ -163,8 +184,10 @@ final class AppCoordinator {
         do {
             try await transcriber.start()
             wpInfo("[Coordinator] transcriber.start OK")
-            try await systemCapture.start()
-            wpInfo("[Coordinator] systemCapture.start OK")
+            if processTapFrames == nil {
+                try await systemCapture.start()
+                wpInfo("[Coordinator] systemCapture.start OK (SCK)")
+            }
             if settings.captureMicrophone {
                 try await micCapture.start()
                 wpInfo("[Coordinator] micCapture.start OK")
@@ -227,11 +250,17 @@ final class AppCoordinator {
         autoSendTimer?.invalidate()
         autoSendTimer = nil
 
-        await systemCapture.stop()
+        if let stop = processTapStop {
+            stop()
+            processTapStop = nil
+            processTapFrames = nil
+        } else {
+            await systemCapture.stop()
+        }
         await micCapture.stop()
         transcriber?.stop()
         transcriber = nil
-        aiProvider = nil
+        // aiProvider stays alive across stop/start so the composer keeps working.
 
         isRunning = false
         overlayState.status = .idle
@@ -388,7 +417,9 @@ final class AppCoordinator {
         let context = context
         let engine = triggerEngine
 
-        let systemStream = systemCapture.frames
+        // Source the system audio from whichever capture path is currently active. Process
+        // Tap is preferred (audio-only, set up above when on macOS 14.4+); SCK is the fallback.
+        let systemStream = processTapFrames ?? systemCapture.frames
         let micStream = micCapture.frames
 
         consumerTasks.append(Task.detached {
