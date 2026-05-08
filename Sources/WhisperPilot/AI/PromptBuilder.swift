@@ -47,8 +47,19 @@ enum PromptBuilder {
     /// Triggered when the user types a prompt in the composer. The transcript AND the prior
     /// chat are both included so multi-turn references ("translate that", "explain more",
     /// "what did they say about X") resolve naturally.
-    static func buildUserQuery(context: ConversationSnapshot, history: [ChatTurn], query: String, style: ResponseStyle) -> Prompt {
-        let system = """
+    ///
+    /// When `withScreenshot` is true, the system instruction tells the model that an image
+    /// of the user's current screen accompanies the prompt. The actual image bytes are
+    /// attached separately on the `Prompt` (set by the coordinator after a successful
+    /// `SCScreenshotManager` capture).
+    static func buildUserQuery(
+        context: ConversationSnapshot,
+        history: [ChatTurn],
+        query: String,
+        style: ResponseStyle,
+        withScreenshot: Bool = false
+    ) -> Prompt {
+        var system = """
         You are an ambient real-time copilot. The user has typed a question or instruction \
         for you. Use the provided live transcript and the prior chat as context. If the user \
         references "they", "that", or "what was said", interpret it against the transcript or \
@@ -56,6 +67,10 @@ enum PromptBuilder {
 
         Style: \(style.rawValue) — \(style.description)
         """
+        if withScreenshot {
+            system += "\n\nAttached to this message is a screenshot of the user's current screen. " +
+                "Treat it as primary visual context for their question."
+        }
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),

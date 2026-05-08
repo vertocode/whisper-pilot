@@ -36,9 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("[WP] action.toggleAIPaused fired")
                 self?.coordinator.toggleAIPaused()
             },
-            sendUserPrompt: { [weak self] text in
-                print("[WP] action.sendUserPrompt fired (\(text.count) chars)")
-                self?.coordinator.sendUserPrompt(text)
+            sendUserPrompt: { [weak self] text, withScreenshot in
+                print("[WP] action.sendUserPrompt fired (\(text.count) chars, screenshot=\(withScreenshot))")
+                self?.coordinator.sendUserPrompt(text, withScreenshot: withScreenshot)
             }
         )
 

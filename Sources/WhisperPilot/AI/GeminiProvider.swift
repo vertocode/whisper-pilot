@@ -119,13 +119,17 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         let userText = """
         \(prompt.context)
 
-        Other party just asked: \(prompt.question)
+        Question for you: \(prompt.question)
 
         Respond now in the requested style.
         """
+        var parts: [GeminiRequest.Part] = [.init(text: userText)]
+        if let imageData = prompt.imageJPEGBase64, !imageData.isEmpty {
+            parts.append(.init(inlineData: .init(mimeType: "image/jpeg", data: imageData)))
+        }
         return GeminiRequest(
             systemInstruction: .init(parts: [.init(text: prompt.systemInstruction)]),
-            contents: [.init(role: "user", parts: [.init(text: userText)])],
+            contents: [.init(role: "user", parts: parts)],
             generationConfig: .init(temperature: 0.7, maxOutputTokens: 600)
         )
     }
@@ -155,7 +159,29 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
 // MARK: - Wire types
 
 private struct GeminiRequest: Encodable {
-    struct Part: Codable { let text: String }
+    struct InlineData: Codable {
+        let mimeType: String
+        let data: String
+
+        enum CodingKeys: String, CodingKey {
+            case mimeType = "mime_type"
+            case data
+        }
+    }
+
+    struct Part: Codable {
+        var text: String?
+        var inlineData: InlineData?
+
+        init(text: String) { self.text = text }
+        init(inlineData: InlineData) { self.inlineData = inlineData }
+
+        enum CodingKeys: String, CodingKey {
+            case text
+            case inlineData = "inline_data"
+        }
+    }
+
     struct Content: Codable {
         let role: String?
         let parts: [Part]

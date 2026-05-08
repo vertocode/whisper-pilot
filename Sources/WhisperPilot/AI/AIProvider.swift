@@ -30,6 +30,9 @@ struct Prompt: Sendable {
     let context: String
     let question: String
     let style: ResponseStyle
+    /// Optional base64-encoded JPEG attached as multimodal input (e.g. "see my screen"
+    /// composer toggle). Providers without vision support should ignore this gracefully.
+    var imageJPEGBase64: String? = nil
 }
 
 enum QuestionClass: String, Codable, Sendable {

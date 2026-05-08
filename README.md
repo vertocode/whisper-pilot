@@ -4,31 +4,42 @@
 
 <h1 align="center">Whisper Pilot</h1>
 
-<p align="center">An invisible, realtime AI sidekick for conversations on macOS.</p>
+<p align="center">An invisible, local-first AI co-pilot for everything you do on your Mac.</p>
 
-Whisper Pilot listens to your meetings (Teams, Meet, Slack, Zoom, Discord, browser calls) and your microphone, transcribes the conversation in realtime, detects when someone asks **you** a question, and quietly streams a contextual answer into a translucent floating overlay. No prompts. No copy/paste. No "Ask AI" button.
+Whisper Pilot listens to anything your Mac can hear — meetings, podcasts, tutorials, your own voice — transcribes it on-device in realtime, and lets you ask an AI about it from a translucent floating overlay. Type a question. Optionally let it see your screen. Get a streaming answer back, contextualized to what's actually happening.
 
-> **Status:** early. The architecture is in place; the audio → transcription → trigger → AI streaming → overlay vertical slice is wired end-to-end. Many heuristics, models, and UI affordances are scaffolded for iteration. See `docs/ARCHITECTURE.md` and `docs/ROADMAP.md`.
+It's tuned for live meetings (Teams, Meet, Slack, Zoom, Discord, in-browser calls), but the same pipeline works for any audio source. Pair programming, watching a Korean drama, debugging an error message in a video, capturing notes from a conference talk — the assistant doesn't care about the source.
 
-## Why
+> **Status:** alpha. The architecture is in place, sessions persist to disk as plain markdown, and the audio → transcription → trigger → AI → overlay pipeline is wired end-to-end. Many heuristics, models, and UI affordances are deliberately simple so they can be iterated quickly. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-Existing "AI assistants" force you to interrupt the flow of a conversation: switch windows, type a prompt, paste context. That defeats the point in a live call. Whisper Pilot is the opposite: ambient, proactive, and quiet by default. It only speaks up when a question on the call actually warrants help, and the answer is already streaming by the time you'd have alt-tabbed.
+## Why this exists
 
-## Design philosophy
+Existing AI assistants make you stop what you're doing: switch windows, type a prompt, paste context, wait. That's fine for a chatbot. It's wrong for anything live.
 
-- **Realtime** — every layer is streaming. Audio → transcription → trigger → LLM → UI all pipe partial results.
-- **Invisible** — translucent overlay, optional click-through, no chat UI.
-- **Proactive** — the trigger engine decides when to ask the model, not the user.
-- **Local-first by default** — system + microphone capture and transcription run on-device. Only the LLM call leaves your machine, and only with your own key.
-- **Bring your own key** — no backend, no telemetry, no signup. You provide a Gemini API key (Anthropic Claude / OpenAI / local providers planned).
-- **Free Apple stack** — no paid Developer Program needed. Builds and runs ad-hoc signed.
+Whisper Pilot is the opposite. It's ambient. It captures what's happening on your Mac, holds it in a rolling context, and is ready when you need it — either by detecting a question and answering proactively, or because you typed something into the composer and pressed ⌘⏎.
+
+A few examples of what that unlocks:
+
+- **Live meetings.** Someone asks you a hard question on a Zoom call. The assistant detects the question and starts streaming an answer before you'd have alt-tabbed.
+- **Tutorials and lectures.** Watching a video, hit pause, ask "what was that piece about object pools?" — the assistant has the transcript.
+- **Pair programming.** Tick the *See my screen* box in the composer, ask "why is this test failing?" — the assistant gets your prompt plus a fresh screenshot.
+- **Translation while watching.** Foreign-language video playing — ask "translate the last minute" or set auto-send on a 30-second interval and let it run.
+- **Generic system assistant.** Anything visible or audible on your Mac is fair game. You provide your own LLM key; we provide the plumbing.
+
+## Design principles
+
+- **Realtime end-to-end.** Audio → transcription → trigger → LLM → UI all stream. Partial results appear immediately.
+- **Local-first.** Audio never leaves the device. Transcription runs on-device via `SFSpeechRecognizer` (with `WhisperKit` planned). Only the prompt goes to the LLM, and only with your own key.
+- **Bring your own key.** No backend, no telemetry, no signup. Today: Gemini. Tomorrow: Claude, GPT, Ollama — same `AIProvider` protocol.
+- **Invisible by default.** Translucent floating window, optional click-through. No chat-window UX. The AI doesn't pop up — it streams quietly into a lane you can ignore.
+- **Free Apple stack.** No paid Developer Program required. Ad-hoc signed, runs locally.
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later — ScreenCaptureKit audio capture requires 13+; we target 14 for SwiftUI ergonomics
-- Apple Silicon recommended
-- Xcode 15+
-- [xcodegen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
+- macOS 14 (Sonoma) or later
+- Apple Silicon recommended (Intel works; transcription is slower)
+- Xcode 15 or later
+- [`xcodegen`](https://github.com/yonaskolb/XcodeGen) — `brew install xcodegen`
 - A Gemini API key from [aistudio.google.com](https://aistudio.google.com/app/apikey)
 
 ## Quick start
@@ -37,91 +48,124 @@ Existing "AI assistants" force you to interrupt the flow of a conversation: swit
 git clone git@github.com:vertocode/whisper-pilot.git
 cd whisper-pilot
 brew install xcodegen
-xcodegen generate
+./bin/regenerate         # runs `xcodegen generate`
 open WhisperPilot.xcodeproj
 ```
 
-Then in Xcode: select the **WhisperPilot** scheme and run (`⌘R`).
+In Xcode: select the **WhisperPilot** scheme and ⌘R. The first launch shows a **Sessions window** — start a new session, give it an optional name, then click **Start new**. The overlay appears in the top-right of your screen.
 
-> A `Package.swift` is also committed for contributor convenience — `swift build` will type-check the whole module without Xcode, and `swift run SmokeTests` runs the pure-logic test suite. It does not produce a runnable `.app` (entitlements and `Info.plist` live in `Project.yml`), and you should **not** open `Package.swift` in Xcode to run the app — always go through `xcodegen` + the generated `.xcodeproj`.
+A few first-run notes:
 
-**After every `git pull` (or after adding/removing source files), re-run xcodegen so the project file picks up the change:**
+1. macOS will prompt for **Screen Recording** permission the first time you click ▶ Play. Grant it in *System Settings → Privacy & Security → Screen & System Audio Recording*. This is how ScreenCaptureKit exposes meeting audio (and how we capture the screen for the *See my screen* feature).
+2. Microphone permission is only needed if you turn on *Capture microphone* in Settings.
+3. Open **Settings** (⚙ icon in the overlay header) and paste your Gemini API key. Stored in the macOS Keychain, never written to disk in plaintext.
 
-```bash
-./bin/regenerate     # convenience wrapper for `xcodegen generate`
+> A `Package.swift` is also committed for contributor convenience — `swift build` type-checks the whole module without Xcode and `swift run SmokeTests` runs the pure-logic test suite. **Do not** open `Package.swift` in Xcode to run the app — always go through `xcodegen` and the generated `.xcodeproj`. Run `./bin/regenerate` after every `git pull` so the project picks up new files.
+
+## How you use it
+
+The overlay is always available once you've picked a session.
+
+**▶ Start listening.** Begins capturing system audio (and microphone if enabled). Status flips to "Listening", and live counters under the status pill show the number of audio frames captured and transcripts produced. The transcript lane fills in as people talk.
+
+**Ask the AI.** Three ways:
+
+1. **Detected questions.** When the trigger engine detects someone asking *you* a question on the call, it streams an answer into the AI lane automatically. Configurable cooldown and pause requirements keep this from being noisy.
+2. **Periodic auto-send.** Set an interval in Settings → General → "Auto-send to AI" (`Off`, every 30 s, 1 min, 2 min, or 5 min). On every tick the assistant gets a recap-and-suggest-a-follow-up prompt. Skips the tick if no new transcripts have arrived since the last send.
+3. **Composer.** Type a question in the box at the bottom of the overlay. ⌘⏎ to send. Multi-turn references work — "translate that", "explain more", "what did they say about X" — because the AI receives both the live transcript and the recent chat history as context.
+
+**📸 See my screen.** Tick the small toggle next to the composer. When you submit, the overlay captures your current display via ScreenCaptureKit, downsamples it to ≤ 1280 px wide, JPEG-encodes it, and ships it as a multimodal `inline_data` part to Gemini. The model gets your text plus the image. The toggle resets after each send so it's deliberate every time.
+
+**⏸ Pause AI.** The sparkles button in the overlay header. When paused, neither detected questions nor the auto-send timer fire — only manual composer prompts go through. Useful when you want the assistant to listen and transcribe without burning tokens.
+
+## Sessions
+
+Sessions are first-class. Each session lives on disk under:
+
+```
+~/Library/Application Support/com.whisperpilot.app/sessions/<slug>-YYYY-MM-DD-HH-mm/
+├── transcript.md      # appended live, one block per finalized transcript segment
+├── chat.md            # appended live, one heading per turn
+└── metadata.json      # display name + timestamps
 ```
 
-If you skip this step, Xcode will surface "Cannot find … in scope" errors for newly added types because the `.xcodeproj` is a snapshot of the file tree at the last `xcodegen` run.
+`transcript.md` and `chat.md` are plain markdown — grep them, share them, version-control them. The app doesn't need to be running for them to be useful.
 
-On first launch:
-1. Grant **Microphone** permission (optional — only if you want to capture your own voice)
-2. Grant **Screen Recording** permission (required — this is how macOS exposes system audio via ScreenCaptureKit)
-3. Open **Settings** (⌘,) and paste your Gemini API key. It's stored in the macOS Keychain, never on disk in plaintext.
+The Sessions window (the launch screen, also reachable from the menu bar via *Sessions…* / ⌘S) shows your past sessions with line counts, last-used time, and per-session actions (Resume, Open in Finder, Delete).
 
-Start a meeting in Teams / Meet / Slack / Zoom. Click the menu bar icon → **Start listening**. The overlay appears. When the other party asks you a question, an answer streams in.
+**Resume re-includes prior content in every AI prompt.** The blue tip in the Sessions window says it explicitly: prefer a fresh session unless you actually need the prior context — it's cheaper in tokens.
 
 ## Architecture at a glance
 
 ```
-                            ┌──────────────┐
-   ScreenCaptureKit ──┐     │              │
-                       ├──►  AudioMixer ──► VAD ──► Transcriber ──► TranscriptBuffer
-   AVAudioEngine   ───┘     │              │                              │
-   (microphone, opt)        └──────────────┘                              ▼
-                                                                  ConversationContext
-                                                                          │
-                                                                          ▼
-                                                                   TriggerEngine
-                                                              (question? cooldown? VAD pause?)
-                                                                          │
-                                                                          ▼
-                                                                    AIProvider
-                                                                  (Gemini streaming)
-                                                                          │
-                                                                          ▼
-                                                                   OverlayState ──► SwiftUI overlay
+                              ┌──────────────┐
+   ScreenCaptureKit  ───┐     │              │
+                         ├──►  AudioMixer ──► VAD ──► Transcriber ──► TranscriptBuffer
+   AVAudioEngine    ────┘     │              │                              │
+   (microphone, opt)          └──────────────┘                              ▼
+                                                                     ConversationContext
+                                                                            │
+                              ┌─────────────────────────────────────────────┤
+                              │                                             │
+                       composer (with optional screenshot)            TriggerEngine
+                                              ▲                             │
+                              auto-send timer ┘                             ▼
+                                              │                       AIProvider
+                                              └────────────────►   (Gemini, streaming)
+                                                                            │
+                                                                            ▼
+                                                                     OverlayState ──► SwiftUI overlay
+                                                                            │
+                                                                            ▼
+                                                                     SessionStore (transcript.md + chat.md)
 ```
 
-Module breakdown lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Module-by-module breakdown lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Each module is behind a small protocol — swapping in a different LLM, transcriber, or VAD is a matter of conforming to the protocol and registering the implementation in `AppCoordinator`.
 
 ## Configuration
 
-Settings are persisted in `UserDefaults`; the API key is in Keychain.
+Settings persist in `UserDefaults`. The Gemini API key lives in Keychain.
 
-| Setting | Default | Notes |
-| --- | --- | --- |
-| AI provider | `gemini` | `gemini` is the only one wired up; the protocol supports more |
-| Gemini model | `gemini-2.0-flash` | low-latency tier |
-| Response style | `concise` | `concise`, `detailed`, `strategic`, `follow-up` |
-| Capture microphone | `false` | when off, only system audio is transcribed |
-| Trigger cooldown | `8s` | minimum gap between proactive answers |
-| VAD pause threshold | `700ms` | silence after a question that signals "your turn" |
-| Always on top | `true` | NSWindow level `.floating` |
-| Click-through | `false` | `ignoresMouseEvents` toggle |
+| Setting | Default | Where | Notes |
+| --- | --- | --- | --- |
+| Gemini API key | — | AI Provider tab | Keychain-backed |
+| Gemini model | `gemini-2.0-flash` | AI Provider tab | Flash is the right call for first-token latency |
+| Response style | `concise` | General tab | `concise` / `detailed` / `strategic` / `follow-up` |
+| Locale | system locale | General tab | `SFSpeechRecognizer` is locale-bound |
+| Auto-send to AI | `Off` | General tab | `30 s` / `1 min` / `2 min` / `5 min` |
+| Capture microphone | off | Capture tab | When off, only system audio is transcribed |
+| Always on top | on | Overlay tab | Window level `.floating` |
+| Click-through | off | Overlay tab | Ignores mouse events on the overlay |
 
 ## Privacy
 
-- Audio is processed in-memory and never written to disk.
-- Transcription runs locally via Apple's `SFSpeechRecognizer`. No audio leaves your machine for transcription.
-- Only the prompt sent to your chosen LLM provider leaves your machine — and only when the trigger engine fires. No background polling.
-- The Gemini API key lives in the macOS Keychain.
-- There is no backend. There is no telemetry.
+- **Audio is processed in-memory and never written to disk.** Only the resulting transcript is persisted, and only into the active session folder.
+- **Transcription runs locally** via Apple's `SFSpeechRecognizer` with on-device recognition where the locale supports it. No audio leaves the machine for transcription.
+- **The LLM call is the only thing that leaves your Mac** — and only when the trigger engine fires, the auto-send timer ticks, or you explicitly submit something in the composer. No background polling.
+- **Screenshots are captured only when you tick *See my screen*** and are sent inline with that single prompt. They're not cached, not written to disk, not retained.
+- **No backend, no telemetry, no signup.** The Gemini API key lives in your Keychain.
 
 ## Roadmap
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md). Highlights:
+The high points (full list in [`docs/ROADMAP.md`](docs/ROADMAP.md)):
 
-- WhisperKit / whisper.cpp transcriber as a drop-in alternative to `SFSpeechRecognizer`
-- Local LLM provider (Ollama, llama.cpp) behind the same `AIProvider` protocol
-- Speaker diarization (so the assistant knows when **you** are the one asking vs. answering)
-- Meeting summary + action item export at end of session
-- Coding-interview mode (system design diagrams, step-through reasoning)
-- Realtime translation overlay
-- Personalized response style ("write like me")
+- **WhisperKit transcriber** — drop-in alternative to `SFSpeechRecognizer`, better quality, runs on the Apple Neural Engine.
+- **Local LLM provider** — Ollama / `llama.cpp` behind the same `AIProvider` protocol.
+- **Speaker diarization** — beyond the system-vs-mic channel split.
+- **Per-mode prompts** — coding interview, sales call, customer support each get specialized system prompts.
+- **End-of-session summary** — action items, decisions, follow-ups.
+- **Realtime translation overlay.**
+- **Cross-session memory / RAG.**
 
 ## Contributing
 
-See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md). The project is structured into small modules (audio, transcription, ai, triggers, context, overlay, settings, permissions). Every module is behind a protocol, so swapping in alternatives — different LLM, different transcriber, different VAD — is a matter of conforming to the protocol and registering the implementation in `AppCoordinator`.
+We'd like the help. See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md). Modules are small, protocol-first, and isolated; swapping or extending one rarely touches the rest.
+
+A few areas that especially need eyes:
+
+- The trigger heuristic is hand-rolled. Snapshot tests against real transcripts would catch regressions.
+- WhisperKit transcriber.
+- Anyone who knows ScreenCaptureKit well enough to make the audio path more robust on multi-display / virtual-output setups.
 
 ## License
 

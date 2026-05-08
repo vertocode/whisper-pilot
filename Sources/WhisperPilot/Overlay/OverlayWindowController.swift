@@ -11,7 +11,9 @@ struct OverlayActions {
     var hideOverlay: () -> Void
     var openScreenRecordingPrivacy: () -> Void
     var toggleAIPaused: () -> Void
-    var sendUserPrompt: (String) -> Void
+    /// (text, withScreenshot) — when `withScreenshot` is true, the coordinator captures
+    /// the current display and ships it as multimodal input.
+    var sendUserPrompt: (String, Bool) -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

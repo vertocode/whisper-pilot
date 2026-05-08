@@ -22,6 +22,7 @@ struct OverlayView: View {
     @ObservedObject var state: OverlayState
     let actions: OverlayActions
     @FocusState private var composerFocused: Bool
+    @State private var includeScreenshot: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -140,24 +141,48 @@ struct OverlayView: View {
     // MARK: - Composer
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            TextField("Ask the AI… (uses live transcript as context)", text: $state.composerText, axis: .vertical)
-                .lineLimit(1...4)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .focused($composerFocused)
-                .onSubmit { submit() }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("Ask the AI… (uses live transcript and chat history as context)", text: $state.composerText, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($composerFocused)
+                    .onSubmit { submit() }
 
-            Button(action: submit) {
-                let isEmpty = state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(isEmpty ? AnyShapeStyle(HierarchicalShapeStyle.tertiary) : AnyShapeStyle(Color.accentColor))
+                Button(action: submit) {
+                    let isEmpty = state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(isEmpty ? AnyShapeStyle(HierarchicalShapeStyle.tertiary) : AnyShapeStyle(Color.accentColor))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Send to AI (⌘⏎)")
+            }
+
+            Button(action: { includeScreenshot.toggle() }) {
+                HStack(spacing: 4) {
+                    Image(systemName: includeScreenshot ? "eye.fill" : "eye")
+                        .font(.system(size: 11))
+                    Text("See my screen")
+                        .font(.system(size: 10))
+                    if includeScreenshot {
+                        Text("· attached")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(includeScreenshot ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.08))
+                )
+                .foregroundStyle(includeScreenshot ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
             }
             .buttonStyle(.plain)
-            .keyboardShortcut(.return, modifiers: [.command])
-            .disabled(state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .help("Send to AI (⌘⏎)")
+            .help("When on, the AI receives a screenshot of your current display along with this message.")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -166,8 +191,9 @@ struct OverlayView: View {
     private func submit() {
         let text = state.composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        actions.sendUserPrompt(text)
+        actions.sendUserPrompt(text, includeScreenshot)
         state.composerText = ""
+        includeScreenshot = false
     }
 
     // MARK: - Banner

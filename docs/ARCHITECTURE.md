@@ -1,88 +1,101 @@
 # Architecture
 
-This document describes the runtime data flow and the responsibilities of each module. It assumes you have read the README.
+This document describes the runtime data flow and the responsibilities of each module. Read the README first.
+
+Whisper Pilot is a system-wide AI co-pilot for macOS. It captures audio (and optionally a screenshot) from anywhere on your Mac, transcribes locally, holds rolling context, and streams an LLM response into a translucent overlay. The architecture optimizes for three things: end-to-end latency, module isolation, and substitutability.
 
 ## Goals
 
-1. **Streaming top to bottom.** Audio frames, transcript hypotheses, LLM tokens, UI updates — everything flows as it arrives.
-2. **Module isolation.** Every domain (audio, transcription, AI, …) is behind a small protocol. The wiring lives in `AppCoordinator` and nowhere else.
-3. **No surprises.** Each module is small, single-purpose, and unit-testable in isolation.
+1. **Streaming top to bottom.** Audio frames, transcript hypotheses, LLM tokens, UI updates — everything flows as it arrives. No batch processing.
+2. **Module isolation.** Every domain (audio, transcription, AI, sessions, …) is behind a small protocol. The wiring lives in `AppCoordinator` and nowhere else.
+3. **Substitutable parts.** Swapping in WhisperKit, Ollama, a smarter VAD, a learned question detector — each is one file plus one line in the coordinator.
 
 ## Module map
 
 ```
 Sources/WhisperPilot/
-├── App/             // Entry point, AppDelegate, AppCoordinator (wires modules)
-├── Audio/           // Capture pipeline (system + mic), VAD
-├── Transcription/   // Streaming speech-to-text
+├── App/             // Entry point, AppDelegate, AppCoordinator (the only file that wires concrete types)
+├── Audio/           // System audio (ScreenCaptureKit) + microphone (AVAudioEngine), VAD, mixer
+├── Transcription/   // Streaming speech-to-text with channel attribution
 ├── Context/         // Rolling conversation memory + topic state
 ├── Triggers/        // Question detection + cooldown / debounce policy
-├── AI/              // Provider protocol + Gemini implementation
-├── Overlay/         // Floating panel window + SwiftUI views
+├── AI/              // Provider protocol + Gemini implementation (multimodal-aware)
+├── Overlay/         // Floating panel window + SwiftUI views (header, chat lane, transcript lane, composer)
 ├── Settings/        // Preferences view, persistent store, Keychain helper
 ├── Permissions/     // Microphone + Screen Recording flow
-└── Persistence/     // (future) session log
+├── Persistence/     // SessionStore — disk-backed sessions with markdown transcripts
+├── Sessions/        // SessionsWindow — launch screen + resume UI
+└── MenuBar/         // Status item + menu
 ```
+
+## Lifecycle
+
+1. App launches → `WhisperPilotApp` (SwiftUI) → `AppDelegate.applicationDidFinishLaunching`.
+2. `AppDelegate` constructs `AppCoordinator`, the overlay window (hidden), and the **Sessions window** (visible). The user picks or creates a session.
+3. Picking a session calls `coordinator.useSession(_:resumed:)`, which seeds `ConversationContext` (with prior markdown if resumed), and shows the overlay.
+4. The user clicks ▶ Play → `coordinator.startListening()` walks gates: Screen Recording probe, mic permission (if requested), API key presence. Then it starts the transcriber, the system + microphone capture, and wires the pipeline.
 
 ## Data flow
 
 ### 1. Capture
 
-`SystemAudioCapture` uses `SCStream` from ScreenCaptureKit to receive system audio frames. `MicrophoneCapture` uses `AVAudioEngine` to tap the input node. Both produce `AVAudioPCMBuffer` instances on a dedicated audio queue.
+`SystemAudioCapture` uses `SCStream` from ScreenCaptureKit with `capturesAudio = true` to receive system audio. `MicrophoneCapture` uses `AVAudioEngine`'s input node tap. Both convert to a canonical 16 kHz mono PCM format via `AVAudioConverter`, attaching the `AudioChannel` (`.system` / `.microphone`) on every frame.
 
-`AudioMixer` consumes both streams. When the user has the microphone enabled it forwards both as separate logical channels (we do **not** sum them yet; see "Speaker diarization" in the roadmap). When mic is disabled, only system audio is forwarded.
+`AudioMixer` consumes both `AsyncStream<AudioFrame>` instances and merges them into a single ordered stream — channels are kept distinct, never summed, so transcription stays attributable.
 
-`VoiceActivityDetector` wraps the stream with a simple energy-based detector. It emits `.speechStarted`, `.speechEnded(duration:)` events alongside the buffers. The `Triggers` module consumes those events to know when a question has finished.
+`VoiceActivityDetector` is a per-channel energy-threshold VAD with hangover. It emits `.speechStarted` / `.speechEnded` events the trigger engine uses to know when to fire after a question.
 
 ### 2. Transcription
 
-`TranscriptionProvider` is a protocol:
+`TranscriptionProvider` is a small protocol:
 
 ```swift
 protocol TranscriptionProvider {
     func start() async throws
     func stop()
-    func feed(_ buffer: AVAudioPCMBuffer)
+    func feed(_ buffer: AVAudioPCMBuffer, channel: AudioChannel)
     var transcripts: AsyncStream<TranscriptUpdate> { get }
 }
 ```
 
-`TranscriptUpdate` carries `(segmentId, text, isFinal, timestamp, channel)` — `channel` is `system` or `microphone` so the consumer can attribute speakers later.
+`TranscriptUpdate` carries `(segmentId, text, isFinal, channel, timestamp)` — `channel` is preserved end-to-end so the overlay shows `OTHER:` vs `ME:` and the trigger engine can ignore the user's own utterances.
 
-The default implementation is `AppleSpeechTranscriber` (uses `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true`). It is free, native, and on-device on macOS 14+. Drop-in alternatives planned: `WhisperKitTranscriber`, `WhisperCppTranscriber`.
+The default implementation, `AppleSpeechTranscriber`, runs two `SFSpeechRecognizer` pipes in parallel — one per channel — with `requiresOnDeviceRecognition` set when the locale supports it. Drop-in alternatives planned: `WhisperKitTranscriber` (Core ML, runs on the ANE on Apple Silicon), `WhisperCppTranscriber`.
 
-Updates land in `TranscriptBuffer`, a rolling buffer keyed by segment ID. Partial hypotheses overwrite their slot until they're finalized. The buffer publishes its current state to `ConversationContext` and to the overlay.
+`TranscriptBuffer` is a rolling actor-backed buffer keyed by segment ID. Partial hypotheses overwrite their slot until they're finalized. The buffer publishes its current state to `OverlayState` and its finalized lines to `ConversationContext`.
 
 ### 3. Context
 
 `ConversationContext` is the rolling memory the LLM sees. It holds:
 
-- The last N seconds of transcript (default 90s, ~600 tokens for a normal-paced conversation)
-- Extracted topics (tracked across turns so we don't keep re-discovering them)
-- Detected entities and technologies
-- A digest of older content so we don't blow the context window
+- The last N seconds of finalized transcript (default 90 s, ~600 tokens for normal-paced conversation).
+- Extracted topics (kept across turns so we don't keep rediscovering them).
+- Detected entities and technologies.
+- Optional **prior session markdown** when a session was resumed — surfaced as a separate "Prior session transcript / Prior session AI chat" block so the model knows it's older context.
 
-`TopicExtractor` runs cheaply on every finalized segment: keyword-based for v1, embedding-based later.
+`TopicExtractor` runs cheaply via `NLTagger` per finalized segment.
 
 ### 4. Triggers
 
-`QuestionDetector` looks at finalized transcript segments and scores them on:
+`QuestionDetector` scores each finalized system-channel segment based on:
 
-- Question marks / interrogative starters ("how", "what", "can you", "could you", "do you", "would you", "why", "when")
-- Pronouns directed at the listener ("you", "your")
-- Pause length after the segment (from VAD)
-- Sentence length (very short utterances are usually filler)
+- Question marks + interrogative starters (`how`, `what`, `why`, `can you`, `could you`, …).
+- Modal leads (`tell me about`, `walk me through`, …).
+- Direct address (`you`, `your`).
+- Length thresholds (very short or very long utterances are downweighted).
 
 `TriggerEngine` decides whether to actually fire:
 
-- Score must clear `triggerThreshold` (default 0.6)
-- Cooldown since last fire must be respected (default 8s)
-- A minimum VAD silence after the question must have passed (default 700ms — gives the user a chance to start answering before we suggest)
-- If a fire is in flight when a new candidate arrives, the in-flight call is cancelled and the new one takes priority (latest question wins)
+- Score ≥ `triggerThreshold` (default 0.6).
+- Cooldown since last fire respected (default 8 s).
+- A minimum VAD silence after the question — default 700 ms — gives the user a chance to start answering before we suggest.
+- In-flight completions are cancelled when a new trigger fires (latest question wins).
+
+When the user has set the AI to Paused, the trigger engine's events still come through but the coordinator drops them on the floor. Only manual composer prompts go through.
 
 ### 5. AI
 
-`AIProvider` is small on purpose:
+`AIProvider` is intentionally tight:
 
 ```swift
 protocol AIProvider {
@@ -93,55 +106,69 @@ protocol AIProvider {
 }
 ```
 
-`GeminiProvider` implements it via the `streamGenerateContent` REST endpoint. The streaming endpoint emits Server-Sent-Event chunks of partial JSON; we parse incrementally with `URLSession.bytes(for:)` and yield decoded text deltas.
+`Prompt` carries `systemInstruction`, `context`, `question`, `style`, and an optional `imageJPEGBase64` for multimodal input. `GeminiProvider` packages those into `streamGenerateContent?alt=sse` requests, parses the SSE stream of partial JSON via `URLSession.bytes(for:)`, and yields decoded text deltas. When `imageJPEGBase64` is set, it ships as a second `inline_data` part so vision-capable models reason about the screenshot.
 
-`PromptBuilder` assembles the prompt from `ConversationContext` + the detected question + the user's chosen response style. It deliberately keeps the system instruction short (latency).
+`PromptBuilder` is the only place that decides how transcript + history + screenshot context get composed. Three entry points:
 
-`classifyQuestion` and `extractTopics` are also Gemini calls but with `responseMimeType: application/json` for structured output.
+- `build(...)` — for detected questions on the call.
+- `buildAutoSend(...)` — for the periodic timer; asks for a recap + suggested follow-up.
+- `buildUserQuery(..., withScreenshot:)` — for composer messages; flips a hint in the system instruction when a screenshot accompanies the prompt.
+
+All three include the recent meeting transcript, the prior assistant↔user chat (last 10 turns), topics, and prior session markdown if resumed.
 
 ### 6. Overlay
 
-`OverlayWindowController` owns an `NSPanel` configured as:
+`OverlayWindowController` owns a real `NSWindow` (not `NSPanel`) so window managers like BetterSnapTool, Rectangle, and macOS's own snap-to-edge can manage and resize it. The chrome is hidden (`titlebarAppearsTransparent`, `titleVisibility = .hidden`, all traffic lights `.isHidden = true`) so it still looks borderless. The window level is `.floating` when *Always on top* is enabled.
 
-- Level `.floating` (or `.statusBar` when "always on top" is on)
-- `.nonactivatingPanel` style mask (we don't steal focus from the call)
-- `isMovableByWindowBackground = true`
-- `ignoresMouseEvents = true` when click-through is enabled
+`OverlayView` lays out four lanes that update independently:
 
-`OverlayView` renders four lanes that update independently:
+- **Header** — logo, status pill (`Idle` / `Listening` / `Thinking` / `Speaking`), live counters (`X audio · Y transcripts`), and the action cluster: ▶ listening toggle, ⏸ AI pause, ⚙ settings, ✕ hide.
+- **Banner** — appears for `.needsAPIKey`, `.needsPermission(...)`, or `.error(...)`. Each banner provides an actionable button (Open Settings / Open Privacy Settings).
+- **Chat lane** — `[ChatMessage]` bubbles with role badges (You / Assistant / System) and origin badges (`from detected question`, `auto-send`).
+- **Transcript lane** — recent transcript segments with channel attribution.
+- **Composer** — text field + 📤 send + 👁 *See my screen* toggle. Toggle resets after each send so attaching a screenshot is always deliberate.
 
-- **Live transcript** — last few seconds, ghosted older lines
-- **AI response** — the streaming token output, with a typing indicator
-- **Suggested follow-ups** — short tap-to-pin list
-- **State** — listening / thinking / speaking / idle
+`OverlayState` is the `@MainActor` `ObservableObject` the coordinator pushes into.
 
-`OverlayState` is an `@MainActor` `ObservableObject` that the coordinator pushes updates into.
+### 7. Sessions & persistence
 
-### 7. Settings & Permissions
+`SessionStore` is an `actor` that owns `~/Library/Application Support/<bundle>/sessions/`. Each session is a folder named `<slug>-YYYY-MM-DD-HH-mm/` containing `transcript.md`, `chat.md`, and `metadata.json`. Files are appended live as transcripts finalize and chat turns complete — no batched flush, no in-memory queue.
 
-`SettingsStore` wraps `UserDefaults`. `KeychainHelper` reads/writes the API key. `PermissionsManager` walks the user through both system permission grants on first launch.
+`SessionsWindow` is the launch UI. It lists past sessions (sorted by most-recently-used), supports per-row Resume / Open in Finder / Delete, and prominently displays a tip about the token-cost trade-off of resuming.
+
+On resume, the coordinator loads `transcript.md` and `chat.md` as raw markdown and hands both to `ConversationContext.seedFromMarkdown(...)`. Subsequent prompts include "Prior session transcript (resumed)" and "Prior session AI chat (resumed)" sections so the model knows it's older context.
+
+### 8. Settings & permissions
+
+`SettingsStore` wraps `UserDefaults`. `KeychainHelper` reads/writes the Gemini API key. `PermissionsManager` walks the user through both system permission grants on first launch and provides a deep link to the Privacy & Security pane for recovery (TCC denials are easy to hit during dev).
+
+The Settings window is owned by `AppDelegate`, not by SwiftUI's `Settings { }` scene — the magic `showSettingsWindow:` action selector silently no-ops on accessory / `LSUIElement` apps in recent SDKs, so we manage our own `NSWindow` and skip the routing entirely.
 
 ## Threading model
 
-- **Audio queue** — `SystemAudioCapture` and `MicrophoneCapture` deliver buffers on a dedicated `DispatchQueue`. They do not touch UI.
-- **Transcription actor** — `AppleSpeechTranscriber` is an actor. It owns the recognizer and the `AsyncStream` continuation.
-- **Trigger engine** — also an actor. State (cooldown, last fire) is contained.
-- **AI calls** — plain `Task` chains. Cancellable, in-flight call is stored on the coordinator so a new trigger can cancel it.
+- **Audio queue** — `SystemAudioCapture` and `MicrophoneCapture` deliver buffers on a dedicated `DispatchQueue`. They never touch UI.
+- **Transcription** — `AppleSpeechTranscriber` is a class with two internal channel pipes; the `recognitionTask` callback marshals updates into the public `AsyncStream`.
+- **Trigger engine** — actor. State (cooldown, last fire, pending candidate) is fully contained.
+- **AI calls** — plain `Task` chains. Cancellable. The in-flight task is stored on the coordinator so a new trigger or composer submission cancels the old one.
 - **UI** — every observable state mutation hops to `@MainActor`.
+- **Persistence** — `SessionStore` is an actor; appends are serialized.
 
 ## Why these choices
 
-- **`SFSpeechRecognizer` over WhisperKit on day one.** No model download, no Core ML compile step, works on first launch. The `TranscriptionProvider` protocol means swapping is trivial when we want the quality bump.
-- **Gemini Flash over Pro on day one.** Latency is the dominant UX signal here. Flash's first-token latency on streamed completion is consistently sub-second.
-- **No SwiftData / no Core Data.** There is nothing persistent in v1 except settings. Conversation log persistence is in the roadmap and will be a single module addition.
-- **Floating panel, not a regular window.** A regular `NSWindow` steals focus and disrupts the meeting. `NSPanel` with `.nonactivating` does not.
+- **`SFSpeechRecognizer` over WhisperKit on day one.** No model download, no Core ML compile, works on first launch. The `TranscriptionProvider` protocol means swapping in WhisperKit later is a single conformance.
+- **Gemini Flash over Pro by default.** Latency is the dominant UX signal here. Flash's first-token latency on streamed completion is consistently sub-second.
+- **No SwiftData / no Core Data.** The persistence model is markdown files on disk. Plain text outlives any database we'd pick. If we ever need indexing, we'll add it on top of the same files.
+- **`NSWindow` (not `NSPanel`) for the overlay.** Window managers refuse to touch panels and borderless windows. Real `NSWindow` with hidden chrome gives both the borderless look and full window-manager support.
+- **Sessions-first launch screen.** The disk-backed session is the unit of work. Forcing the user to pick or create one removes the ambiguity of "what is this transcript attached to?"
 
 ## Extending
 
-To add a new LLM provider, conform to `AIProvider` and register it in `AppCoordinator.makeAIProvider()`. To add a new transcriber, conform to `TranscriptionProvider` and likewise. The wiring layer is the only place that knows about concrete types.
+To add a new LLM provider, conform to `AIProvider` and register it in `AppCoordinator.startListening()`. To add a new transcriber, conform to `TranscriptionProvider` and likewise. The wiring layer is the only place that knows about concrete types.
+
+To add a new context source — e.g. clipboard contents, browser tab title, Apple Notes — extend `ConversationSnapshot` and have `PromptBuilder.contextBlock(...)` include it. The pipeline downstream needs no changes.
 
 ## Non-goals
 
-- A chat UI. There is no input field for the user to type into. Adding one would be feature creep that compromises the ambient design.
-- Multi-language conversation transcription on day one. `SFSpeechRecognizer` is locale-bound; we expose locale in settings but assume one language per session.
-- Server-side anything. There is no backend. If we ever need shared state (cross-device memory), it will live behind a provider protocol.
+- A chat UI. We have a composer for explicit prompts, but the assistant is not a chatbot. Scrollback for a conversation is fine; full message threads with branching are out of scope.
+- A hosted backend. There isn't one and there won't be one. If we ever need shared state across devices, it'll be behind a provider protocol the user can swap.
+- iOS. iOS doesn't expose system audio capture; the product fundamentally requires a desktop OS.

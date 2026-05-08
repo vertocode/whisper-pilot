@@ -1,8 +1,11 @@
 import AVFoundation
 import Combine
+import CoreGraphics
 import Foundation
+import ImageIO
 import OSLog
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 
 /// Owns every long-lived module. The only place that knows about concrete types.
 @MainActor
@@ -201,24 +204,95 @@ final class AppCoordinator {
     }
 
     /// User typed something in the composer. Always honored even when AI is paused.
-    func sendUserPrompt(_ raw: String) {
+    /// When `withScreenshot` is true, we capture the current display via ScreenCaptureKit
+    /// and ship it as a multimodal `inline_data` part so the model can reason about what
+    /// the user is looking at.
+    func sendUserPrompt(_ raw: String, withScreenshot: Bool = false) {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let ai = aiProvider else {
             overlayState.appendSystemNote("Start listening first to enable the AI.")
             return
         }
-        overlayState.appendUserMessage(text)
-        persistChatTurn(role: "You", text: text)
-        // Capture chat history *excluding the message we just added* so the AI sees the
-        // prior turns as context, not its own current question.
+        let displayedText = withScreenshot ? "\(text) 📸" : text
+        overlayState.appendUserMessage(displayedText)
+        persistChatTurn(role: "You", text: text + (withScreenshot ? "\n_(screenshot attached)_" : ""))
         let history = chatHistorySnapshot(excludingLast: true)
+
         Task { [weak self] in
             guard let self else { return }
             let snapshot = await self.context.snapshotWithPrior()
-            let prompt = PromptBuilder.buildUserQuery(context: snapshot, history: history, query: text, style: self.settings.responseStyle)
+            var prompt = PromptBuilder.buildUserQuery(
+                context: snapshot,
+                history: history,
+                query: text,
+                style: self.settings.responseStyle,
+                withScreenshot: withScreenshot
+            )
+
+            if withScreenshot {
+                if let imageData = await self.captureScreenJPEG() {
+                    prompt.imageJPEGBase64 = imageData.base64EncodedString()
+                    print("[WP][Screenshot] captured \(imageData.count) bytes")
+                } else {
+                    self.overlayState.appendSystemNote("Couldn't capture screen — sending without it.")
+                    print("[WP][Screenshot] capture failed; falling back to text-only")
+                }
+            }
             await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
         }
+    }
+
+    /// Captures the primary display via ScreenCaptureKit, downsamples to ≤1280 px wide so
+    /// we don't ship 4K frames to the model, and JPEG-encodes at quality 0.7. Returns nil
+    /// if Screen Recording permission isn't granted or no display is shareable.
+    private func captureScreenJPEG(maxWidth: Int = 1280, quality: CGFloat = 0.7) async -> Data? {
+        do {
+            let content = try await SCShareableContent.current
+            guard let display = content.displays.first else { return nil }
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            let config = SCStreamConfiguration()
+            config.width = display.width
+            config.height = display.height
+            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            let resized = downsample(cgImage, maxWidth: maxWidth) ?? cgImage
+            return jpegData(from: resized, quality: quality)
+        } catch {
+            log.error("Screenshot capture failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    private func downsample(_ image: CGImage, maxWidth: Int) -> CGImage? {
+        let width = image.width
+        guard width > maxWidth else { return image }
+        let scale = CGFloat(maxWidth) / CGFloat(width)
+        let newWidth = maxWidth
+        let newHeight = Int((CGFloat(image.height) * scale).rounded())
+        guard let space = image.colorSpace,
+              let context = CGContext(
+                data: nil,
+                width: newWidth,
+                height: newHeight,
+                bitsPerComponent: image.bitsPerComponent,
+                bytesPerRow: 0,
+                space: space,
+                bitmapInfo: image.bitmapInfo.rawValue
+              ) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+        return context.makeImage()
+    }
+
+    private func jpegData(from cgImage: CGImage, quality: CGFloat) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else {
+            return nil
+        }
+        let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
+        CGImageDestinationAddImage(dest, cgImage, options as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
     }
 
     private func persistChatTurn(role: String, text: String) {
