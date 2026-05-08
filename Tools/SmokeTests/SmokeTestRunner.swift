@@ -1,4 +1,6 @@
+import AVFoundation
 import Foundation
+import Speech
 @testable import WhisperPilot
 
 /// Minimal expect/suite harness. Returns 0 on success, 1 on failure.
@@ -13,6 +15,7 @@ struct SmokeTestRunner {
         await runConversationContextSuite()
         await runPromptBuilderSuite()
         await runTriggerEngineSuite()
+        await runSpeechRecognitionIntegrationSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
@@ -187,6 +190,99 @@ struct SmokeTestRunner {
 
             let p4 = PromptBuilder.build(context: snapshotFor(topics: ["postgres", "scaling"]), history: [], question: "What about sharding?", style: .detailed)
             await expect(p4.context.contains("postgres") && p4.context.contains("scaling"), "topics listed when present")
+        }
+    }
+
+    /// End-to-end integration test: synthesize a known sentence via `AVSpeechSynthesizer`,
+    /// feed the resulting audio buffers (converted to our canonical format) directly into
+    /// `AppleSpeechTranscriber`, and verify a non-empty transcript comes back. Skipped if
+    /// the toolchain doesn't have Speech Recognition authorized — that's a TCC environment
+    /// issue, not a code bug, and we report it as such.
+    static func runSpeechRecognitionIntegrationSuite() async {
+        await suite("SpeechRecognition (integration)") {
+            let auth = SFSpeechRecognizer.authorizationStatus()
+            guard auth == .authorized else {
+                print("  ⓘ Speech recognition not authorized on this machine (status=\(auth.rawValue)). Skipping integration test.")
+                return
+            }
+
+            let transcriber = AppleSpeechTranscriber(locale: Locale(identifier: "en-US"))
+            do {
+                try await transcriber.start()
+            } catch {
+                await expect(false, "transcriber.start() threw: \(error.localizedDescription)")
+                return
+            }
+            defer { transcriber.stop() }
+
+            // Subscribe to transcripts in the background; capture text into a shared buffer.
+            actor TranscriptCollector {
+                var combined = ""
+                func append(_ text: String) { combined = text } // last-wins (partial overwrites)
+                func snapshot() -> String { combined }
+            }
+            let collector = TranscriptCollector()
+            let collectorTask = Task {
+                for await update in transcriber.transcripts {
+                    await collector.append(update.text)
+                    if update.isFinal { return }
+                }
+            }
+
+            // Synthesize "Hello world this is a test of speech recognition"
+            let synth = AVSpeechSynthesizer()
+            let utterance = AVSpeechUtterance(string: "Hello world. This is a test of speech recognition.")
+            utterance.rate = 0.5
+            utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+
+            let canonical = CanonicalAudioFormat.make()
+            let synthesisFinished = Task<Void, Never> {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    var finished = false
+                    var converter: AVAudioConverter?
+                    var sourceFormat: AVAudioFormat?
+                    synth.write(utterance) { buffer in
+                        guard let pcm = buffer as? AVAudioPCMBuffer, pcm.frameLength > 0 else {
+                            // synthesizer signals end-of-utterance with an empty buffer
+                            if !finished {
+                                finished = true
+                                continuation.resume()
+                            }
+                            return
+                        }
+                        if sourceFormat?.isEqual(pcm.format) != true {
+                            sourceFormat = pcm.format
+                            converter = AVAudioConverter(from: pcm.format, to: canonical)
+                        }
+                        guard let converter else { return }
+                        let outputCapacity = AVAudioFrameCount(Double(pcm.frameLength) * canonical.sampleRate / pcm.format.sampleRate) + 1024
+                        guard let out = AVAudioPCMBuffer(pcmFormat: canonical, frameCapacity: outputCapacity) else { return }
+                        var error: NSError?
+                        var consumed = false
+                        converter.convert(to: out, error: &error) { _, status in
+                            if consumed { status.pointee = .endOfStream; return nil }
+                            consumed = true
+                            status.pointee = .haveData
+                            return pcm
+                        }
+                        if error == nil, out.frameLength > 0 {
+                            transcriber.feed(out, channel: .system)
+                        }
+                    }
+                }
+            }
+            _ = await synthesisFinished.value
+
+            // Give the recognizer a couple of seconds to flush trailing partial → final.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            collectorTask.cancel()
+
+            let final = await collector.snapshot()
+            print("  ⓘ Recognized: \"\(final)\"")
+            let lower = final.lowercased()
+            await expect(!final.isEmpty, "transcriber produced at least one transcript update for synthesized speech")
+            await expect(lower.contains("hello") || lower.contains("test") || lower.contains("speech") || lower.contains("recognition"),
+                         "recognized text contains at least one of the synthesized keywords (got: \"\(final)\")")
         }
     }
 

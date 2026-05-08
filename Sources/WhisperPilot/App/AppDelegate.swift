@@ -50,6 +50,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             dismissMessage: { [weak self] id in
                 self?.coordinator.overlayState.removeMessage(id: id)
+            },
+            runSelfTest: { [weak self] in
+                Task { await self?.coordinator.runRecognitionSelfTest() }
             }
         )
 

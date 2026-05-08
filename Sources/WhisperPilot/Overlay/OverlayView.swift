@@ -141,6 +141,11 @@ struct OverlayView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button("Self-Test") { actions.runSelfTest() }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                    .help("Synthesize speech and feed it directly into the recognizer. Proves whether transcription works in isolation from audio capture.")
                 Button("Clear") { logBuffer.clearAll() }
                     .controlSize(.small)
                     .buttonStyle(.plain)

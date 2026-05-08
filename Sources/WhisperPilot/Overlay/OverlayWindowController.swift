@@ -19,6 +19,8 @@ struct OverlayActions {
     var goToSessions: () -> Void
     /// Dismiss a chat message by id (used by the close button on system notes).
     var dismissMessage: (UUID) -> Void
+    /// Run the recognition self-test (synthesizes speech → feeds to recognizer → reports).
+    var runSelfTest: () -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers
