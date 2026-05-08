@@ -5,13 +5,20 @@ final class MenuBarController {
     private let coordinator: AppCoordinator
     private let overlay: OverlayWindowController
     private let openSettings: () -> Void
+    private let openSessions: () -> Void
     private let item: NSStatusItem
     private let menu = NSMenu()
 
-    init(coordinator: AppCoordinator, overlay: OverlayWindowController, openSettings: @escaping () -> Void) {
+    init(
+        coordinator: AppCoordinator,
+        overlay: OverlayWindowController,
+        openSettings: @escaping () -> Void,
+        openSessions: @escaping () -> Void
+    ) {
         self.coordinator = coordinator
         self.overlay = overlay
         self.openSettings = openSettings
+        self.openSessions = openSessions
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configure()
     }
@@ -39,6 +46,10 @@ final class MenuBarController {
         menu.addItem(showOverlay)
 
         menu.addItem(.separator())
+
+        let sessions = NSMenuItem(title: "Sessions…", action: #selector(openSessionsAction), keyEquivalent: "s")
+        sessions.target = self
+        menu.addItem(sessions)
 
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettingsAction), keyEquivalent: ",")
         settings.target = self
@@ -77,6 +88,10 @@ final class MenuBarController {
 
     @objc private func openSettingsAction() {
         openSettings()
+    }
+
+    @objc private func openSessionsAction() {
+        openSessions()
     }
 
     @objc private func quit() {

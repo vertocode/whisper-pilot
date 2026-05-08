@@ -65,23 +65,30 @@ enum PromptBuilder {
     }
 
     private static func contextBlock(transcript: ConversationSnapshot, history: [ChatTurn]) -> String {
-        let recent = transcript.recentLines.suffix(20).joined(separator: "\n")
-        let topics = transcript.topics.isEmpty ? "" : "\nTopics so far: \(transcript.topics.joined(separator: ", "))"
+        var sections: [String] = []
 
-        let chatBlock: String
-        if history.isEmpty {
-            chatBlock = ""
-        } else {
+        if let priorTranscript = transcript.priorTranscriptMarkdown {
+            sections.append("Prior session transcript (resumed):\n\(priorTranscript)")
+        }
+        if let priorChat = transcript.priorChatMarkdown {
+            sections.append("Prior session AI chat (resumed):\n\(priorChat)")
+        }
+
+        let recent = transcript.recentLines.suffix(20).joined(separator: "\n")
+        if !recent.isEmpty {
+            sections.append("Live meeting transcript (most recent at the bottom):\n\(recent)")
+        }
+        if !transcript.topics.isEmpty {
+            sections.append("Topics so far: \(transcript.topics.joined(separator: ", "))")
+        }
+        if !history.isEmpty {
             let formatted = history.suffix(10).map { turn in
                 let label = turn.role == .user ? "User" : "You (assistant)"
                 return "\(label): \(turn.text)"
             }.joined(separator: "\n")
-            chatBlock = "\n\nPrior chat between you and the user (most recent at the bottom):\n\(formatted)"
+            sections.append("Prior chat in this session (most recent at the bottom):\n\(formatted)")
         }
 
-        return """
-        Recent meeting transcript (most recent at the bottom):
-        \(recent)\(topics)\(chatBlock)
-        """
+        return sections.joined(separator: "\n\n")
     }
 }

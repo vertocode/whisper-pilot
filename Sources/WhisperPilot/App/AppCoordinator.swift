@@ -33,6 +33,7 @@ final class AppCoordinator {
     private var lastAutoSendTranscriptCount: Int = 0
 
     private(set) var isRunning = false
+    private(set) var currentSession: SessionMeta?
 
     init() {
         settingsObserver = settings.objectWillChange.sink { [weak self] in
@@ -181,6 +182,24 @@ final class AppCoordinator {
         overlayState.isAIPaused.toggle()
     }
 
+    /// Activate a session — either fresh or resumed. On resume we hand the prior
+    /// transcript + chat markdown to the conversation context so the AI sees them on the
+    /// next prompt; we do NOT replay them into the live transcript lane (that lane shows
+    /// new content only). A system note tells the user which session they're in.
+    func useSession(_ session: SessionMeta, resumed: Bool) async {
+        currentSession = session
+        if resumed {
+            let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
+            let chat = await SessionStore.shared.loadChatMarkdown(session.id)
+            await context.seedFromMarkdown(transcript: transcript, chat: chat)
+            overlayState.appendSystemNote("Resumed session “\(session.displayName)”. Prior transcript and chat are now in AI context.")
+        } else {
+            overlayState.clearChat()
+            await context.reset()
+            overlayState.appendSystemNote("New session: \(session.displayName)")
+        }
+    }
+
     /// User typed something in the composer. Always honored even when AI is paused.
     func sendUserPrompt(_ raw: String) {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -190,14 +209,22 @@ final class AppCoordinator {
             return
         }
         overlayState.appendUserMessage(text)
+        persistChatTurn(role: "You", text: text)
         // Capture chat history *excluding the message we just added* so the AI sees the
         // prior turns as context, not its own current question.
         let history = chatHistorySnapshot(excludingLast: true)
         Task { [weak self] in
             guard let self else { return }
-            let snapshot = await self.context.snapshot()
+            let snapshot = await self.context.snapshotWithPrior()
             let prompt = PromptBuilder.buildUserQuery(context: snapshot, history: history, query: text, style: self.settings.responseStyle)
             await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
+        }
+    }
+
+    private func persistChatTurn(role: String, text: String) {
+        guard let sessionID = currentSession?.id else { return }
+        Task {
+            await SessionStore.shared.appendChatTurn(role: role, text: text, at: Date(), to: sessionID)
         }
     }
 
@@ -263,6 +290,20 @@ final class AppCoordinator {
                 self?.overlayState.transcript = snapshot
                 transcriptsSeen += 1
                 self?.overlayState.transcriptCount = transcriptsSeen
+
+                // Persist finalized transcript lines to the active session's transcript.md
+                if update.isFinal,
+                   let sessionID = self?.currentSession?.id,
+                   !update.text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Task {
+                        await SessionStore.shared.appendTranscriptLine(
+                            channel: update.channel,
+                            text: update.text,
+                            at: update.timestamp,
+                            to: sessionID
+                        )
+                    }
+                }
             }
         })
 
@@ -275,7 +316,7 @@ final class AppCoordinator {
                 }
                 self.log.info("→ Trigger fired, building prompt")
                 self.overlayState.status = .thinking
-                let snapshot = await self.context.snapshot()
+                let snapshot = await self.context.snapshotWithPrior()
                 let style = self.settings.responseStyle
                 let history = self.chatHistorySnapshot(excludingLast: false)
                 let prompt = PromptBuilder.build(
@@ -312,6 +353,10 @@ final class AppCoordinator {
                 self.log.info("Stream complete (\(deltaCount) deltas)")
                 self.overlayState.finishAssistant(id: messageId)
                 self.overlayState.status = .listening
+                if let finalText = self.overlayState.messages.first(where: { $0.id == messageId })?.text,
+                   !finalText.isEmpty {
+                    self.persistChatTurn(role: "Assistant", text: finalText)
+                }
             } catch is CancellationError {
                 self.overlayState.finishAssistant(id: messageId)
             } catch {
@@ -352,7 +397,7 @@ final class AppCoordinator {
         print("[WP][Coordinator] auto-send tick firing")
         Task { [weak self] in
             guard let self else { return }
-            let snapshot = await self.context.snapshot()
+            let snapshot = await self.context.snapshotWithPrior()
             let history = self.chatHistorySnapshot(excludingLast: false)
             let prompt = PromptBuilder.buildAutoSend(context: snapshot, history: history, style: self.settings.responseStyle)
             await self.runCompletion(prompt: prompt, ai: ai, origin: .autoSend)

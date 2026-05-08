@@ -4,6 +4,10 @@ struct ConversationSnapshot: Sendable {
     let recentLines: [String]
     let topics: [String]
     let entities: [String]
+    /// Set when a session is resumed — markdown content from prior `transcript.md` and `chat.md`.
+    /// `PromptBuilder` includes this as a separate section so the model knows it's older context.
+    var priorTranscriptMarkdown: String? = nil
+    var priorChatMarkdown: String? = nil
 }
 
 /// Rolling memory the LLM sees on every prompt. We keep the recent transcript verbatim and a small
@@ -47,6 +51,28 @@ actor ConversationContext {
         lines.removeAll()
         topics.clear()
         entities.clear()
+    }
+
+    /// Markdown loaded on session resume. Surfaced in the prompt context but kept separate
+    /// from the live transcript so the live lane stays clean.
+    private var priorTranscriptMarkdown: String?
+    private var priorChatMarkdown: String?
+
+    func seedFromMarkdown(transcript: String, chat: String) {
+        lines.removeAll()
+        topics.clear()
+        entities.clear()
+        let t = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let c = chat.trimmingCharacters(in: .whitespacesAndNewlines)
+        priorTranscriptMarkdown = t.isEmpty ? nil : t
+        priorChatMarkdown = c.isEmpty ? nil : c
+    }
+
+    func snapshotWithPrior() -> ConversationSnapshot {
+        var snap = snapshot()
+        snap.priorTranscriptMarkdown = priorTranscriptMarkdown
+        snap.priorChatMarkdown = priorChatMarkdown
+        return snap
     }
 
     private func prune() {

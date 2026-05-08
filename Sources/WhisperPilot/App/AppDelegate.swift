@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var menuBar: MenuBarController?
     private var overlay: OverlayWindowController?
+    private var sessionsWindow: SessionsWindowController?
+    private var sessionsViewModel: SessionsViewModel?
     private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -42,12 +44,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let overlay = OverlayWindowController(state: coordinator.overlayState, settings: coordinator.settings, actions: actions)
         self.overlay = overlay
-        overlay.showWindow(nil)
+        // Don't show overlay until a session is picked.
+
+        let vm = SessionsViewModel()
+        vm.onStartNew = { [weak self] meta in self?.openSession(meta, resumed: false) }
+        vm.onResume = { [weak self] meta in self?.openSession(meta, resumed: true) }
+        sessionsViewModel = vm
+
+        let sessions = SessionsWindowController(viewModel: vm)
+        sessionsWindow = sessions
+        sessions.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        sessions.window?.makeKeyAndOrderFront(nil)
 
         menuBar = MenuBarController(
             coordinator: coordinator,
             overlay: overlay,
-            openSettings: { [weak self] in self?.showSettings() }
+            openSettings: { [weak self] in self?.showSettings() },
+            openSessions: { [weak self] in self?.showSessionsWindow() }
         )
 
         Task { await coordinator.bootstrap() }
@@ -57,14 +71,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await coordinator.shutdown() }
     }
 
-    /// Owns the Settings window directly. We don't rely on SwiftUI's `Settings { }` scene
-    /// because the magic `showSettingsWindow:` action selector is silently a no-op for
-    /// accessory / LSUIElement apps on recent macOS SDKs — clicks on the gear icon would
-    /// do nothing and leave no error in the console.
     func showSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 540, height: 440),
+                contentRect: NSRect(x: 0, y: 0, width: 540, height: 460),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
@@ -72,9 +82,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.title = "Whisper Pilot Settings"
             window.isReleasedWhenClosed = false
             window.center()
-            // The overlay panel runs at `.statusBar` level (25) when Always-on-Top is on,
-            // so a default-level Settings window (.normal = 0) opens *underneath* the
-            // overlay and looks like nothing happened. We pin Settings above the overlay.
             window.level = .popUpMenu
             window.contentView = NSHostingView(rootView: SettingsView(store: coordinator.settings))
             settingsWindow = window
@@ -82,5 +89,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
         settingsWindow?.orderFrontRegardless()
+    }
+
+    func showSessionsWindow() {
+        Task {
+            await sessionsViewModel?.refresh()
+            sessionsWindow?.showWindow(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            sessionsWindow?.window?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    private func openSession(_ meta: SessionMeta, resumed: Bool) {
+        Task {
+            // If a different session is already running, stop it first so we don't mix audio.
+            if coordinator.isRunning, coordinator.currentSession?.id != meta.id {
+                await coordinator.stopListening()
+            }
+            await coordinator.useSession(meta, resumed: resumed)
+            sessionsWindow?.window?.orderOut(nil)
+            overlay?.showWindow(nil)
+            overlay?.window?.orderFrontRegardless()
+        }
     }
 }
