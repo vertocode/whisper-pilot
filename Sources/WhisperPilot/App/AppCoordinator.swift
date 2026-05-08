@@ -200,6 +200,7 @@ final class AppCoordinator {
                 wpInfo("[Coordinator] systemCapture.start OK (SCK)")
             }
             if settings.captureMicrophone {
+                micCapture.preferredDeviceUID = settings.microphoneDeviceUID
                 try await micCapture.start()
                 wpInfo("[Coordinator] micCapture.start OK")
             } else {

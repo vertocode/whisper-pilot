@@ -4,6 +4,7 @@ struct SettingsView: View {
     @ObservedObject var store: SettingsStore
     @State private var apiKeyDraft: String = ""
     @State private var apiKeySaved: Bool = false
+    @State private var inputDevices: [AudioInputDevice] = []
 
     var body: some View {
         VStack(spacing: 12) {
@@ -23,17 +24,56 @@ struct SettingsView: View {
 
             TabView {
                 generalTab.tabItem { Label("General", systemImage: "gearshape") }
+                devicesTab.tabItem { Label("Devices", systemImage: "mic.and.signal.meter") }
                 providerTab.tabItem { Label("AI Provider", systemImage: "brain") }
                 captureTab.tabItem { Label("Capture", systemImage: "waveform") }
                 overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
             }
         }
-        .frame(width: 520, height: 420)
+        .frame(width: 540, height: 460)
         .padding()
         .onAppear {
             apiKeyDraft = store.geminiAPIKey ?? ""
             apiKeySaved = !apiKeyDraft.isEmpty
+            inputDevices = MicrophoneCapture.listInputDevices()
         }
+    }
+
+    private var devicesTab: some View {
+        Form {
+            Section("Microphone") {
+                Picker("Input device", selection: $store.microphoneDeviceUID) {
+                    Text("System default").tag(nil as String?)
+                    ForEach(inputDevices) { device in
+                        Text(device.name).tag(device.uid as String?)
+                    }
+                }
+                Button("Refresh device list") {
+                    inputDevices = MicrophoneCapture.listInputDevices()
+                }
+                .controlSize(.small)
+            }
+
+            Section {
+                Text("The microphone selection takes effect the next time you click ▶ Play. \"System default\" follows your current System Settings → Sound → Input choice.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section("System audio") {
+                if let info = MicrophoneCapture.defaultOutputDeviceInfo() {
+                    LabeledContent("Active output", value: info.name ?? "unknown (id=\(info.id))")
+                } else {
+                    LabeledContent("Active output", value: "unknown")
+                }
+                Text("System audio is captured via the macOS audio mixdown for whatever your default output device is. Change it in System Settings → Sound → Output. Some Bluetooth codecs and virtual / aggregate devices bypass the mixdown — if Audio Test reports silence, switch to built-in speakers or wired output.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
     }
 
     private var generalTab: some View {

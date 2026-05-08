@@ -3,8 +3,18 @@ import CoreAudio
 import Foundation
 import OSLog
 
+struct AudioInputDevice: Identifiable, Hashable, Sendable {
+    let id: AudioDeviceID
+    let uid: String
+    let name: String
+    var stableID: String { uid }
+}
+
 /// Microphone capture via AVAudioEngine. Output is converted to the canonical 16 kHz mono format.
 final class MicrophoneCapture {
+    /// Optional Core Audio device UID to force as the input. When set, applied before
+    /// `engine.start()` via `AudioUnitSetProperty`. `nil` means "use the system default".
+    var preferredDeviceUID: String?
     let frames: AsyncStream<AudioFrame>
     private let continuation: AsyncStream<AudioFrame>.Continuation
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "Microphone")
@@ -31,6 +41,33 @@ final class MicrophoneCapture {
         } else {
             wpWarn("Couldn't read default input device — Core Audio query failed")
         }
+
+        // If the user has explicitly chosen a microphone in Settings → Devices, apply it
+        // to the engine's input node before starting. Has to happen before `engine.start`
+        // — `AVAudioEngine` reads the input device at start time.
+        if let preferredUID = preferredDeviceUID {
+            if let device = Self.listInputDevices().first(where: { $0.uid == preferredUID }) {
+                var deviceID = device.id
+                if let unit = engine.inputNode.audioUnit {
+                    let status = AudioUnitSetProperty(
+                        unit,
+                        kAudioOutputUnitProperty_CurrentDevice,
+                        kAudioUnitScope_Global,
+                        0,
+                        &deviceID,
+                        UInt32(MemoryLayout<AudioDeviceID>.size)
+                    )
+                    if status == noErr {
+                        wpInfo("Microphone using selected device: \(device.name) (uid=\(device.uid))")
+                    } else {
+                        wpWarn("Couldn't set microphone to \(device.name) (status=\(status)); falling back to default")
+                    }
+                }
+            } else {
+                wpWarn("Selected microphone UID \(preferredUID) is no longer available; falling back to default")
+            }
+        }
+
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
@@ -116,6 +153,64 @@ final class MicrophoneCapture {
             AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, ptr)
         }
         return (deviceID, nameStatus == noErr ? (name as String?) : nil)
+    }
+
+    /// Enumerates all Core Audio devices that have at least one input stream. Used by
+    /// the Settings → Devices picker so the user can pick a specific microphone.
+    static func listInputDevices() -> [AudioInputDevice] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else {
+            return []
+        }
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var deviceIDs = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceIDs) == noErr else {
+            return []
+        }
+
+        return deviceIDs.compactMap { id -> AudioInputDevice? in
+            // Filter to devices that have at least one input stream.
+            var inputAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var streamSize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &inputAddr, 0, nil, &streamSize) == noErr,
+                  streamSize > 0 else { return nil }
+
+            // Stable identifier for the device.
+            var uidAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var uidSize = UInt32(MemoryLayout<CFString?>.size)
+            var uidValue: CFString?
+            let uidStatus = withUnsafeMutablePointer(to: &uidValue) { ptr in
+                AudioObjectGetPropertyData(id, &uidAddr, 0, nil, &uidSize, ptr)
+            }
+            guard uidStatus == noErr, let uid = uidValue as String? else { return nil }
+
+            // Friendly name.
+            var nameAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioObjectPropertyName,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var nameSize = UInt32(MemoryLayout<CFString?>.size)
+            var nameValue: CFString?
+            let nameStatus = withUnsafeMutablePointer(to: &nameValue) { ptr in
+                AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nameSize, ptr)
+            }
+            let name = (nameStatus == noErr ? (nameValue as String?) : nil) ?? uid
+            return AudioInputDevice(id: id, uid: uid, name: name)
+        }
     }
 
     static func defaultOutputDeviceInfo() -> (id: AudioObjectID, name: String?)? {
