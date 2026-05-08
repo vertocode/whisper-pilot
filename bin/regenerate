@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Re-generate WhisperPilot.xcodeproj from Project.yml.
+# Run this every time you pull, or after adding/removing source files.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "xcodegen not installed. Run: brew install xcodegen" >&2
+    exit 1
+fi
+
+xcodegen generate
+echo "✓ WhisperPilot.xcodeproj regenerated."

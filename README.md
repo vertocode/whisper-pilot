@@ -45,6 +45,14 @@ Then in Xcode: select the **WhisperPilot** scheme and run (`⌘R`).
 
 > A `Package.swift` is also committed for contributor convenience — `swift build` will type-check the whole module without Xcode, and `swift run SmokeTests` runs the pure-logic test suite. It does not produce a runnable `.app` (entitlements and `Info.plist` live in `Project.yml`), and you should **not** open `Package.swift` in Xcode to run the app — always go through `xcodegen` + the generated `.xcodeproj`.
 
+**After every `git pull` (or after adding/removing source files), re-run xcodegen so the project file picks up the change:**
+
+```bash
+./bin/regenerate     # convenience wrapper for `xcodegen generate`
+```
+
+If you skip this step, Xcode will surface "Cannot find … in scope" errors for newly added types because the `.xcodeproj` is a snapshot of the file tree at the last `xcodegen` run.
+
 On first launch:
 1. Grant **Microphone** permission (optional — only if you want to capture your own voice)
 2. Grant **Screen Recording** permission (required — this is how macOS exposes system audio via ScreenCaptureKit)
