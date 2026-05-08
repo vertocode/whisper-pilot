@@ -2,37 +2,36 @@ import AppKit
 import Combine
 import SwiftUI
 
-/// Translucent floating panel. We use `NSPanel` with `.nonactivatingPanel` so showing the overlay
-/// doesn't pull focus from the meeting window.
+/// Translucent floating panel. Borderless so we don't have traffic lights or an empty
+/// title-bar strip; the SwiftUI content provides its own controls and is draggable via
+/// the window background.
 @MainActor
 final class OverlayWindowController: NSWindowController {
     private let state: OverlayState
     private let settings: SettingsStore
     private var cancellables: Set<AnyCancellable> = []
 
-    init(state: OverlayState, settings: SettingsStore) {
+    init(state: OverlayState, settings: SettingsStore, actions: OverlayActions) {
         self.state = state
         self.settings = settings
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 360),
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Whisper Pilot"
-        panel.titlebarAppearsTransparent = true
-        panel.titleVisibility = .hidden
         panel.isMovableByWindowBackground = true
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
+        panel.appearance = NSAppearance(named: .vibrantDark)
 
-        let host = NSHostingView(rootView: OverlayView(state: state))
+        let host = NSHostingView(rootView: OverlayView(state: state, actions: actions))
         host.translatesAutoresizingMaskIntoConstraints = false
         panel.contentView = host
 
@@ -52,6 +51,15 @@ final class OverlayWindowController: NSWindowController {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unsupported") }
+
+    func toggleVisibility() {
+        guard let window else { return }
+        if window.isVisible {
+            window.orderOut(nil)
+        } else {
+            window.orderFrontRegardless()
+        }
+    }
 
     private func positionInTopRight(_ panel: NSPanel) {
         guard let screen = NSScreen.main else { return }

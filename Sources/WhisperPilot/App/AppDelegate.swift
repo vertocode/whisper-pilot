@@ -11,7 +11,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let overlay = OverlayWindowController(state: coordinator.overlayState, settings: coordinator.settings)
+        let actions = OverlayActions(
+            toggleListening: { [weak self] in
+                Task { await self?.coordinator.toggleListening() }
+            },
+            openSettings: {
+                SettingsLauncher.open()
+            },
+            hideOverlay: { [weak self] in
+                self?.overlay?.window?.orderOut(nil)
+            }
+        )
+
+        let overlay = OverlayWindowController(state: coordinator.overlayState, settings: coordinator.settings, actions: actions)
         self.overlay = overlay
         overlay.showWindow(nil)
 

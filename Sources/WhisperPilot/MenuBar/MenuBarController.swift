@@ -16,8 +16,16 @@ final class MenuBarController {
 
     private func configure() {
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "Whisper Pilot")
-            button.imagePosition = .imageOnly
+            let symbol = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Whisper Pilot")
+                ?? NSImage(systemSymbolName: "waveform", accessibilityDescription: "Whisper Pilot")
+            if let symbol {
+                button.image = symbol
+                button.imagePosition = .imageOnly
+            } else {
+                // Belt-and-braces fallback so the user always sees *something* to click.
+                button.title = "WP"
+            }
+            button.toolTip = "Whisper Pilot"
         }
 
         let toggle = NSMenuItem(title: "Start listening", action: #selector(toggleListening), keyEquivalent: "l")
@@ -67,12 +75,7 @@ final class MenuBarController {
     }
 
     @objc private func openSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        if #available(macOS 14, *) {
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        } else {
-            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-        }
+        SettingsLauncher.open()
     }
 
     @objc private func quit() {

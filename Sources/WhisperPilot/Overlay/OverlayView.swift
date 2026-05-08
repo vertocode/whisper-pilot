@@ -2,18 +2,19 @@ import SwiftUI
 
 struct OverlayView: View {
     @ObservedObject var state: OverlayState
+    let actions: OverlayActions
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.3)
+            Divider().opacity(0.25)
             content
         }
         .frame(minWidth: 360, minHeight: 240)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+                .strokeBorder(.white.opacity(0.08), lineWidth: 1)
         )
         .padding(8)
     }
@@ -24,11 +25,40 @@ struct OverlayView: View {
                 .resizable()
                 .scaledToFit()
                 .frame(width: 18, height: 18)
+
             StatusDot(status: state.status)
+
             Text(state.status.label)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
             Spacer()
+
+            Button(action: actions.toggleListening) {
+                Image(systemName: state.status.isActive ? "stop.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(state.status.isActive ? .red : .accentColor)
+            }
+            .buttonStyle(.plain)
+            .help(state.status.isActive ? "Stop listening" : "Start listening")
+
+            Button(action: actions.openSettings) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+
+            Button(action: actions.hideOverlay) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Hide overlay (re-open from the menu bar icon)")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -38,6 +68,10 @@ struct OverlayView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if let banner = bannerMessage {
+                        BannerView(message: banner, actionTitle: bannerAction, action: actions.openSettings)
+                            .id("banner")
+                    }
                     if !state.responseText.isEmpty || state.isResponseStreaming {
                         ResponseLane(text: state.responseText, streaming: state.isResponseStreaming)
                             .id("response")
@@ -53,6 +87,59 @@ struct OverlayView: View {
                 }
             }
         }
+    }
+
+    private var bannerMessage: String? {
+        switch state.status {
+        case .needsAPIKey:
+            return "Add your Gemini API key in Settings to start receiving suggestions."
+        case .needsPermission(.microphone):
+            return "Microphone permission is required for the option you enabled. Grant it in System Settings."
+        case .needsPermission(.screenRecording):
+            return "Screen Recording permission is required to capture meeting audio. Grant it in System Settings → Privacy & Security."
+        case .error(let message):
+            return message
+        default:
+            return nil
+        }
+    }
+
+    private var bannerAction: String? {
+        switch state.status {
+        case .needsAPIKey: return "Open Settings"
+        case .needsPermission, .error: return nil
+        default: return nil
+        }
+    }
+}
+
+private struct BannerView: View {
+    let message: String
+    let actionTitle: String?
+    let action: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.callout)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.primary)
+                if let actionTitle {
+                    Button(actionTitle, action: action)
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+        )
     }
 }
 
@@ -78,9 +165,7 @@ private struct StatusDot: View {
         }
     }
 
-    private var opacity: Double {
-        pulse ? 0.5 : 1.0
-    }
+    private var opacity: Double { pulse ? 0.5 : 1.0 }
 
     private var pulse: Bool {
         switch status {
@@ -115,7 +200,7 @@ private struct ResponseLane: View {
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.blue.opacity(0.08))
+                .fill(Color.blue.opacity(0.10))
         )
     }
 }
