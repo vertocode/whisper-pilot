@@ -1,28 +1,17 @@
 import AppKit
 
-/// Convenience for opening the SwiftUI `Settings` scene from anywhere on the main actor.
-@MainActor
-enum SettingsLauncher {
-    static func open() {
-        NSApp.activate(ignoringOtherApps: true)
-        if #available(macOS 14, *) {
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        } else {
-            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-        }
-    }
-}
-
 @MainActor
 final class MenuBarController {
     private let coordinator: AppCoordinator
     private let overlay: OverlayWindowController
+    private let openSettings: () -> Void
     private let item: NSStatusItem
     private let menu = NSMenu()
 
-    init(coordinator: AppCoordinator, overlay: OverlayWindowController) {
+    init(coordinator: AppCoordinator, overlay: OverlayWindowController, openSettings: @escaping () -> Void) {
         self.coordinator = coordinator
         self.overlay = overlay
+        self.openSettings = openSettings
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configure()
     }
@@ -35,7 +24,6 @@ final class MenuBarController {
                 button.image = symbol
                 button.imagePosition = .imageOnly
             } else {
-                // Belt-and-braces fallback so the user always sees *something* to click.
                 button.title = "WP"
             }
             button.toolTip = "Whisper Pilot"
@@ -52,7 +40,7 @@ final class MenuBarController {
 
         menu.addItem(.separator())
 
-        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettingsAction), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
 
@@ -87,8 +75,8 @@ final class MenuBarController {
         overlay.window?.orderFrontRegardless()
     }
 
-    @objc private func openSettings() {
-        SettingsLauncher.open()
+    @objc private func openSettingsAction() {
+        openSettings()
     }
 
     @objc private func quit() {
