@@ -137,6 +137,20 @@ Settings persist in `UserDefaults`. The Gemini API key lives in Keychain.
 | Always on top | on | Overlay tab | Window level `.floating` |
 | Click-through | off | Overlay tab | Ignores mouse events on the overlay |
 
+## Permissions persist across rebuilds — set up Personal Team signing
+
+By default, Xcode signs the app **ad-hoc** (`CODE_SIGN_IDENTITY = "-"`). Every time you rebuild, the binary's hash changes, and macOS's TCC database treats the new build as a different app — so it forgets your Microphone / Screen Recording grants and asks again, requiring your admin password to re-enable. That gets old fast.
+
+**Fix it once with a free Apple ID Personal Team:**
+
+1. Open Xcode → **Settings → Accounts** → **+** → sign in with your Apple ID. (Free; no paid Developer Program needed.)
+2. In the project, select the **WhisperPilot** target → **Signing & Capabilities**.
+3. Change **Team** from "None" to your name (Personal Team). Xcode generates a stable certificate.
+4. Build once. macOS prompts for permissions one final time. Grant them.
+5. From now on, rebuilds reuse the same code signature → TCC remembers your permissions → no more password prompts.
+
+This works because TCC tracks Personal Team signed binaries by stable identity rather than by content hash.
+
 ## Privacy
 
 - **Audio is processed in-memory and never written to disk.** Only the resulting transcript is persisted, and only into the active session folder.

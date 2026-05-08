@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 import OSLog
 
@@ -23,6 +24,13 @@ final class MicrophoneCapture {
 
     func start() async throws {
         log.info("Starting microphone capture…")
+        // Log the active default input device so the user can see in Diagnostics whether
+        // macOS routed us to the right microphone (built-in vs USB vs Bluetooth, etc.).
+        if let info = Self.defaultInputDeviceInfo() {
+            wpInfo("Microphone default input device: \(info.name ?? "unknown") (id=\(info.id))")
+        } else {
+            wpWarn("Couldn't read default input device — Core Audio query failed")
+        }
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
@@ -82,6 +90,55 @@ final class MicrophoneCapture {
             wpInfo("Microphone frame#\(framesEmitted) inFrames=\(buffer.frameLength) outFrames=\(output.frameLength) inRMS=\(String(format: "%.5f", inRMS)) outRMS=\(String(format: "%.5f", outRMS))")
         }
         continuation.yield(AudioFrame(buffer: output, channel: .microphone, timestamp: Date()))
+    }
+
+    /// Reads `kAudioHardwarePropertyDefaultInputDevice` and that device's display name.
+    /// We use this purely to log what the user is currently set to — picking a device
+    /// programmatically through AVAudioEngine is more involved and not yet exposed.
+    static func defaultInputDeviceInfo() -> (id: AudioObjectID, name: String?)? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID: AudioObjectID = 0
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let getDeviceStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil, &size, &deviceID
+        )
+        guard getDeviceStatus == noErr, deviceID != 0 else { return nil }
+
+        address.mSelector = kAudioObjectPropertyName
+        var name: CFString?
+        size = UInt32(MemoryLayout<CFString?>.size)
+        let nameStatus = withUnsafeMutablePointer(to: &name) { ptr in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, ptr)
+        }
+        return (deviceID, nameStatus == noErr ? (name as String?) : nil)
+    }
+
+    static func defaultOutputDeviceInfo() -> (id: AudioObjectID, name: String?)? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID: AudioObjectID = 0
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let getDeviceStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil, &size, &deviceID
+        )
+        guard getDeviceStatus == noErr, deviceID != 0 else { return nil }
+
+        address.mSelector = kAudioObjectPropertyName
+        var name: CFString?
+        size = UInt32(MemoryLayout<CFString?>.size)
+        let nameStatus = withUnsafeMutablePointer(to: &name) { ptr in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, ptr)
+        }
+        return (deviceID, nameStatus == noErr ? (name as String?) : nil)
     }
 
     private static func computeRMSAny(_ buffer: AVAudioPCMBuffer) -> Float {

@@ -116,6 +116,16 @@ final class AppCoordinator {
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
+        // Surface what audio devices the OS is presenting before we start capture, so the
+        // user can immediately see in Diagnostics whether they're using the device they
+        // expected (built-in vs USB vs Bluetooth vs aggregate vs virtual).
+        if let out = MicrophoneCapture.defaultOutputDeviceInfo() {
+            wpInfo("Default output device: \(out.name ?? "unknown") (id=\(out.id))")
+        }
+        if let mic = MicrophoneCapture.defaultInputDeviceInfo() {
+            wpInfo("Default input device: \(mic.name ?? "unknown") (id=\(mic.id))")
+        }
+
         // Audio capture path. Prefer Core Audio Process Taps when available (macOS 14.4+):
         // pure audio capture, no Screen Recording prompt, no "screen is being recorded"
         // mode that breaks Live Captions and confuses some macOS audio routing setups.
@@ -218,7 +228,9 @@ final class AppCoordinator {
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             guard let self, self.isRunning else { return }
             if self.overlayState.audioFrameCount == 0 {
-                let message = "No audio frames after 6 seconds. ScreenCaptureKit started but isn't delivering audio. Try playing a video, switching audio output device, or stop and start listening again."
+                let method = self.processTapFrames != nil ? "Core Audio Process Tap" : "ScreenCaptureKit"
+                let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
+                let message = "No audio frames after 6 seconds. \(method) started but isn't delivering audio. Default output device is “\(outName)”. Check that audio is actually playing through that device — virtual / aggregate / Bluetooth devices sometimes bypass the macOS audio mixdown that we capture from."
                 wpWarn(message)
                 self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             } else if self.overlayState.transcriptCount == 0 {
