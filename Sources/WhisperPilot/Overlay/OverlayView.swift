@@ -80,14 +80,6 @@ struct OverlayView: View {
             .buttonStyle(.plain)
             .help(state.status.isActive ? "Stop listening" : "Start listening")
 
-            Button(action: actions.toggleAIPaused) {
-                Image(systemName: state.isAIPaused ? "sparkles.slash" : "sparkles")
-                    .font(.system(size: 14))
-                    .foregroundStyle(state.isAIPaused ? .orange : .blue)
-            }
-            .buttonStyle(.plain)
-            .help(state.isAIPaused ? "Resume AI (auto-suggestions)" : "Pause AI (no auto-calls; manual prompts still work)")
-
             Button {
                 showDebugPanel.toggle()
                 if showDebugPanel { logBuffer.clearAlertBadge() }
@@ -184,10 +176,12 @@ struct OverlayView: View {
                             .id("banner")
                     }
 
-                    if !state.messages.isEmpty {
-                        ChatLane(messages: state.messages)
-                            .id("chat")
-                    }
+                    ChatLane(
+                        messages: state.messages,
+                        isAIPaused: state.isAIPaused,
+                        onToggleAI: actions.toggleAIPaused
+                    )
+                    .id("chat")
 
                     TranscriptLane(segments: state.transcript)
                         .id("transcript")
@@ -373,6 +367,8 @@ private struct StatusDot: View {
 
 private struct ChatLane: View {
     let messages: [ChatMessage]
+    let isAIPaused: Bool
+    let onToggleAI: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -381,15 +377,62 @@ private struct ChatLane: View {
                     .font(.caption)
                     .foregroundStyle(.blue)
                 Text("AI")
-                    .font(.caption)
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
             }
-            ForEach(messages) { message in
-                MessageBubble(message: message)
-                    .id(message.id)
+
+            if messages.isEmpty {
+                Text(emptyStateText)
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                    .padding(.vertical, 4)
+            } else {
+                ForEach(messages) { message in
+                    MessageBubble(message: message)
+                        .id(message.id)
+                }
             }
         }
+    }
+
+    private var emptyStateText: String {
+        if isAIPaused {
+            return "AI is paused. Type a prompt below — manual prompts always go through."
+        }
+        return "No AI messages yet. Detected questions and the composer below will appear here."
+    }
+}
+
+private struct AIToggleButton: View {
+    let isPaused: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: isPaused ? "pause.fill" : "play.fill")
+                    .font(.system(size: 9))
+                Text(isPaused ? "Paused" : "Active")
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(isPaused ? AnyShapeStyle(Color.orange) : AnyShapeStyle(Color.green))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill((isPaused ? Color.orange : Color.green).opacity(0.15))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder((isPaused ? Color.orange : Color.green).opacity(0.35), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(isPaused
+              ? "AI is paused. Click to resume — detected questions and auto-send will fire again."
+              : "AI is active. Click to pause auto-calls. Manual composer prompts always go through.")
     }
 }
 

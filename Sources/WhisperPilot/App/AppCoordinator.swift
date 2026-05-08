@@ -49,12 +49,8 @@ final class AppCoordinator {
 
         pausedObserver = overlayState.$isAIPaused
             .removeDuplicates()
-            .sink { [weak self] paused in
-                if paused {
-                    self?.overlayState.appendSystemNote("AI paused — only manual prompts will be sent.")
-                } else {
-                    self?.overlayState.appendSystemNote("AI active.")
-                }
+            .sink { [weak self] _ in
+                // The toggle button itself is the visual indicator — no system note needed.
                 self?.restartAutoSendTimer()
             }
     }
@@ -81,11 +77,10 @@ final class AppCoordinator {
             if !key.isEmpty {
                 if aiProvider == nil {
                     aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
-                    overlayState.appendSystemNote("✅ AI is now active. Key detected.")
                 }
             } else if aiProvider != nil {
                 aiProvider = nil
-                overlayState.appendSystemNote("ℹ️ AI disabled — Gemini key removed. Transcription still running.")
+                overlayState.appendSystemNote("ℹ️ Gemini key removed. Transcription still running; AI features disabled.")
             }
             return
         }
@@ -250,11 +245,10 @@ final class AppCoordinator {
             let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
             let chat = await SessionStore.shared.loadChatMarkdown(session.id)
             await context.seedFromMarkdown(transcript: transcript, chat: chat)
-            overlayState.appendSystemNote("Resumed session “\(session.displayName)”. Prior transcript and chat are now in AI context.")
+            // No system note — the user just picked this session, they know what they did.
         } else {
             overlayState.clearChat()
             await context.reset()
-            overlayState.appendSystemNote("New session: \(session.displayName)")
         }
     }
 
