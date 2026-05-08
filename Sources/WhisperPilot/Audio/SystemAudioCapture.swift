@@ -41,14 +41,13 @@ final class SystemAudioCapture: NSObject {
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        // We deliberately leave sampleRate/channelCount at their ScreenCaptureKit defaults
-        // (48 kHz stereo on most hardware) and do the resample in `makePCMBuffer` via
-        // AVAudioConverter. Forcing low values here has been observed to silently produce
-        // zero audio frames on some macOS versions.
+        // Pin the audio config explicitly. Letting these default has been observed to
+        // produce empty audio buffers (RMS = 0) on some macOS Sonoma/Sequoia configurations.
+        config.sampleRate = 48000
+        config.channelCount = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         // Tiny dummy video size — we don't consume video, but ScreenCaptureKit requires a
-        // sane non-zero rect. Apple's audio-only sample uses 2x2; we use 100x100 because
-        // 2x2 has been known to silently drop audio frames on Sonoma+ on some hardware.
+        // sane non-zero rect. 100x100 is empirically more reliable than 2x2 on Sonoma+.
         config.width = 100
         config.height = 100
         config.queueDepth = 5
@@ -119,7 +118,7 @@ extension SystemAudioCapture: SCStreamOutput {
         if sourceFormat?.isEqual(inputFormat) != true {
             sourceFormat = inputFormat
             converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
-            log.info("System audio source format: \(inputFormat.sampleRate, privacy: .public) Hz, \(inputFormat.channelCount, privacy: .public) ch")
+            wpInfo("System audio source format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
         }
         guard let converter else { return nil }
 
@@ -162,7 +161,53 @@ extension SystemAudioCapture: SCStreamOutput {
             log.error("Conversion error: \(String(describing: error), privacy: .public)")
             return nil
         }
+
+        // Multi-stage RMS so we can tell whether the source is silent or our converter is.
+        if framesEmitted < 5 || framesEmitted % 200 == 0 {
+            let inRMS = Self.computeRMSAny(inputBuffer)
+            let outRMS = Self.computeRMSAny(outputBuffer)
+            wpInfo("SystemAudio frame#\(framesEmitted) inFrames=\(inputBuffer.frameLength) outFrames=\(outputBuffer.frameLength) inRMS=\(String(format: "%.5f", inRMS)) outRMS=\(String(format: "%.5f", outRMS))")
+        }
+
         return outputBuffer
+    }
+
+    /// RMS over whatever channel layout / sample format the buffer happens to use. We need
+    /// a single helper that works on the CMSampleBuffer-derived input (often interleaved
+    /// Float32 stereo) AND on our canonical output (non-interleaved Float32 mono).
+    private static func computeRMSAny(_ buffer: AVAudioPCMBuffer) -> Float {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return 0 }
+
+        if let floatChannelData = buffer.floatChannelData {
+            let channels = Int(buffer.format.channelCount)
+            var sum: Float = 0
+            var count = 0
+            for c in 0..<channels {
+                let ptr = floatChannelData[c]
+                for i in 0..<frames {
+                    let s = ptr[i]
+                    sum += s * s
+                    count += 1
+                }
+            }
+            return count > 0 ? (sum / Float(count)).squareRoot() : 0
+        }
+        if let int16ChannelData = buffer.int16ChannelData {
+            let channels = Int(buffer.format.channelCount)
+            var sum: Double = 0
+            var count = 0
+            for c in 0..<channels {
+                let ptr = int16ChannelData[c]
+                for i in 0..<frames {
+                    let s = Double(ptr[i]) / 32768.0
+                    sum += s * s
+                    count += 1
+                }
+            }
+            return count > 0 ? Float((sum / Double(count)).squareRoot()) : 0
+        }
+        return 0
     }
 }
 
