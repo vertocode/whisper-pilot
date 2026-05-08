@@ -42,6 +42,12 @@ final class OverlayState: ObservableObject {
     @Published var permissionStatus: PermissionsSnapshot = PermissionsSnapshot()
     @Published var pinnedSuggestions: [String] = []
 
+    /// Live counters surfaced in the overlay UI so the user can tell at a glance whether
+    /// the audio pipeline is actually flowing — even if the Xcode debug console is hiding
+    /// our log lines. Updated in throttled batches by the coordinator.
+    @Published var audioFrameCount: Int = 0
+    @Published var transcriptCount: Int = 0
+
     nonisolated let statusStream: AsyncStream<OverlayStatus>
     nonisolated private let statusContinuation: AsyncStream<OverlayStatus>.Continuation
 

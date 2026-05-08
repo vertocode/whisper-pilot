@@ -150,6 +150,8 @@ final class AppCoordinator {
 
         isRunning = false
         overlayState.status = .idle
+        overlayState.audioFrameCount = 0
+        overlayState.transcriptCount = 0
     }
 
     func toggleListening() async {
@@ -178,8 +180,10 @@ final class AppCoordinator {
                 framesProcessed += 1
                 if framesProcessed == 1 {
                     print("[WP][Pipeline] FIRST mixer frame received (channel=\(frame.channel))")
-                } else if framesProcessed % 200 == 0 {
-                    print("[WP][Pipeline] mixer frames forwarded: \(framesProcessed)")
+                }
+                if framesProcessed % 25 == 0 {
+                    let count = framesProcessed
+                    Task { @MainActor [weak self] in self?.overlayState.audioFrameCount = count }
                 }
                 let event = await vad.feed(frame)
                 transcriber.feed(frame.buffer, channel: frame.channel)
@@ -192,11 +196,14 @@ final class AppCoordinator {
         })
 
         consumerTasks.append(Task { [weak self] in
+            var transcriptsSeen = 0
             for await update in transcriber.transcripts {
                 await buffer.apply(update)
                 await context.absorb(update)
                 let snapshot = await buffer.snapshot()
                 self?.overlayState.transcript = snapshot
+                transcriptsSeen += 1
+                self?.overlayState.transcriptCount = transcriptsSeen
             }
         })
 

@@ -82,9 +82,22 @@ final class SystemAudioCapture: NSObject {
 
 extension SystemAudioCapture: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio,
-              sampleBuffer.isValid,
-              let pcm = makePCMBuffer(from: sampleBuffer) else { return }
+        // Count delegate invocations regardless of type so we can tell if SCStream is
+        // delivering ANYTHING. If this never fires, the stream itself isn't producing.
+        if framesEmitted == 0 {
+            print("[WP][SystemAudio] didOutputSampleBuffer fired (type=\(type.rawValue), valid=\(sampleBuffer.isValid))")
+        }
+        guard type == .audio else { return }
+        guard sampleBuffer.isValid else {
+            print("[WP][SystemAudio] received invalid audio sample buffer")
+            return
+        }
+        guard let pcm = makePCMBuffer(from: sampleBuffer) else {
+            if framesEmitted == 0 {
+                print("[WP][SystemAudio] makePCMBuffer returned nil for first sample")
+            }
+            return
+        }
 
         let frame = AudioFrame(buffer: pcm, channel: .system, timestamp: Date())
         framesEmitted += 1
@@ -156,6 +169,7 @@ extension SystemAudioCapture: SCStreamOutput {
 extension SystemAudioCapture: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log.error("SCStream stopped with error: \(String(describing: error), privacy: .public)")
+        print("[WP][SystemAudio] SCStream stopped with error: \(error.localizedDescription)")
     }
 }
 

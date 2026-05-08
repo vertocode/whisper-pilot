@@ -46,11 +46,19 @@ struct OverlayView: View {
 
             StatusDot(status: state.status)
 
-            Text(state.status.label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(state.status.label)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if state.status.isActive {
+                    Text("\(state.audioFrameCount) audio · \(state.transcriptCount) transcripts")
+                        .font(.system(size: 9, weight: .regular))
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                }
+            }
 
             Spacer()
 
