@@ -433,14 +433,16 @@ final class AppCoordinator {
         overlayState.appendSystemNote("🧪 Running recognition self-test…", category: .transcript)
         wpInfo("Self-test starting: synthesizing \"\(phrase)\"")
 
-        switch SFSpeechRecognizer.authorizationStatus() {
+        let authStatus = SFSpeechRecognizer.authorizationStatus()
+        wpInfo("Self-test: auth status = \(authStatus.rawValue) (\(authStatus))")
+        switch authStatus {
         case .authorized: break
         case .notDetermined:
             let granted: Bool = await withCheckedContinuation { cont in
                 SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
             }
             if !granted {
-                overlayState.appendSystemNote("❌ Self-test failed: Speech Recognition permission was not granted. Re-run after enabling it in System Settings → Privacy & Security → Speech Recognition.", category: .transcript)
+                overlayState.appendSystemNote("❌ Self-test failed: Speech Recognition permission was not granted.", category: .transcript)
                 return
             }
         case .denied, .restricted:
@@ -451,7 +453,14 @@ final class AppCoordinator {
             return
         }
 
-        let testTranscriber = AppleSpeechTranscriber(locale: settings.locale)
+        // Inspect what the recognizer actually offers for the chosen locale.
+        if let probe = SFSpeechRecognizer(locale: settings.locale) {
+            wpInfo("Self-test: recognizer for \(settings.localeIdentifier) — isAvailable=\(probe.isAvailable), supportsOnDeviceRecognition=\(probe.supportsOnDeviceRecognition)")
+        } else {
+            wpError("Self-test: SFSpeechRecognizer init returned nil for \(settings.localeIdentifier)")
+        }
+
+        let testTranscriber = AppleSpeechTranscriber(locale: settings.locale, autoRestart: false)
         do {
             try await testTranscriber.start()
         } catch {
@@ -473,6 +482,9 @@ final class AppCoordinator {
             }
         }
 
+        // Snapshot the log buffer offset so we can find new errors that show up during this test.
+        let preTestLogCount = LogBuffer.shared.entries.count
+
         // Synthesize and feed
         let synth = AVSpeechSynthesizer()
         let utterance = AVSpeechUtterance(string: phrase)
@@ -481,6 +493,8 @@ final class AppCoordinator {
             ?? AVSpeechSynthesisVoice(language: "en-US")
 
         let canonical = CanonicalAudioFormat.make()
+        var buffersFed = 0
+        var rmsAccum: Double = 0
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             var done = false
             var converter: AVAudioConverter?
@@ -508,22 +522,50 @@ final class AppCoordinator {
                 }
                 if error == nil, out.frameLength > 0 {
                     testTranscriber.feed(out, channel: .system)
+                    buffersFed += 1
+                    rmsAccum += Double(Self.computeRMS(out))
                 }
             }
         }
+        let avgRMS = buffersFed > 0 ? rmsAccum / Double(buffersFed) : 0
+        wpInfo("Self-test: fed \(buffersFed) buffers, avg RMS = \(String(format: "%.5f", avgRMS))")
 
-        // Give SFSpeech a moment to flush partial → final
+        // Wait for the recognizer to flush.
         try? await Task.sleep(nanoseconds: 3_000_000_000)
         collectorTask.cancel()
         testTranscriber.stop()
 
         let result = await collector.snapshot()
         wpInfo("Self-test result: \"\(result)\"")
-        if result.isEmpty {
-            overlayState.appendSystemNote("❌ Self-test failed: recognizer received synthesized speech but produced no transcripts. The recognizer pipeline isn't working — likely a Speech Recognition permission or locale model issue.", category: .transcript)
-        } else {
-            overlayState.appendSystemNote("✅ Self-test passed: recognizer produced \"\(result)\". The recognition pipeline works correctly. If live transcription still fails, the bug is in audio capture / routing — your default output device is likely not exposing audio to the macOS mixdown that we capture from.", category: .transcript)
+
+        if !result.isEmpty {
+            overlayState.appendSystemNote("✅ Self-test passed: recognizer produced \"\(result)\". The recognition pipeline works. If live transcription still fails, the bug is in audio capture / routing — your default output device isn't exposing audio to the macOS mixdown that we capture from.", category: .transcript)
+            return
         }
+
+        // Pull recognition errors that were logged during this run.
+        let newEntries = Array(LogBuffer.shared.entries.dropFirst(preTestLogCount))
+        let recognitionErrors = newEntries
+            .filter { $0.level == .error && $0.message.contains("recognition error") }
+            .map { $0.message }
+        let errorTail = recognitionErrors.isEmpty ? "no recognizer errors logged" : "last error: \(recognitionErrors.last!)"
+
+        overlayState.appendSystemNote("""
+        ❌ Self-test failed: recognizer received \(buffersFed) synthesized buffers (avg RMS=\(String(format: "%.4f", avgRMS))) but produced no transcripts. \
+        \(errorTail). \
+        Common causes: Speech Recognition denied (System Settings → Privacy & Security → Speech Recognition), wrong locale (try en-US), or the locale's on-device model isn't installed.
+        """, category: .transcript)
+    }
+
+    /// RMS over a Float32 PCM buffer; used for self-test diagnostics only.
+    private static func computeRMS(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData else { return 0 }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return 0 }
+        let pointer = channelData.pointee
+        var sum: Float = 0
+        for i in 0..<frames { sum += pointer[i] * pointer[i] }
+        return (sum / Float(frames)).squareRoot()
     }
 
     // MARK: - Wiring
