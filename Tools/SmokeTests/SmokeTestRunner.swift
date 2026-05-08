@@ -173,19 +173,19 @@ struct SmokeTestRunner {
 
     static func runPromptBuilderSuite() async {
         await suite("PromptBuilder") {
-            let p1 = PromptBuilder.build(context: snapshotFor(), question: "What's your opinion on modular monoliths?", style: .strategic)
+            let p1 = PromptBuilder.build(context: snapshotFor(), history: [], question: "What's your opinion on modular monoliths?", style: .strategic)
             await expect(p1.systemInstruction.contains("strategic"), "style name appears in system instruction")
 
             let q = "How would you approach this migration?"
-            let p2 = PromptBuilder.build(context: snapshotFor(), question: q, style: .concise)
+            let p2 = PromptBuilder.build(context: snapshotFor(), history: [], question: q, style: .concise)
             await expect(p2.question == q, "question is carried through")
 
             let lines = (0..<50).map { "Other: line \($0)" }
-            let p3 = PromptBuilder.build(context: snapshotFor(lines: lines), question: "?", style: .concise)
+            let p3 = PromptBuilder.build(context: snapshotFor(lines: lines), history: [], question: "?", style: .concise)
             await expect(p3.context.contains("line 49"), "most recent line preserved")
             await expect(!p3.context.contains("line 0\n"), "earliest line trimmed")
 
-            let p4 = PromptBuilder.build(context: snapshotFor(topics: ["postgres", "scaling"]), question: "What about sharding?", style: .detailed)
+            let p4 = PromptBuilder.build(context: snapshotFor(topics: ["postgres", "scaling"]), history: [], question: "What about sharding?", style: .detailed)
             await expect(p4.context.contains("postgres") && p4.context.contains("scaling"), "topics listed when present")
         }
     }

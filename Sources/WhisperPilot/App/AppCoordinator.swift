@@ -190,11 +190,30 @@ final class AppCoordinator {
             return
         }
         overlayState.appendUserMessage(text)
+        // Capture chat history *excluding the message we just added* so the AI sees the
+        // prior turns as context, not its own current question.
+        let history = chatHistorySnapshot(excludingLast: true)
         Task { [weak self] in
             guard let self else { return }
             let snapshot = await self.context.snapshot()
-            let prompt = PromptBuilder.buildUserQuery(context: snapshot, query: text, style: self.settings.responseStyle)
+            let prompt = PromptBuilder.buildUserQuery(context: snapshot, history: history, query: text, style: self.settings.responseStyle)
             await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
+        }
+    }
+
+    /// Snapshots the recent assistant↔user chat as `[ChatTurn]` for prompt context. Drops
+    /// system notes (those are user-facing UI affordances, not part of the conversation).
+    private func chatHistorySnapshot(excludingLast: Bool) -> [ChatTurn] {
+        var msgs = overlayState.messages
+        if excludingLast, !msgs.isEmpty {
+            msgs.removeLast()
+        }
+        return msgs.compactMap { msg -> ChatTurn? in
+            switch msg.role {
+            case .user: return ChatTurn(role: .user, text: msg.text)
+            case .assistant where !msg.text.isEmpty: return ChatTurn(role: .assistant, text: msg.text)
+            default: return nil
+            }
         }
     }
 
@@ -258,8 +277,10 @@ final class AppCoordinator {
                 self.overlayState.status = .thinking
                 let snapshot = await self.context.snapshot()
                 let style = self.settings.responseStyle
+                let history = self.chatHistorySnapshot(excludingLast: false)
                 let prompt = PromptBuilder.build(
                     context: snapshot,
+                    history: history,
                     question: trigger.text,
                     style: style
                 )
@@ -332,7 +353,8 @@ final class AppCoordinator {
         Task { [weak self] in
             guard let self else { return }
             let snapshot = await self.context.snapshot()
-            let prompt = PromptBuilder.buildAutoSend(context: snapshot, style: self.settings.responseStyle)
+            let history = self.chatHistorySnapshot(excludingLast: false)
+            let prompt = PromptBuilder.buildAutoSend(context: snapshot, history: history, style: self.settings.responseStyle)
             await self.runCompletion(prompt: prompt, ai: ai, origin: .autoSend)
         }
     }
