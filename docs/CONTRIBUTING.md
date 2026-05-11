@@ -23,6 +23,20 @@ swift run SmokeTests         # runs the pure-logic test suite (29 assertions)
 
 `swift build` won't produce a runnable `.app` — entitlements and `Info.plist` live in `Project.yml`.
 
+### Stop macOS from re-asking for permissions on every rebuild
+
+By default the project signs ad-hoc (`CODE_SIGN_IDENTITY = "-"`). Every rebuild changes the binary hash, and macOS's TCC database treats the new build as a different app — so Microphone / Screen Recording / Speech Recognition grants get wiped and re-prompted (with your admin password) every time. That gets old fast.
+
+Fix it once with a free Apple ID Personal Team:
+
+1. Xcode → **Settings → Accounts** → **+** → sign in with your Apple ID (free; no paid Developer Program needed).
+2. Select the **WhisperPilot** target → **Signing & Capabilities**.
+3. Change **Team** from `None` to your name (Personal Team). Xcode generates a stable certificate.
+4. Build once. macOS prompts for permissions one final time. Grant them.
+5. From then on, rebuilds reuse the same code signature → TCC remembers your permissions → no more password prompts.
+
+This works because TCC keys Personal Team-signed binaries by stable identity rather than content hash.
+
 ## How to find your way around
 
 Read [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) first. It maps every module to the runtime data flow. The fastest way to understand the codebase is to follow a single audio frame from `SystemAudioCapture` to the overlay, and a single composer submission from `OverlayView` to `GeminiProvider`.
