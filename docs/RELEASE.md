@@ -1,21 +1,66 @@
 # Release process
 
-How to cut a new version of Whisper Pilot, ship it as a DMG, and make it installable via Homebrew. **Once the one-time setup is done, releasing is a single button-click.**
+How to cut a new version of Whisper Pilot, ship it as a DMG, and make it installable via Homebrew. **Releasing is one command (local) or one button click (CI) — and both run the same `bin/release` script.**
 
-## TL;DR (recommended — manual CI trigger)
+## TL;DR
 
-1. Go to [**Actions → Release**](https://github.com/vertocode/whisper-pilot/actions/workflows/release.yml) on GitHub.
-2. Click **Run workflow** (top right).
-3. Type a version (e.g. `0.2.0`), click **Run workflow** again.
+**Locally:**
 
-The workflow checks out the current `main`, builds the DMG, creates a GitHub Release `v0.2.0` with the DMG attached, and — if you've configured the tap token (see [one-time setup](#one-time-setup)) — bumps the [Homebrew tap](https://github.com/vertocode/homebrew-whisper-pilot) cask file so users running `brew upgrade --cask whisper-pilot` get the new build automatically.
+```sh
+./bin/release --version 0.2.0
+```
 
-## Other triggers
+**Via CI:** Go to [Actions → Release → Run workflow](https://github.com/vertocode/whisper-pilot/actions/workflows/release.yml), type the version, click Run.
+
+Either way, the end state is the same: a GitHub Release `v0.2.0` with the DMG attached, and the Homebrew tap auto-bumped so `brew upgrade --cask whisper-pilot` picks up the new build.
+
+## Local release
+
+```sh
+# full release: build, sign (if configured), notarize (if configured), publish, bump tap
+./bin/release --version 0.2.0
+
+# alternatives
+./bin/release 0.2.0                       # positional version, same as above
+./bin/release --version 0.2.0 --build-only   # produce DMG locally; no uploads
+./bin/release --version 0.2.0 --skip-tap     # publish a Release; skip the tap update
+./bin/release --help                       # full reference
+```
+
+Requirements for the local flow:
+
+| Tool | Install | Used for |
+| --- | --- | --- |
+| `xcodegen` | `brew install xcodegen` | Generates `WhisperPilot.xcodeproj` from `Project.yml` |
+| `create-dmg` | `brew install create-dmg` | Wraps the `.app` into a styled installer DMG |
+| `xcbeautify` | `brew install xcbeautify` *(optional)* | Pretty-prints xcodebuild output |
+| `gh` | `brew install gh && gh auth login` | Creates the GitHub Release and authenticates the cross-repo tap push |
+| Xcode 16+ | Mac App Store | Builds the `.app`. Xcode 15 fails to read `objectVersion 77` `.pbxproj` files |
+
+If `gh auth login` is done once and you have push access to both `vertocode/whisper-pilot` and `vertocode/homebrew-whisper-pilot`, the full flow runs without any additional secrets — `gh auth setup-git` configures git credentials for cross-repo push transparently.
+
+### What the script does, step by step
+
+1. **Regenerates** the Xcode project (`./bin/regenerate`)
+2. **Archives** `Release` config with `MARKETING_VERSION=<your version>`
+3. **Extracts** the `.app` (signed export via `xcodebuild -exportArchive` if `WP_DEVELOPER_ID` is set, otherwise a plain copy out of the archive)
+4. **Notarizes** the `.app`, if all of `WP_APPLE_ID` / `WP_APPLE_APP_PASSWORD` / `WP_TEAM_ID` are set
+5. **Wraps** the `.app` into a DMG via `create-dmg`
+6. **Signs + notarizes the DMG** if signing is configured
+7. **Computes SHA-256** and writes `WhisperPilot-<version>.dmg.sha256` next to the DMG
+8. *(unless `--build-only`)* **Creates GitHub Release** `v<version>` via `gh release create` and attaches the DMG
+9. *(unless `--skip-tap`)* **Clones the tap**, sed-bumps `version` + `sha256` in `Casks/whisper-pilot.rb`, commits, pushes
+
+## CI release
+
+Identical behavior, but on a hosted macOS runner so you don't tie up your Mac for 5 minutes. Same `bin/release` script under the hood — see [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+
+Triggers:
 
 | How | What happens |
 | --- | --- |
-| `git tag v0.2.0 && git push origin v0.2.0` | Same workflow runs, version is parsed from the tag |
-| `./bin/release 0.2.0` (local) | Same DMG build, but no GitHub Release or tap update — you'd have to upload manually |
+| Actions UI → Run workflow → type version | Workflow runs `./bin/release --version <input>` |
+| `git tag v0.2.0 && git push origin v0.2.0` | Same, version parsed from the tag |
 
 ## One-time setup
 

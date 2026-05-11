@@ -1,83 +1,159 @@
 #!/usr/bin/env bash
-# Build, package, and (optionally) sign + notarize a release DMG of Whisper Pilot.
+# Whisper Pilot release script.
+#
+# Builds a DMG, optionally signs + notarizes it, publishes a GitHub Release with the
+# DMG attached, and bumps the Homebrew tap so `brew upgrade --cask whisper-pilot`
+# picks up the new version. The same script is invoked by
+# `.github/workflows/release.yml` — CI and local releases produce identical artifacts.
 #
 # Usage:
-#   ./bin/release                 # build using version in Project.yml, write to build/
-#   ./bin/release 0.2.0           # override the version stamped into the build
+#   ./bin/release --version 0.2.0              # full release (build + publish + tap)
+#   ./bin/release 0.2.0                        # positional form, same effect
+#   ./bin/release --version 0.2.0 --build-only # just produce a DMG, no uploads
+#   ./bin/release --version 0.2.0 --skip-tap   # publish Release but don't touch tap
+#   ./bin/release --help
 #
-# Behavior:
-#   - Always: regenerates the Xcode project, archives Release config, exports the .app,
-#     creates a DMG via `create-dmg`, prints SHA-256 for Homebrew Cask use.
-#   - If WP_DEVELOPER_ID is exported in the environment (e.g.
-#     "Developer ID Application: Your Name (TEAMID)"), the build is codesigned with that
-#     identity. Without it, the DMG is unsigned — users will need to right-click → Open
-#     the first time to bypass Gatekeeper.
-#   - If WP_APPLE_ID + WP_APPLE_APP_PASSWORD + WP_TEAM_ID are all set, the DMG is also
-#     submitted to Apple for notarization and the resulting ticket is stapled. Without
-#     them, notarization is skipped (which is fine for alpha distribution — same caveat
-#     as unsigned).
-#
-# Output:
-#   build/WhisperPilot-${VERSION}.dmg
-#   build/WhisperPilot-${VERSION}.dmg.sha256
+# Environment variables (all optional):
+#   WP_DEVELOPER_ID              Codesign identity ("Developer ID Application: …")
+#   WP_APPLE_ID + WP_APPLE_APP_PASSWORD + WP_TEAM_ID    Notarization credentials
+#   TAP_REPO_TOKEN               Fine-grained PAT with Contents:Write on the tap repo.
+#                                Used by CI to push the cask update. Locally, the script
+#                                falls back to your `gh auth setup-git` credentials.
+#   GH_TOKEN / GITHUB_TOKEN      Used by `gh release create`. CI sets these automatically;
+#                                locally, `gh auth login` once is enough.
 set -euo pipefail
-
 cd "$(dirname "$0")/.."
 
-VERSION="${1:-$(awk '/CFBundleShortVersionString/ { gsub(/"/, "", $2); print $2; exit }' Project.yml)}"
-if [[ -z "${VERSION}" ]]; then
-    echo "Could not determine version. Pass it as the first arg or set CFBundleShortVersionString in Project.yml." >&2
-    exit 1
+# --- Help ------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+Whisper Pilot release script.
+
+Usage:
+  ./bin/release [--version X.Y.Z] [flags]
+
+Flags:
+  -v, --version VERSION   Version to release (e.g. 0.2.0). Falls back to
+                          CFBundleShortVersionString in Project.yml if omitted.
+      --build-only        Produce the DMG locally only. Skip GitHub Release
+                          and Homebrew tap update.
+      --skip-publish      Build (and update tap, if enabled). Skip GH Release.
+      --skip-tap          Build + create GH Release. Skip the tap update.
+  -h, --help              Show this help.
+
+Examples:
+  ./bin/release --version 0.2.0           # full release
+  ./bin/release --version 0.2.0 --build-only
+  ./bin/release 0.0.1 --build-only        # positional version, build only
+EOF
+}
+
+# --- Arg parsing -----------------------------------------------------------
+VERSION=""
+BUILD_ONLY=0
+SKIP_PUBLISH=0
+SKIP_TAP=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--version)
+      if [[ $# -lt 2 ]]; then echo "Error: --version requires a value" >&2; exit 1; fi
+      VERSION="$2"; shift 2 ;;
+    --build-only)    BUILD_ONLY=1; shift ;;
+    --skip-publish)  SKIP_PUBLISH=1; shift ;;
+    --skip-tap)      SKIP_TAP=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    --)              shift; break ;;
+    -*)              echo "Unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$VERSION" ]]; then VERSION="$1"
+      else echo "Error: unexpected argument '$1'" >&2; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+# Default version from Project.yml if unspecified.
+if [[ -z "$VERSION" ]]; then
+  VERSION="$(awk '/CFBundleShortVersionString/ { gsub(/"/, "", $2); print $2; exit }' Project.yml || true)"
+fi
+VERSION="${VERSION#v}"  # strip leading v if present
+
+if [[ -z "$VERSION" ]]; then
+  echo "Error: no version supplied and Project.yml has no CFBundleShortVersionString." >&2
+  usage >&2
+  exit 1
 fi
 
+if [[ $BUILD_ONLY -eq 1 ]]; then
+  SKIP_PUBLISH=1
+  SKIP_TAP=1
+fi
+
+# --- Constants -------------------------------------------------------------
 SCHEME="WhisperPilot"
 BUILD_DIR="build"
 ARCHIVE_PATH="${BUILD_DIR}/WhisperPilot.xcarchive"
 EXPORT_DIR="${BUILD_DIR}/export"
 APP_PATH="${EXPORT_DIR}/WhisperPilot.app"
 DMG_PATH="${BUILD_DIR}/WhisperPilot-${VERSION}.dmg"
+TAP_REPO="vertocode/homebrew-whisper-pilot"
 
-# Prerequisites — fail loudly with a recovery hint rather than letting xcodebuild error out
-# halfway through with a less-actionable message.
-command -v xcodegen >/dev/null  || { echo "Missing xcodegen — run: brew install xcodegen" >&2; exit 1; }
-command -v xcodebuild >/dev/null || { echo "Missing xcodebuild — install Xcode from the App Store." >&2; exit 1; }
+# --- Logging helpers -------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_STEP=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'; C_RESET=$'\033[0m'
+else
+  C_STEP=''; C_OK=''; C_WARN=''; C_RESET=''
+fi
+step()      { printf "\n%s▸%s %s\n" "$C_STEP" "$C_RESET" "$*"; }
+done_step() { printf "%s✓%s %s\n" "$C_OK" "$C_RESET" "$*"; }
+warn()      { printf "%s!%s %s\n" "$C_WARN" "$C_RESET" "$*" >&2; }
+
+# --- Prereq checks ---------------------------------------------------------
+command -v xcodegen   >/dev/null || { echo "Missing xcodegen — run: brew install xcodegen"   >&2; exit 1; }
+command -v xcodebuild >/dev/null || { echo "Missing xcodebuild — install Xcode."             >&2; exit 1; }
 command -v create-dmg >/dev/null || { echo "Missing create-dmg — run: brew install create-dmg" >&2; exit 1; }
 
-echo "▸ Regenerating Xcode project"
+if [[ $SKIP_PUBLISH -eq 0 ]] || [[ $SKIP_TAP -eq 0 ]]; then
+  command -v gh >/dev/null || { echo "Missing gh CLI — run: brew install gh && gh auth login." >&2; exit 1; }
+fi
+
+if [[ $SKIP_PUBLISH -eq 0 ]]; then
+  if ! gh auth status >/dev/null 2>&1 && [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+    echo "Error: gh CLI is not authenticated. Run 'gh auth login' (or set GH_TOKEN)." >&2
+    exit 1
+  fi
+fi
+
+# --- Build -----------------------------------------------------------------
+step "Regenerating Xcode project"
 ./bin/regenerate
 
-echo "▸ Cleaning previous build artifacts"
+step "Cleaning previous build artifacts"
 rm -rf "${BUILD_DIR}"
 mkdir -p "${EXPORT_DIR}"
 
-EXPORT_PLIST="${BUILD_DIR}/ExportOptions.plist"
 if [[ -n "${WP_DEVELOPER_ID:-}" ]]; then
-    SIGN_METHOD="developer-id"
-    SIGN_IDENTITY="${WP_DEVELOPER_ID}"
-    echo "▸ Code-sign identity: ${SIGN_IDENTITY}"
+  SIGN_METHOD="developer-id"
+  SIGN_IDENTITY="${WP_DEVELOPER_ID}"
+  step "Code-sign identity: ${SIGN_IDENTITY}"
 else
-    SIGN_METHOD="none"
-    SIGN_IDENTITY="-"
-    echo "▸ No WP_DEVELOPER_ID set — building unsigned. Users will see a Gatekeeper warning."
+  SIGN_METHOD="none"
+  SIGN_IDENTITY="-"
+  warn "No WP_DEVELOPER_ID set — building unsigned. Users will see a Gatekeeper warning."
 fi
 
-cat > "${EXPORT_PLIST}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>method</key>
-    <string>${SIGN_METHOD}</string>
-    <key>signingStyle</key>
-    <string>manual</string>
-    <key>destination</key>
-    <string>export</string>
-</dict>
-</plist>
-EOF
+run_xcodebuild() {
+  if command -v xcbeautify >/dev/null; then
+    xcodebuild "$@" 2>&1 | xcbeautify --quieter
+    return ${PIPESTATUS[0]}
+  else
+    xcodebuild "$@"
+  fi
+}
 
-echo "▸ Archiving (Release, version ${VERSION})"
-xcodebuild \
+step "Archiving (Release, version ${VERSION})"
+run_xcodebuild \
     -project WhisperPilot.xcodeproj \
     -scheme "${SCHEME}" \
     -configuration Release \
@@ -85,51 +161,68 @@ xcodebuild \
     -destination "platform=macOS" \
     MARKETING_VERSION="${VERSION}" \
     CODE_SIGN_IDENTITY="${SIGN_IDENTITY}" \
-    archive | xcbeautify --quieter || true
+    archive
 
-if [[ ! -d "${ARCHIVE_PATH}" ]]; then
-    echo "Archive failed — see Xcode output above." >&2
-    exit 1
+[[ -d "${ARCHIVE_PATH}" ]] || { echo "Archive failed." >&2; exit 1; }
+
+# Extract the .app from the archive. For signed builds we go through
+# `xcodebuild -exportArchive` with a method=developer-id plist; for unsigned
+# builds we just copy the .app out of the archive directly — Xcode rejects
+# any "method=none" plist value, and there's nothing for the exporter to do
+# when there's no Developer ID anyway.
+if [[ "${SIGN_METHOD}" == "developer-id" ]]; then
+  step "Exporting signed .app"
+  EXPORT_PLIST="${BUILD_DIR}/ExportOptions.plist"
+  cat > "${EXPORT_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key><string>developer-id</string>
+    <key>signingStyle</key><string>manual</string>
+    <key>destination</key><string>export</string>
+</dict>
+</plist>
+EOF
+  run_xcodebuild \
+      -exportArchive \
+      -archivePath "${ARCHIVE_PATH}" \
+      -exportPath "${EXPORT_DIR}" \
+      -exportOptionsPlist "${EXPORT_PLIST}"
+else
+  step "Copying unsigned .app out of archive"
+  ARCHIVE_APP="${ARCHIVE_PATH}/Products/Applications/WhisperPilot.app"
+  [[ -d "${ARCHIVE_APP}" ]] || { echo "No .app found inside archive at ${ARCHIVE_APP}" >&2; exit 1; }
+  cp -R "${ARCHIVE_APP}" "${APP_PATH}"
 fi
 
-echo "▸ Exporting .app"
-xcodebuild \
-    -exportArchive \
-    -archivePath "${ARCHIVE_PATH}" \
-    -exportPath "${EXPORT_DIR}" \
-    -exportOptionsPlist "${EXPORT_PLIST}" | xcbeautify --quieter || true
+[[ -d "${APP_PATH}" ]] || { echo "Export failed — no .app at ${APP_PATH}" >&2; exit 1; }
 
-if [[ ! -d "${APP_PATH}" ]]; then
-    echo "Export failed — no .app at ${APP_PATH}" >&2
-    exit 1
-fi
-
-# Optional: notarize. Requires that the app was signed with Developer ID above.
+# --- Optional: notarize the .app -------------------------------------------
 if [[ "${SIGN_METHOD}" == "developer-id" \
    && -n "${WP_APPLE_ID:-}" \
    && -n "${WP_APPLE_APP_PASSWORD:-}" \
    && -n "${WP_TEAM_ID:-}" ]]; then
-    echo "▸ Zipping for notarization"
-    NOTARIZE_ZIP="${BUILD_DIR}/WhisperPilot-notarize.zip"
-    ditto -c -k --keepParent "${APP_PATH}" "${NOTARIZE_ZIP}"
+  step "Zipping for notarization"
+  NOTARIZE_ZIP="${BUILD_DIR}/WhisperPilot-notarize.zip"
+  ditto -c -k --keepParent "${APP_PATH}" "${NOTARIZE_ZIP}"
 
-    echo "▸ Submitting to Apple for notarization (may take 1–10 min)"
-    xcrun notarytool submit "${NOTARIZE_ZIP}" \
-        --apple-id "${WP_APPLE_ID}" \
-        --password "${WP_APPLE_APP_PASSWORD}" \
-        --team-id "${WP_TEAM_ID}" \
-        --wait
+  step "Submitting to Apple for notarization (1–10 min)"
+  xcrun notarytool submit "${NOTARIZE_ZIP}" \
+      --apple-id "${WP_APPLE_ID}" \
+      --password "${WP_APPLE_APP_PASSWORD}" \
+      --team-id "${WP_TEAM_ID}" \
+      --wait
 
-    echo "▸ Stapling notarization ticket to .app"
-    xcrun stapler staple "${APP_PATH}"
-    rm -f "${NOTARIZE_ZIP}"
+  step "Stapling notarization ticket to .app"
+  xcrun stapler staple "${APP_PATH}"
+  rm -f "${NOTARIZE_ZIP}"
 else
-    echo "▸ Skipping notarization (set WP_APPLE_ID, WP_APPLE_APP_PASSWORD, WP_TEAM_ID to enable)"
+  warn "Skipping notarization (set WP_APPLE_ID, WP_APPLE_APP_PASSWORD, WP_TEAM_ID to enable)"
 fi
 
-echo "▸ Building DMG"
-# Use a temporary "stage" directory so create-dmg only picks up the .app, not the export
-# plist or archive folder.
+# --- Build the DMG ---------------------------------------------------------
+step "Building DMG"
 STAGE_DIR="${BUILD_DIR}/dmg-stage"
 rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
@@ -148,30 +241,96 @@ create-dmg \
     "${STAGE_DIR}/"
 
 if [[ "${SIGN_METHOD}" == "developer-id" ]]; then
-    echo "▸ Signing the DMG itself"
-    codesign --force --sign "${SIGN_IDENTITY}" "${DMG_PATH}"
+  step "Signing the DMG"
+  codesign --force --sign "${SIGN_IDENTITY}" "${DMG_PATH}"
 
-    if [[ -n "${WP_APPLE_ID:-}" && -n "${WP_APPLE_APP_PASSWORD:-}" && -n "${WP_TEAM_ID:-}" ]]; then
-        echo "▸ Notarizing the DMG"
-        xcrun notarytool submit "${DMG_PATH}" \
-            --apple-id "${WP_APPLE_ID}" \
-            --password "${WP_APPLE_APP_PASSWORD}" \
-            --team-id "${WP_TEAM_ID}" \
-            --wait
-        xcrun stapler staple "${DMG_PATH}"
-    fi
+  if [[ -n "${WP_APPLE_ID:-}" && -n "${WP_APPLE_APP_PASSWORD:-}" && -n "${WP_TEAM_ID:-}" ]]; then
+    step "Notarizing the DMG"
+    xcrun notarytool submit "${DMG_PATH}" \
+        --apple-id "${WP_APPLE_ID}" \
+        --password "${WP_APPLE_APP_PASSWORD}" \
+        --team-id "${WP_TEAM_ID}" \
+        --wait
+    xcrun stapler staple "${DMG_PATH}"
+  fi
 fi
 
-SHA256=$(shasum -a 256 "${DMG_PATH}" | awk '{print $1}')
+SHA256="$(shasum -a 256 "${DMG_PATH}" | awk '{print $1}')"
 echo "${SHA256}  $(basename "${DMG_PATH}")" > "${DMG_PATH}.sha256"
 
-echo ""
-echo "✓ DMG ready: ${DMG_PATH}"
+done_step "DMG ready: ${DMG_PATH}"
 echo "  SHA-256:  ${SHA256}"
-echo ""
-echo "Next steps:"
-echo "  1. Upload to GitHub Releases:"
-echo "       gh release create v${VERSION} \"${DMG_PATH}\" --notes \"...\""
-echo "  2. Update Casks/whisper-pilot.rb:"
-echo "       version  \"${VERSION}\""
-echo "       sha256   \"${SHA256}\""
+
+if [[ $BUILD_ONLY -eq 1 ]]; then
+  echo
+  done_step "Build-only mode: skipping publish + tap update."
+  exit 0
+fi
+
+# --- Publish to GitHub Releases --------------------------------------------
+if [[ $SKIP_PUBLISH -eq 0 ]]; then
+  step "Publishing GitHub Release v${VERSION}"
+  NOTES="**SHA-256:** \`${SHA256}\`
+
+Install via Homebrew (after the tap is updated):
+\`\`\`
+brew install --cask vertocode/whisper-pilot/whisper-pilot
+\`\`\`
+or download the .dmg below."
+
+  if gh release view "v${VERSION}" >/dev/null 2>&1; then
+    gh release upload "v${VERSION}" "${DMG_PATH}" --clobber
+    done_step "Updated existing release v${VERSION}"
+  else
+    gh release create "v${VERSION}" "${DMG_PATH}" \
+        --title "Whisper Pilot ${VERSION}" \
+        --notes "${NOTES}"
+    done_step "Created release v${VERSION}"
+  fi
+fi
+
+# --- Update Homebrew tap ---------------------------------------------------
+if [[ $SKIP_TAP -eq 0 ]]; then
+  step "Updating Homebrew tap (${TAP_REPO})"
+  TAP_DIR="${BUILD_DIR}/tap"
+  rm -rf "${TAP_DIR}"
+
+  # When run from CI, TAP_REPO_TOKEN is the explicit way to authenticate. When run
+  # locally, the user's `gh auth setup-git` credential helper handles auth invisibly.
+  if [[ -n "${TAP_REPO_TOKEN:-}" ]]; then
+    CLONE_URL="https://x-access-token:${TAP_REPO_TOKEN}@github.com/${TAP_REPO}.git"
+  else
+    CLONE_URL="https://github.com/${TAP_REPO}.git"
+  fi
+
+  if ! git clone --quiet "${CLONE_URL}" "${TAP_DIR}"; then
+    warn "Couldn't clone the tap repo. Make sure either:"
+    warn "  - You're logged in via 'gh auth login' (and ran 'gh auth setup-git'), OR"
+    warn "  - You have TAP_REPO_TOKEN set in your environment."
+    warn "Skipping tap update — Release was created, you can update the cask manually."
+    exit 0
+  fi
+
+  (
+    cd "${TAP_DIR}"
+    sed -i.bak "s/^  version .*/  version \"${VERSION}\"/" Casks/whisper-pilot.rb
+    sed -i.bak "s/^  sha256 .*/  sha256 \"${SHA256}\"/"  Casks/whisper-pilot.rb
+    rm -f Casks/whisper-pilot.rb.bak
+
+    if git diff --quiet; then
+      done_step "Tap already at v${VERSION} — nothing to commit."
+    else
+      git -c user.email="release@whisperpilot.app" \
+          -c user.name="Whisper Pilot Release" \
+          add Casks/whisper-pilot.rb
+      git -c user.email="release@whisperpilot.app" \
+          -c user.name="Whisper Pilot Release" \
+          commit --quiet -m "chore: bump to v${VERSION}"
+      git push --quiet
+      done_step "Tap updated. Users running 'brew upgrade --cask whisper-pilot' will get v${VERSION}."
+    fi
+  )
+fi
+
+echo
+done_step "Release v${VERSION} complete."
