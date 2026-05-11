@@ -65,6 +65,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             toggleSystemAudioMute: { [weak self] in
                 self?.coordinator.overlayState.isSystemAudioMuted.toggle()
+            },
+            exportTranscript: { [weak self] in
+                self?.exportCurrentTranscript()
             }
         )
 
@@ -123,6 +126,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sessionsWindow?.showWindow(nil)
             NSApp.activate(ignoringOtherApps: true)
             sessionsWindow?.window?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// Read-only export: copies the active session's `transcript.md` to a user-chosen
+    /// path via the standard macOS save panel. The original on-disk transcript stays
+    /// untouched. No-op if no session is active (the overlay shouldn't be visible in that
+    /// case anyway, so this is purely defensive).
+    private func exportCurrentTranscript() {
+        guard let session = coordinator.currentSession else {
+            wpWarn("Export transcript: no active session — nothing to export")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Export transcript"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [.plainText]
+        let sanitizedName = session.displayName
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = "\(sanitizedName).md"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task {
+                let markdown = await SessionStore.shared.loadTranscriptMarkdown(session.id)
+                do {
+                    try markdown.write(to: url, atomically: true, encoding: .utf8)
+                    wpInfo("Exported transcript (\(markdown.count) bytes) to \(url.path)")
+                } catch {
+                    wpError("Export transcript failed: \(error.localizedDescription)")
+                }
+            }
         }
     }
 

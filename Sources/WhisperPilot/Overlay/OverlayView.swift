@@ -29,32 +29,35 @@ struct OverlayView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.25)
+            Divider().opacity(0.4)
             if showDebugPanel {
                 debugPanel
-                Divider().opacity(0.25)
+                Divider().opacity(0.4)
             }
             content
-            Divider().opacity(0.25)
+            Divider().opacity(0.4)
             composer
         }
         .frame(minWidth: 380, minHeight: 320)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+            RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous)
+                .strokeBorder(.separator.opacity(0.6), lineWidth: 0.5)
         )
-        .padding(8)
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 6)
+        .padding(WP.Space.sm)
     }
 
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: WP.Space.sm) {
             Button(action: actions.goToSessions) {
-                Image(systemName: "chevron.left.circle.fill")
-                    .font(.system(size: 14))
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("Back to Sessions (stops listening)")
@@ -62,150 +65,172 @@ struct OverlayView: View {
             BrandLogo()
                 .frame(width: 18, height: 18)
 
-            StatusDot(status: state.status)
-
-            VStack(alignment: .leading, spacing: 0) {
-                Text(state.status.label)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                if state.status.isActive {
-                    Text("\(state.audioFrameCount) audio · \(state.transcriptCount) transcripts")
-                        .font(.system(size: 9, weight: .regular))
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
-                }
-            }
-
-            Spacer()
-
-            Button(action: actions.toggleListening) {
-                Image(systemName: state.status.isActive ? "stop.circle.fill" : "play.circle.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(state.status.isActive ? .red : .accentColor)
-            }
-            .buttonStyle(.plain)
-            .help(state.status.isActive ? "Stop listening" : "Start listening")
-
-            Button(action: actions.toggleMicMute) {
-                Image(systemName: state.isMicrophoneMuted ? "mic.slash.fill" : "mic.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(state.isMicrophoneMuted ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-            }
-            .buttonStyle(.plain)
-            .help(state.isMicrophoneMuted
-                  ? "Microphone is muted — no transcription of your voice. Click to resume."
-                  : "Microphone is being transcribed. Click to mute (capture continues but isn't transcribed).")
-
-            Button(action: actions.toggleSystemAudioMute) {
-                Image(systemName: state.isSystemAudioMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(state.isSystemAudioMuted ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-            }
-            .buttonStyle(.plain)
-            .help(state.isSystemAudioMuted
-                  ? "System audio is muted — no transcription of meeting/video audio. Click to resume."
-                  : "System audio is being transcribed. Click to mute (capture continues but isn't transcribed).")
-
-            Button {
-                showDebugPanel.toggle()
-                if showDebugPanel { logBuffer.clearAlertBadge() }
-            } label: {
-                ZStack(alignment: .topTrailing) {
-                    Image(systemName: showDebugPanel ? "ladybug.fill" : "ladybug")
-                        .font(.system(size: 14))
-                        .foregroundStyle(showDebugPanel ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-                    if logBuffer.unseenAlertCount > 0 {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 8, height: 8)
-                            .offset(x: 4, y: -2)
+            HStack(spacing: 6) {
+                StatusDot(status: state.status)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(state.status.label)
+                        .font(WP.TextStyle.label)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if state.status.isActive {
+                        Text("\(state.audioFrameCount) audio · \(state.transcriptCount) transcripts")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                            .monospacedDigit()
                     }
                 }
             }
+
+            Spacer(minLength: WP.Space.sm)
+
+            Button(action: actions.toggleListening) {
+                if state.status == .starting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.75)
+                        .frame(width: 22, height: 22)
+                } else {
+                    Image(systemName: state.status.isActive ? "stop.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(state.status.isActive ? Color.red : Color.accentColor)
+                        .frame(width: 22, height: 22)
+                }
+            }
             .buttonStyle(.plain)
+            .disabled(state.status == .starting)
+            .help(playButtonHelp)
+
+            ChannelMuteButton(
+                isMuted: state.isMicrophoneMuted,
+                activeIcon: "mic.fill",
+                mutedIcon: "mic.slash.fill",
+                activeHelp: "Microphone is being transcribed. Click to mute (capture continues but isn't transcribed).",
+                mutedHelp: "Microphone is muted — no transcription of your voice. Click to resume.",
+                action: actions.toggleMicMute
+            )
+
+            ChannelMuteButton(
+                isMuted: state.isSystemAudioMuted,
+                activeIcon: "speaker.wave.2.fill",
+                mutedIcon: "speaker.slash.fill",
+                activeHelp: "System audio is being transcribed. Click to mute (capture continues but isn't transcribed).",
+                mutedHelp: "System audio is muted — no transcription of meeting/video audio. Click to resume.",
+                action: actions.toggleSystemAudioMute
+            )
+
+            Menu {
+                Button(action: actions.exportTranscript) {
+                    Label("Export transcript…", systemImage: "square.and.arrow.up")
+                }
+                .keyboardShortcut("e", modifiers: [.command])
+                Divider()
+                Button {
+                    showDebugPanel.toggle()
+                    if showDebugPanel { logBuffer.clearAlertBadge() }
+                } label: {
+                    Label(
+                        showDebugPanel ? "Hide diagnostics" : "Show diagnostics",
+                        systemImage: "ladybug"
+                    )
+                }
+                Button(action: actions.openSettings) {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+                .keyboardShortcut(",", modifiers: [.command])
+                Divider()
+                Button(action: actions.hideOverlay) {
+                    Label("Hide overlay", systemImage: "eye.slash")
+                }
+            } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                    if logBuffer.unseenAlertCount > 0 {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 7, height: 7)
+                            .overlay(Circle().strokeBorder(.background, lineWidth: 1))
+                            .offset(x: 2, y: 1)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
             .help(logBuffer.unseenAlertCount > 0
-                  ? "Diagnostics (\(logBuffer.unseenAlertCount) new alert\(logBuffer.unseenAlertCount == 1 ? "" : "s"))"
-                  : "Diagnostics / debug log")
-
-            Button(action: actions.openSettings) {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
-
-            Button(action: actions.hideOverlay) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Hide overlay")
+                  ? "More (\(logBuffer.unseenAlertCount) new diagnostic alert\(logBuffer.unseenAlertCount == 1 ? "" : "s"))"
+                  : "More")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, WP.Space.md)
+        .padding(.vertical, 7)
+        .background(.regularMaterial)
+    }
+
+    private var playButtonHelp: String {
+        switch state.status {
+        case .starting: return "Starting…"
+        case .listening, .thinking, .streaming: return "Stop listening"
+        default: return "Start listening"
+        }
     }
 
     // MARK: - Debug panel
 
     private var debugPanel: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: WP.Space.xs) {
+            HStack(spacing: WP.Space.sm) {
                 Image(systemName: "ladybug.fill")
                     .font(.caption)
                     .foregroundStyle(.tint)
                 Text("Diagnostics")
-                    .font(.caption.weight(.semibold))
+                    .font(WP.TextStyle.sectionHeader)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Mic Test") { actions.runMicTest() }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
-                    .font(.caption)
                     .help("Records 3s from your microphone and reports RMS energy. Proves whether the mic captures real audio (independent of the recognizer).")
                 Button("Audio Test") { actions.runAudioTest() }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
-                    .font(.caption)
                     .help("Captures 3s of system audio via Process Tap and reports RMS energy. Proves whether your audio routing is going through the macOS mixdown we read from.")
                 Button("Self-Test") { actions.runSelfTest() }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
-                    .font(.caption)
                     .help("Synthesizes speech and feeds it to the recognizer. Proves whether the recognition pipeline works in isolation from audio capture.")
                 Button("Clear") { logBuffer.clearAll() }
                     .controlSize(.small)
-                    .buttonStyle(.plain)
+                    .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
-                    .font(.caption)
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
+            .padding(.horizontal, WP.Space.md)
+            .padding(.top, WP.Space.sm)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     let recent = logBuffer.entries.suffix(60)
                     if recent.isEmpty {
-                        Text("No log entries yet — start listening to see audio + AI events.")
+                        Text("No log entries yet — start listening to see audio and AI events appear here.")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 4)
+                            .padding(.horizontal, WP.Space.md)
+                            .padding(.vertical, WP.Space.xs)
                     } else {
                         ForEach(recent) { entry in
                             LogRow(entry: entry)
                         }
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+                .padding(.horizontal, WP.Space.md)
+                .padding(.bottom, WP.Space.sm)
             }
             .frame(maxHeight: 160)
         }
-        .background(Color.gray.opacity(0.06))
+        .background(.quinary)
     }
 
     // MARK: - Content
@@ -213,7 +238,7 @@ struct OverlayView: View {
     private var content: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: WP.Space.md) {
                     if let banner = bannerSpec {
                         BannerView(spec: banner)
                             .id("banner")
@@ -242,7 +267,7 @@ struct OverlayView: View {
                             .id(note.id)
                     }
                 }
-                .padding(12)
+                .padding(WP.Space.md)
             }
             .onChange(of: state.messages.last?.id) { _, _ in
                 if let last = state.messages.last?.id {
@@ -254,6 +279,22 @@ struct OverlayView: View {
             .onChange(of: state.messages.last?.text) { _, _ in
                 if let last = state.messages.last?.id {
                     proxy.scrollTo(last, anchor: .bottom)
+                }
+            }
+            // Auto-follow the live transcript too — without this, transcript lines beyond
+            // what fits in the viewport just render off-screen below the fold and the user
+            // assumes recognition stopped. Trigger on both id (new segment appended) and
+            // text (existing partial growing).
+            .onChange(of: state.transcript.last?.id) { _, _ in
+                if let lastId = state.transcript.last?.id {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(lastId, anchor: .bottom)
+                    }
+                }
+            }
+            .onChange(of: state.transcript.last?.text) { _, _ in
+                if let lastId = state.transcript.last?.id {
+                    proxy.scrollTo(lastId, anchor: .bottom)
                 }
             }
         }
@@ -274,51 +315,58 @@ struct OverlayView: View {
     // MARK: - Composer
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                TextField("Ask the AI… (uses live transcript and chat history as context)", text: $state.composerText, axis: .vertical)
+        VStack(alignment: .leading, spacing: WP.Space.sm) {
+            HStack(alignment: .bottom, spacing: WP.Space.sm) {
+                TextField("Ask the AI — uses live transcript and chat history as context", text: $state.composerText, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 12))
+                    .font(WP.TextStyle.body)
                     .focused($composerFocused)
                     .onSubmit { submit() }
+                    .padding(.horizontal, WP.Space.sm + 2)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
+                            .fill(.quinary)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
+                            .strokeBorder(composerFocused ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.08), lineWidth: 0.75)
+                    )
 
                 Button(action: submit) {
-                    let isEmpty = state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 13))
-                        .foregroundStyle(isEmpty ? AnyShapeStyle(HierarchicalShapeStyle.tertiary) : AnyShapeStyle(Color.accentColor))
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(isComposerEmpty ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Color.accentColor))
                 }
                 .buttonStyle(.plain)
                 .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(isComposerEmpty)
                 .help("Send to AI (⌘⏎)")
             }
 
             Button(action: { includeScreenshot.toggle() }) {
-                HStack(spacing: 4) {
+                HStack(spacing: WP.Space.xs) {
                     Image(systemName: includeScreenshot ? "eye.fill" : "eye")
-                        .font(.system(size: 11))
-                    Text("See my screen")
                         .font(.system(size: 10))
+                    Text("See my screen")
+                        .font(WP.TextStyle.micro)
                     if includeScreenshot {
                         Text("· attached")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(WP.TextStyle.tag)
                     }
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(includeScreenshot ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.08))
-                )
-                .foregroundStyle(includeScreenshot ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                .chip(includeScreenshot ? .accent : .neutral)
             }
             .buttonStyle(.plain)
             .help("When on, the AI receives a screenshot of your current display along with this message.")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, WP.Space.md)
+        .padding(.vertical, WP.Space.sm + 2)
+    }
+
+    private var isComposerEmpty: Bool {
+        state.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func submit() {
@@ -376,45 +424,87 @@ private struct BannerView: View {
     let spec: BannerSpec
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: WP.Space.sm) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
                 .font(.callout)
-            VStack(alignment: .leading, spacing: 6) {
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: WP.Space.sm - 2) {
                 Text(spec.message)
-                    .font(.system(size: 12))
+                    .font(WP.TextStyle.body)
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let button = spec.button {
                     Button(button.title, action: button.action)
                         .controlSize(.small)
                         .buttonStyle(.borderedProminent)
+                        .tint(.orange)
                 }
             }
-            Spacer()
+            Spacer(minLength: 0)
         }
-        .padding(10)
+        .padding(WP.Space.md - 2)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.orange.opacity(0.12))
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 0.5)
+        )
+    }
+}
+
+private struct ChannelMuteButton: View {
+    let isMuted: Bool
+    let activeIcon: String
+    let mutedIcon: String
+    let activeHelp: String
+    let mutedHelp: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: isMuted ? mutedIcon : activeIcon)
+                .font(.system(size: 13))
+                .foregroundStyle(isMuted ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isMuted ? mutedHelp : activeHelp)
     }
 }
 
 private struct StatusDot: View {
     let status: OverlayStatus
+    @State private var pulsing: Bool = false
 
     var body: some View {
         Circle()
             .fill(color)
             .frame(width: 8, height: 8)
-            .opacity(opacity)
-            .animation(.easeInOut(duration: 0.4).repeatForever(autoreverses: true), value: pulse)
+            .opacity(shouldPulse ? (pulsing ? 0.35 : 1.0) : 1.0)
+            .onAppear { restartPulse() }
+            .onChange(of: shouldPulse) { _, _ in restartPulse() }
+    }
+
+    private func restartPulse() {
+        // Two-stage animation: snap pulsing back to false then animate to true with
+        // repeatForever-autoreverse so the dot actually oscillates. Without the snap,
+        // SwiftUI sees no value change and the animation never starts.
+        pulsing = false
+        if shouldPulse {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                pulsing = true
+            }
+        }
     }
 
     private var color: Color {
         switch status {
         case .idle: return .gray
+        case .starting: return .blue
         case .listening: return .green
         case .thinking: return .yellow
         case .streaming: return .blue
@@ -423,11 +513,9 @@ private struct StatusDot: View {
         }
     }
 
-    private var opacity: Double { pulse ? 0.5 : 1.0 }
-
-    private var pulse: Bool {
+    private var shouldPulse: Bool {
         switch status {
-        case .listening, .thinking, .streaming: return true
+        case .starting, .listening, .thinking, .streaming: return true
         default: return false
         }
     }
@@ -440,23 +528,23 @@ private struct ChatLane: View {
     let onDismissMessage: (UUID) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: WP.Space.sm) {
+            HStack(spacing: WP.Space.sm) {
                 Image(systemName: "sparkles")
                     .font(.caption)
                     .foregroundStyle(.blue)
                 Text("AI")
-                    .font(.caption.weight(.semibold))
+                    .font(WP.TextStyle.sectionHeader)
                     .foregroundStyle(.secondary)
                 Spacer()
                 AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
             }
 
             if messages.isEmpty {
-                Text(emptyStateText)
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-                    .padding(.vertical, 4)
+                EmptyStatePill(
+                    icon: isAIPaused ? "pause.circle" : "sparkles",
+                    text: emptyStateText
+                )
             } else {
                 ForEach(messages) { message in
                     MessageBubble(message: message, onDismiss: { onDismissMessage(message.id) })
@@ -468,9 +556,32 @@ private struct ChatLane: View {
 
     private var emptyStateText: String {
         if isAIPaused {
-            return "AI is paused. Type a prompt below — manual prompts always go through."
+            return "AI is paused — manual prompts still go through."
         }
-        return "No AI messages yet. Detected questions and the composer below will appear here."
+        return "Detected questions and AI suggestions appear here."
+    }
+}
+
+private struct EmptyStatePill: View {
+    let icon: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: WP.Space.sm) {
+            Image(systemName: icon)
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
+            Text(text)
+                .font(WP.TextStyle.body)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, WP.Space.md - 2)
+        .padding(.vertical, WP.Space.sm)
+        .background(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .fill(.quinary)
+        )
     }
 }
 
@@ -480,23 +591,13 @@ private struct AIToggleButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 5) {
+            HStack(spacing: WP.Space.xs + 1) {
                 Image(systemName: isPaused ? "pause.fill" : "play.fill")
-                    .font(.system(size: 9))
+                    .font(.system(size: 9, weight: .bold))
                 Text(isPaused ? "Paused" : "Active")
-                    .font(.caption2.weight(.semibold))
+                    .font(WP.TextStyle.tag)
             }
-            .foregroundStyle(isPaused ? AnyShapeStyle(Color.orange) : AnyShapeStyle(Color.green))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill((isPaused ? Color.orange : Color.green).opacity(0.15))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder((isPaused ? Color.orange : Color.green).opacity(0.35), lineWidth: 1)
-            )
+            .chip(isPaused ? .warning : .success)
         }
         .buttonStyle(.plain)
         .help(isPaused
@@ -510,13 +611,13 @@ private struct MessageBubble: View {
     var onDismiss: (() -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: WP.Space.xs + 2) {
+            HStack(spacing: WP.Space.sm) {
                 Image(systemName: roleIcon)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(roleColor)
                 Text(roleLabel)
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(WP.TextStyle.tag)
                     .foregroundStyle(roleColor)
                 if let originBadge {
                     Text(originBadge)
@@ -526,37 +627,62 @@ private struct MessageBubble: View {
                 if message.isStreaming {
                     TypingIndicator()
                 }
-                Spacer()
+                Spacer(minLength: 0)
                 // System notes are informational — the user should be able to clear them
                 // when they've read them. Other roles persist (chat history is meaningful).
                 if message.role == .system, let onDismiss {
                     Button(action: onDismiss) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 11))
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
                             .foregroundStyle(.tertiary)
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Dismiss")
                 }
             }
-            Text(message.text.isEmpty ? "…" : message.text)
-                .font(.system(size: 12))
+            Text(renderedText)
+                .font(WP.TextStyle.body)
                 .foregroundStyle(message.role == .system ? .secondary : .primary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .tint(.accentColor)
         }
-        .padding(10)
+        .padding(WP.Space.md - 2)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
                 .fill(bubbleBackground)
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .strokeBorder(bubbleStroke, lineWidth: 0.5)
+        )
+    }
+
+    /// Renders the body text. Assistant messages parse as inline markdown — bold,
+    /// italic, links, inline code — so Gemini's typical `**word**` and backticks come
+    /// through styled rather than as raw characters. `.inlineOnlyPreservingWhitespace`
+    /// is deliberate: block-level constructs (headings, lists, code fences) don't render
+    /// reliably inside a single `Text`, and mid-stream partials would look broken if we
+    /// tried. User messages and system notes stay plain so we never re-interpret what
+    /// the user actually typed.
+    private var renderedText: AttributedString {
+        let raw = message.text
+        if raw.isEmpty { return AttributedString("…") }
+        guard message.role == .assistant else { return AttributedString(raw) }
+        let parsed = try? AttributedString(
+            markdown: raw,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )
+        return parsed ?? AttributedString(raw)
     }
 
     private var roleIcon: String {
         switch message.role {
         case .user: return "person.fill"
         case .assistant: return "sparkles"
-        case .system: return "info.circle"
+        case .system: return "info.circle.fill"
         }
     }
 
@@ -578,18 +704,25 @@ private struct MessageBubble: View {
 
     private var originBadge: String? {
         switch message.origin {
-        case .detectedQuestion: return "from detected question"
-        case .autoSend: return "auto-send"
-        case .userPrompt: return nil
-        case .system: return nil
+        case .detectedQuestion: return "· detected question"
+        case .autoSend: return "· auto-send"
+        case .userPrompt, .system: return nil
         }
     }
 
-    private var bubbleBackground: Color {
+    private var bubbleBackground: AnyShapeStyle {
         switch message.role {
-        case .user: return Color.purple.opacity(0.10)
-        case .assistant: return Color.blue.opacity(0.08)
-        case .system: return Color.gray.opacity(0.10)
+        case .user: return AnyShapeStyle(Color.purple.opacity(0.08))
+        case .assistant: return AnyShapeStyle(Color.blue.opacity(0.07))
+        case .system: return AnyShapeStyle(.quinary)
+        }
+    }
+
+    private var bubbleStroke: Color {
+        switch message.role {
+        case .user: return Color.purple.opacity(0.18)
+        case .assistant: return Color.blue.opacity(0.18)
+        case .system: return Color.primary.opacity(0.08)
         }
     }
 }

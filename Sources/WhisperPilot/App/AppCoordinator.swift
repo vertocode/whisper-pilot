@@ -3,6 +3,7 @@ import Combine
 import CoreGraphics
 import Foundation
 import ImageIO
+import os
 import OSLog
 import ScreenCaptureKit
 import Speech
@@ -50,6 +51,10 @@ final class AppCoordinator {
     private var lastAutoSendTranscriptCount: Int = 0
 
     private(set) var isRunning = false
+    /// Set for the duration of `startListening`. Prevents the user from double-clicking
+    /// Play (or the disabled-but-still-clickable stop affordance) from re-entering startup
+    /// while audio capture is mid-setup, which would leave duplicate captures running.
+    private var isStartingUp = false
     private(set) var currentSession: SessionMeta?
 
     init() {
@@ -118,11 +123,18 @@ final class AppCoordinator {
     // MARK: - Lifecycle
 
     func startListening() async {
-        guard !isRunning else {
-            wpInfo("[Coordinator] startListening: already running, skipping")
+        guard !isRunning, !isStartingUp else {
+            wpInfo("[Coordinator] startListening: already running/starting, skipping")
             return
         }
+        isStartingUp = true
+        defer { isStartingUp = false }
         wpInfo("[Coordinator] ▶ startListening")
+        // Surface the "spinning up" state immediately so the user gets feedback on the
+        // Play click. We hold .starting until the first audio frame arrives (in the
+        // mixer-output consumer below) so the visible transition lines up with the
+        // pipeline actually being live, not just with our setup code returning.
+        overlayState.status = .starting
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
@@ -225,8 +237,12 @@ final class AppCoordinator {
         restartAutoSendTimer()
 
         isRunning = true
-        overlayState.status = .listening
-        wpInfo("[Coordinator] ✓ Listening")
+        // Keep status as `.starting` here — the mixer-output consumer flips it to
+        // `.listening` when the first audio frame arrives, so the UI's "ready" state
+        // matches the moment audio is actually flowing rather than the moment our
+        // setup returned. If audio never arrives, the 6-second watchdog surfaces a
+        // warning so the user isn't left guessing.
+        wpInfo("[Coordinator] ✓ Pipeline started, awaiting first audio frame")
         startNoFramesWatchdog()
     }
 
@@ -691,10 +707,10 @@ final class AppCoordinator {
             return
         }
 
-        let lock = NSLock()
-        var sumSq: Double = 0
-        var sampleCount: Int = 0
-        var peakRMS: Float = 0
+        // OSAllocatedUnfairLock is the async-safe replacement for NSLock — Sendable, and
+        // its `withLock` is statically rejected if the closure suspends. NSLock can't be
+        // used from an async function under Swift 6 strict concurrency.
+        let stats = OSAllocatedUnfairLock(initialState: RMSAccumulator())
 
         let frameTask = Task {
             for await frame in pt.frames {
@@ -713,11 +729,15 @@ final class AppCoordinator {
                 }
                 guard localCount > 0 else { continue }
                 let chunkRMS = Float((localSum / Double(localCount)).squareRoot())
-                lock.lock()
-                sumSq += localSum
-                sampleCount += localCount
-                if chunkRMS > peakRMS { peakRMS = chunkRMS }
-                lock.unlock()
+                // Re-bind to immutable lets so the @Sendable withLock closure captures
+                // copies rather than var references (Swift 6 rejects var capture).
+                let frameSum = localSum
+                let frameCount = localCount
+                stats.withLock { acc in
+                    acc.sumSq += frameSum
+                    acc.sampleCount += frameCount
+                    if chunkRMS > acc.peakRMS { acc.peakRMS = chunkRMS }
+                }
             }
         }
 
@@ -725,6 +745,10 @@ final class AppCoordinator {
         frameTask.cancel()
         pt.stop()
 
+        let snapshot = stats.withLock { $0 }
+        let sumSq = snapshot.sumSq
+        let sampleCount = snapshot.sampleCount
+        let peakRMS = snapshot.peakRMS
         let avgRMS = sampleCount > 0 ? sqrt(sumSq / Double(sampleCount)) : 0
         let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
         let summary = "samples=\(sampleCount), avg RMS=\(String(format: "%.5f", avgRMS)), peak chunk RMS=\(String(format: "%.5f", peakRMS)), default output=\"\(outName)\""
@@ -735,6 +759,15 @@ final class AppCoordinator {
         } else {
             overlayState.appendSystemNote("✅ System audio test PASSED — audio is reaching us. \(summary). If transcription still fails on real meeting audio, the recognizer is the bug.", category: .transcript)
         }
+    }
+
+    /// Accumulator for the diagnostic audio tests. Lives inside an `OSAllocatedUnfairLock`
+    /// so the for-await loop body can update it without violating Swift 6 strict
+    /// concurrency (NSLock can't be used from an async context).
+    private struct RMSAccumulator {
+        var sumSq: Double = 0
+        var sampleCount: Int = 0
+        var peakRMS: Float = 0
     }
 
     /// RMS over a Float32 PCM buffer; used for self-test diagnostics only.
@@ -773,8 +806,16 @@ final class AppCoordinator {
                 if framesProcessed == 1 {
                     wpInfo("Pipeline: first audio frame received (channel=\(frame.channel))")
                     Task { @MainActor [weak self] in
-                        self?.overlayState.audioFrameCount = 1
-                        self?.dismissNoFramesWarning()
+                        guard let self else { return }
+                        self.overlayState.audioFrameCount = 1
+                        self.dismissNoFramesWarning()
+                        // First real audio frame — promote from the "starting" loading
+                        // state to "listening". Guard against overwriting later states
+                        // (thinking/streaming/error) in case something else changed
+                        // status while we were spinning up.
+                        if self.overlayState.status == .starting {
+                            self.overlayState.status = .listening
+                        }
                     }
                 }
                 if framesProcessed % 25 == 0 {

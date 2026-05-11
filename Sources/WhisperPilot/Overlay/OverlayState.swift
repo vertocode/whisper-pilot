@@ -68,6 +68,9 @@ nonisolated func wpError(_ message: String) {
 
 enum OverlayStatus: Equatable, Sendable {
     case idle
+    /// Pipeline is spinning up — permissions probed, audio capture being created, recognizer
+    /// initializing. Lasts from Play-click until the first audio frame reaches the mixer.
+    case starting
     case listening
     case thinking
     case streaming
@@ -77,7 +80,7 @@ enum OverlayStatus: Equatable, Sendable {
 
     var isActive: Bool {
         switch self {
-        case .listening, .thinking, .streaming: return true
+        case .starting, .listening, .thinking, .streaming: return true
         default: return false
         }
     }
@@ -85,6 +88,7 @@ enum OverlayStatus: Equatable, Sendable {
     var label: String {
         switch self {
         case .idle: return "Idle"
+        case .starting: return "Starting…"
         case .listening: return "Listening"
         case .thinking: return "Thinking"
         case .streaming: return "Speaking"

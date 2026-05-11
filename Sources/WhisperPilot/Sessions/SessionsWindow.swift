@@ -51,12 +51,13 @@ final class SessionsViewModel: ObservableObject {
 final class SessionsWindowController: NSWindowController {
     init(viewModel: SessionsViewModel) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 540),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 580),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = "Whisper Pilot — Sessions"
+        window.title = "Whisper Pilot"
+        window.titlebarAppearsTransparent = true
         window.center()
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: SessionsView(vm: viewModel))
@@ -68,144 +69,273 @@ final class SessionsWindowController: NSWindowController {
 
 struct SessionsView: View {
     @ObservedObject var vm: SessionsViewModel
+    @State private var hoveredSessionID: SessionID?
+    @State private var sessionPendingDeletion: SessionMeta?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 0) {
             header
-            newSessionSection
-            Divider()
-            historySection
-            Spacer(minLength: 0)
+            Divider().opacity(0.4)
+            ScrollView {
+                VStack(alignment: .leading, spacing: WP.Space.xl) {
+                    newSessionSection
+                    historySection
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, WP.Space.xl)
+            }
         }
-        .padding(20)
         .frame(minWidth: 640, minHeight: 480)
+        .background(.windowBackground)
         .task { await vm.refresh() }
+        .alert(
+            "Delete session?",
+            isPresented: deletePresentationBinding,
+            presenting: sessionPendingDeletion
+        ) { session in
+            Button("Delete", role: .destructive) {
+                Task { await vm.delete(session) }
+                sessionPendingDeletion = nil
+            }
+            Button("Cancel", role: .cancel) {
+                sessionPendingDeletion = nil
+            }
+        } message: { session in
+            Text("This permanently removes the transcript, chat, and metadata folder for “\(session.displayName)” from disk. This action cannot be undone.")
+        }
+    }
+
+    private var deletePresentationBinding: Binding<Bool> {
+        Binding(
+            get: { sessionPendingDeletion != nil },
+            set: { isPresented in
+                if !isPresented { sessionPendingDeletion = nil }
+            }
+        )
     }
 
     private var header: some View {
-        HStack(spacing: 12) {
-            BrandLogo().frame(width: 32, height: 32)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Whisper Pilot Sessions")
-                    .font(.title2.weight(.semibold))
-                Text("Each session keeps its own meeting transcript and AI conversation on disk.")
-                    .font(.callout)
+        HStack(spacing: WP.Space.md) {
+            BrandLogo().frame(width: 36, height: 36)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Sessions")
+                    .font(.system(size: 18, weight: .semibold))
+                Text("Each session keeps its own transcript and AI conversation on disk.")
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Reveal in Finder") {
+            Button {
                 NSWorkspace.shared.open(SessionStore.shared.rootURL)
+            } label: {
+                Label("Reveal in Finder", systemImage: "folder")
             }
             .buttonStyle(.bordered)
+            .controlSize(.regular)
         }
+        .padding(.horizontal, 24)
+        .padding(.vertical, WP.Space.md + 2)
+        .background(.bar)
     }
 
     private var newSessionSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Start a new session")
-                .font(.headline)
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: WP.Space.md) {
+            SectionHeader(title: "Start a new session", subtitle: "Recommended for most calls — uses the fewest tokens.")
+            HStack(spacing: WP.Space.sm) {
                 TextField("Optional name (e.g. \"Q3 review with Acme\")", text: $vm.newSessionName)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { Task { await vm.createNew() } }
-                Button("Start new") {
+                Button {
                     Task { await vm.createNew() }
+                } label: {
+                    Label("Start new", systemImage: "plus.circle.fill")
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
                 .keyboardShortcut(.defaultAction)
             }
-            Text("A new session starts with an empty transcript and chat. Recommended for most calls — uses the fewest tokens.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
     private var historySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Past sessions")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: WP.Space.md) {
+            HStack(alignment: .firstTextBaseline) {
+                SectionHeader(title: "Past sessions", subtitle: nil)
+                Spacer()
+                if !vm.sessions.isEmpty {
+                    Text("\(vm.sessions.count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(.quinary)
+                        )
+                }
+            }
 
-            resumeWarning
+            ResumeHint()
 
             if vm.sessions.isEmpty {
-                Text("No saved sessions yet.")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
-                    .padding(.top, 8)
+                EmptyHistoryState()
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 6) {
-                        ForEach(vm.sessions) { session in
-                            SessionRow(session: session, vm: vm)
+                LazyVStack(spacing: WP.Space.sm) {
+                    ForEach(vm.sessions) { session in
+                        SessionRow(
+                            session: session,
+                            isHovered: hoveredSessionID == session.id,
+                            vm: vm,
+                            onRequestDelete: { sessionPendingDeletion = session }
+                        )
+                        .onHover { hovering in
+                            hoveredSessionID = hovering ? session.id : (hoveredSessionID == session.id ? nil : hoveredSessionID)
                         }
                     }
                 }
             }
         }
     }
+}
 
-    private var resumeWarning: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "info.circle")
+private struct SectionHeader: View {
+    let title: String
+    let subtitle: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+            if let subtitle {
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct ResumeHint: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: WP.Space.sm) {
+            Image(systemName: "info.circle.fill")
                 .foregroundStyle(.blue)
-                .font(.callout)
+                .font(.system(size: 13))
             Text("Resuming a session re-includes its prior transcript and chat in every AI prompt. Prefer a fresh session unless you actually need the prior context — it'll cost fewer tokens.")
-                .font(.caption)
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue.opacity(0.07)))
+        .padding(WP.Space.md - 2)
+        .background(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .fill(Color.blue.opacity(0.07))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .strokeBorder(Color.blue.opacity(0.18), lineWidth: 0.5)
+        )
+    }
+}
+
+private struct EmptyHistoryState: View {
+    var body: some View {
+        VStack(spacing: WP.Space.sm) {
+            Image(systemName: "tray")
+                .font(.system(size: 28, weight: .light))
+                .foregroundStyle(.tertiary)
+            Text("No saved sessions yet")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("Start one above — your transcripts and chats will appear here.")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 36)
+        .background(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .fill(.quinary)
+        )
     }
 }
 
 private struct SessionRow: View {
     let session: SessionMeta
+    let isHovered: Bool
     let vm: SessionsViewModel
+    let onRequestDelete: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "folder.fill")
-                .foregroundStyle(.tint)
-                .frame(width: 28, height: 28)
+        HStack(spacing: WP.Space.md) {
+            ZStack {
+                RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.12))
+                Image(systemName: "waveform")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .frame(width: 34, height: 34)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayName)
-                    .font(.body.weight(.medium))
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
                 Text(detailLine)
-                    .font(.caption)
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
 
             Spacer()
 
-            Button("Resume") {
+            Button {
                 vm.resume(session)
+            } label: {
+                Text("Resume")
+                    .font(.system(size: 11, weight: .medium))
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
 
             Menu {
-                Button("Open in Finder") {
+                Button {
                     Task { await vm.openInFinder(session) }
+                } label: {
+                    Label("Open in Finder", systemImage: "folder")
                 }
                 Divider()
-                Button("Delete", role: .destructive) {
-                    Task { await vm.delete(session) }
+                Button(role: .destructive, action: onRequestDelete) {
+                    Label("Delete session", systemImage: "trash")
                 }
             } label: {
-                Image(systemName: "ellipsis.circle")
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
-            .frame(width: 28)
+            .menuIndicator(.hidden)
+            .fixedSize()
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.gray.opacity(0.06)))
+        .padding(.horizontal, WP.Space.md)
+        .padding(.vertical, WP.Space.sm + 2)
+        .background(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .fill(isHovered ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.quinary))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
+                .strokeBorder(.separator.opacity(isHovered ? 0.5 : 0.25), lineWidth: 0.5)
+        )
+        .animation(.easeOut(duration: 0.12), value: isHovered)
     }
 
     private var detailLine: String {
         let relative = SessionRow.relativeFormatter.localizedString(for: session.lastUsedAt, relativeTo: Date())
-        return "\(relative) · \(session.transcriptLineCount) transcript line\(session.transcriptLineCount == 1 ? "" : "s") · \(session.chatTurnCount) chat turn\(session.chatTurnCount == 1 ? "" : "s") · \(session.folderName)"
+        return "\(relative) · \(session.transcriptLineCount) transcript line\(session.transcriptLineCount == 1 ? "" : "s") · \(session.chatTurnCount) chat turn\(session.chatTurnCount == 1 ? "" : "s")"
     }
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {

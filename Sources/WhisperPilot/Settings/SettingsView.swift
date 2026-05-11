@@ -7,21 +7,8 @@ struct SettingsView: View {
     @State private var inputDevices: [AudioInputDevice] = []
 
     var body: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 10) {
-                BrandLogo()
-                    .frame(width: 44, height: 44)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Whisper Pilot")
-                        .font(.system(size: 16, weight: .semibold))
-                    Text("Ambient AI for live conversations")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 4)
-
+        VStack(spacing: WP.Space.md) {
+            header
             TabView {
                 generalTab.tabItem { Label("General", systemImage: "gearshape") }
                 devicesTab.tabItem { Label("Devices", systemImage: "mic.and.signal.meter") }
@@ -30,14 +17,78 @@ struct SettingsView: View {
                 overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
             }
         }
-        .frame(width: 540, height: 460)
-        .padding()
+        .frame(minWidth: 560, idealWidth: 620, minHeight: 480, idealHeight: 520)
+        .padding(WP.Space.md)
         .onAppear {
             apiKeyDraft = store.geminiAPIKey ?? ""
             apiKeySaved = !apiKeyDraft.isEmpty
             inputDevices = MicrophoneCapture.listInputDevices()
         }
     }
+
+    // MARK: - Header
+
+    private var header: some View {
+        HStack(spacing: WP.Space.md) {
+            BrandLogo()
+                .frame(width: 40, height: 40)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Whisper Pilot")
+                    .font(.system(size: 15, weight: .semibold))
+                Text("Ambient AI for live conversations")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, WP.Space.xs)
+        .padding(.bottom, WP.Space.xs)
+    }
+
+    // MARK: - General
+
+    private var generalTab: some View {
+        Form {
+            Section {
+                Picker("Response style", selection: $store.responseStyle) {
+                    ForEach(ResponseStyle.allCases, id: \.self) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+                FormHint(store.responseStyle.description)
+            }
+
+            Section {
+                Picker("Locale", selection: $store.localeIdentifier) {
+                    ForEach(Self.locales, id: \.self) { id in
+                        Text(Locale.current.localizedString(forIdentifier: id) ?? id).tag(id)
+                    }
+                }
+                FormHint("Used by the speech recognizer. Match the language of the audio you're transcribing.")
+            }
+
+            Section {
+                Picker("Auto-send to AI", selection: $store.autoSendInterval) {
+                    ForEach(AutoSendInterval.allCases, id: \.self) { interval in
+                        Text(interval.displayName).tag(interval)
+                    }
+                }
+                FormHint("When AI is active and this is on, the assistant proactively summarizes the recent conversation at the chosen interval. Question detection still fires independently.")
+            }
+
+            Section {
+                Picker("Transcript line break", selection: $store.utteranceBoundary) {
+                    ForEach(UtteranceBoundary.allCases, id: \.self) { boundary in
+                        Text(boundary.displayName).tag(boundary)
+                    }
+                }
+                FormHint(store.utteranceBoundary.description)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Devices
 
     private var devicesTab: some View {
         Form {
@@ -48,17 +99,14 @@ struct SettingsView: View {
                         Text(device.name).tag(device.uid as String?)
                     }
                 }
-                Button("Refresh device list") {
-                    inputDevices = MicrophoneCapture.listInputDevices()
+                HStack {
+                    Spacer()
+                    Button("Refresh device list") {
+                        inputDevices = MicrophoneCapture.listInputDevices()
+                    }
+                    .controlSize(.small)
                 }
-                .controlSize(.small)
-            }
-
-            Section {
-                Text("The microphone selection takes effect the next time you click ▶ Play. \"System default\" follows your current System Settings → Sound → Input choice.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                FormHint("Microphone selection takes effect the next time you click Play. \"System default\" follows your current System Settings → Sound → Input choice.")
             }
 
             Section("System audio") {
@@ -67,64 +115,26 @@ struct SettingsView: View {
                 } else {
                     LabeledContent("Active output", value: "unknown")
                 }
-                Text("System audio is captured via the macOS audio mixdown for whatever your default output device is. Change it in System Settings → Sound → Output. Some Bluetooth codecs and virtual / aggregate devices bypass the mixdown — if Audio Test reports silence, switch to built-in speakers or wired output.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                FormHint("System audio is captured via the macOS audio mixdown for whatever your default output device is. Change it in System Settings → Sound → Output. Some Bluetooth codecs and virtual / aggregate devices bypass the mixdown — if Audio Test reports silence, switch to built-in speakers or wired output.")
             }
         }
         .formStyle(.grouped)
     }
 
-    private var generalTab: some View {
-        Form {
-            Picker("Response style", selection: $store.responseStyle) {
-                ForEach(ResponseStyle.allCases, id: \.self) { style in
-                    Text(style.displayName).tag(style)
-                }
-            }
-            Text(store.responseStyle.description)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-
-            Picker("Locale", selection: $store.localeIdentifier) {
-                ForEach(Self.locales, id: \.self) { id in
-                    Text(Locale.current.localizedString(forIdentifier: id) ?? id).tag(id)
-                }
-            }
-
-            Picker("Auto-send to AI", selection: $store.autoSendInterval) {
-                ForEach(AutoSendInterval.allCases, id: \.self) { interval in
-                    Text(interval.displayName).tag(interval)
-                }
-            }
-            Text("When AI is active and this is on, the assistant proactively summarizes the recent conversation at the chosen interval. Question detection still fires independently.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Picker("Transcript line break", selection: $store.utteranceBoundary) {
-                ForEach(UtteranceBoundary.allCases, id: \.self) { boundary in
-                    Text(boundary.displayName).tag(boundary)
-                }
-            }
-            Text(store.utteranceBoundary.description)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .formStyle(.grouped)
-    }
+    // MARK: - AI Provider
 
     private var providerTab: some View {
         Form {
             Section("Gemini") {
                 SecureField("API key", text: $apiKeyDraft)
                     .textFieldStyle(.roundedBorder)
-                HStack {
+                HStack(spacing: WP.Space.sm) {
                     Button(apiKeySaved ? "Update key" : "Save key") {
                         store.geminiAPIKey = apiKeyDraft
                         apiKeySaved = !apiKeyDraft.isEmpty
                     }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
                     .disabled(apiKeyDraft.isEmpty)
 
                     if apiKeySaved {
@@ -137,8 +147,14 @@ struct SettingsView: View {
 
                     Spacer()
 
-                    Link("Get a key", destination: URL(string: "https://aistudio.google.com/app/apikey")!)
-                        .font(.callout)
+                    Link(destination: URL(string: "https://aistudio.google.com/app/apikey")!) {
+                        HStack(spacing: 4) {
+                            Text("Get a key")
+                            Image(systemName: "arrow.up.right.square")
+                                .font(.system(size: 10))
+                        }
+                        .font(.system(size: 12))
+                    }
                 }
 
                 Picker("Model", selection: $store.geminiModel) {
@@ -148,31 +164,43 @@ struct SettingsView: View {
                     Text("gemini-2.5-pro").tag("gemini-2.5-pro")
                 }
 
-                Text("Stored in the macOS Keychain. Never written to disk in plaintext.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: WP.Space.xs) {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.green)
+                    Text("Stored in the macOS Keychain. Never written to disk in plaintext.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
     }
 
+    // MARK: - Capture
+
     private var captureTab: some View {
         Form {
-            Toggle("Capture microphone", isOn: $store.captureMicrophone)
-            Text("System audio (everything macOS plays — Teams, Meet, Slack, browser) is always captured. Microphone is optional and lets the assistant attribute who said what.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            Section {
+                Toggle("Capture microphone", isOn: $store.captureMicrophone)
+                FormHint("System audio (everything macOS plays — Teams, Meet, Slack, browser) is always captured. Microphone is optional and lets the assistant attribute who said what.")
+            }
         }
         .formStyle(.grouped)
     }
 
+    // MARK: - Overlay
+
     private var overlayTab: some View {
         Form {
-            Toggle("Always on top", isOn: $store.alwaysOnTop)
-            Toggle("Click-through", isOn: $store.clickThrough)
-            Text("Click-through ignores mouse events on the overlay so it never intercepts clicks meant for your meeting window.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            Section {
+                Toggle("Always on top", isOn: $store.alwaysOnTop)
+                FormHint("Keeps the overlay floating above your meeting window so you can read suggestions without alt-tabbing.")
+            }
+            Section {
+                Toggle("Click-through", isOn: $store.clickThrough)
+                FormHint("Click-through ignores mouse events on the overlay so it never intercepts clicks meant for your meeting window.")
+            }
         }
         .formStyle(.grouped)
     }
@@ -180,4 +208,18 @@ struct SettingsView: View {
     private static let locales: [String] = [
         "en-US", "en-GB", "pt-BR", "pt-PT", "es-ES", "es-MX", "fr-FR", "de-DE", "it-IT", "nl-NL", "ja-JP"
     ]
+}
+
+/// Inline helper text used under controls in Settings tabs. One source of truth so every
+/// hint has matching size/color/wrapping behavior.
+private struct FormHint: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
 }

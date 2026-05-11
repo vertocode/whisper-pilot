@@ -29,6 +29,8 @@ struct OverlayActions {
     var toggleMicMute: () -> Void
     /// Toggle the system audio mute state.
     var toggleSystemAudioMute: () -> Void
+    /// Save the current session's transcript markdown to a user-chosen location.
+    var exportTranscript: () -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

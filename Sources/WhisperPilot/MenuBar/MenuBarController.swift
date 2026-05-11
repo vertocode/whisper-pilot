@@ -63,6 +63,10 @@ final class MenuBarController {
 
         menu.addItem(.separator())
 
+        let about = NSMenuItem(title: "About Whisper Pilot", action: #selector(showAbout), keyEquivalent: "")
+        about.target = self
+        menu.addItem(about)
+
         let quit = NSMenuItem(title: "Quit Whisper Pilot", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -102,5 +106,37 @@ final class MenuBarController {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    /// Shows the macOS-standard About panel — picks up the app icon from the asset
+    /// catalog automatically, and the version comes from the Info.plist. We pass
+    /// `credits` so the panel mentions the license and the project URL without us
+    /// having to build a custom About window.
+    @objc private func showAbout() {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        let creditsText = NSMutableAttributedString(string: """
+            Ambient, local-first AI co-pilot for live conversations.
+
+            Open source under the MIT license.
+            github.com/vertocode/whisper-pilot
+            """)
+        // Make the URL clickable in the credits area.
+        if let range = creditsText.string.range(of: "github.com/vertocode/whisper-pilot") {
+            let nsRange = NSRange(range, in: creditsText.string)
+            creditsText.addAttribute(.link, value: "https://github.com/vertocode/whisper-pilot", range: nsRange)
+        }
+        creditsText.addAttribute(
+            .font,
+            value: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            range: NSRange(location: 0, length: creditsText.length)
+        )
+
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            NSApplication.AboutPanelOptionKey.applicationName: "Whisper Pilot",
+            NSApplication.AboutPanelOptionKey.applicationVersion: version,
+            NSApplication.AboutPanelOptionKey.credits: creditsText,
+            NSApplication.AboutPanelOptionKey(rawValue: "Copyright"): "© 2026 Whisper Pilot contributors"
+        ])
     }
 }
