@@ -1,0 +1,108 @@
+name: Release
+
+# Builds a DMG, attaches it to a GitHub Release. Triggered by pushing a tag `v*` —
+# typically `git tag v0.2.0 && git push origin v0.2.0`. Also runnable manually from the
+# Actions tab via workflow_dispatch.
+#
+# Signing: optional. If you add the secrets WP_DEVELOPER_ID_CERT_BASE64,
+# WP_DEVELOPER_ID_CERT_PASSWORD, WP_DEVELOPER_ID (the cert common name),
+# WP_APPLE_ID, WP_APPLE_APP_PASSWORD, WP_TEAM_ID to the repo, the build will be
+# signed + notarized. Without them, an unsigned DMG ships.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.2.0)"
+        required: true
+
+permissions:
+  contents: write  # needed to create the release and upload assets
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tooling
+        run: |
+          brew install xcodegen create-dmg xcbeautify
+
+      # Optional: import the Developer ID certificate so the build is signed. Skipped if
+      # the secret isn't set (e.g. on a fork or a first-time contributor PR).
+      - name: Import code-signing certificate
+        if: ${{ env.WP_DEVELOPER_ID_CERT_BASE64 != '' }}
+        env:
+          WP_DEVELOPER_ID_CERT_BASE64: ${{ secrets.WP_DEVELOPER_ID_CERT_BASE64 }}
+          WP_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.WP_DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/dev_id.p12
+          echo "$WP_DEVELOPER_ID_CERT_BASE64" | base64 --decode > "$CERT_PATH"
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain-db
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$WP_DEVELOPER_ID_CERT_PASSWORD" \
+              -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN_PATH"
+
+      - name: Build DMG
+        env:
+          WP_DEVELOPER_ID: ${{ secrets.WP_DEVELOPER_ID }}
+          WP_APPLE_ID: ${{ secrets.WP_APPLE_ID }}
+          WP_APPLE_APP_PASSWORD: ${{ secrets.WP_APPLE_APP_PASSWORD }}
+          WP_TEAM_ID: ${{ secrets.WP_TEAM_ID }}
+        run: |
+          ./bin/release "${{ steps.ver.outputs.version }}"
+
+      - name: Read SHA-256
+        id: sha
+        run: |
+          SHA=$(awk '{print $1}' "build/WhisperPilot-${{ steps.ver.outputs.version }}.dmg.sha256")
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          DMG="build/WhisperPilot-${VERSION}.dmg"
+          NOTES="**SHA-256:** \`${{ steps.sha.outputs.sha256 }}\`
+
+          Install via Homebrew (once the tap is updated):
+          \`\`\`
+          brew install --cask vertocode/whisper-pilot/whisper-pilot
+          \`\`\`
+
+          Or download the .dmg below."
+
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" "${DMG}" --clobber
+          else
+            gh release create "v${VERSION}" "${DMG}" \
+                --title "Whisper Pilot ${VERSION}" \
+                --notes "${NOTES}"
+          fi
+
+      - name: Upload artifact (for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WhisperPilot-${{ steps.ver.outputs.version }}-dmg
+          path: build/WhisperPilot-${{ steps.ver.outputs.version }}.dmg

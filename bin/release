@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Build, package, and (optionally) sign + notarize a release DMG of Whisper Pilot.
+#
+# Usage:
+#   ./bin/release                 # build using version in Project.yml, write to build/
+#   ./bin/release 0.2.0           # override the version stamped into the build
+#
+# Behavior:
+#   - Always: regenerates the Xcode project, archives Release config, exports the .app,
+#     creates a DMG via `create-dmg`, prints SHA-256 for Homebrew Cask use.
+#   - If WP_DEVELOPER_ID is exported in the environment (e.g.
+#     "Developer ID Application: Your Name (TEAMID)"), the build is codesigned with that
+#     identity. Without it, the DMG is unsigned — users will need to right-click → Open
+#     the first time to bypass Gatekeeper.
+#   - If WP_APPLE_ID + WP_APPLE_APP_PASSWORD + WP_TEAM_ID are all set, the DMG is also
+#     submitted to Apple for notarization and the resulting ticket is stapled. Without
+#     them, notarization is skipped (which is fine for alpha distribution — same caveat
+#     as unsigned).
+#
+# Output:
+#   build/WhisperPilot-${VERSION}.dmg
+#   build/WhisperPilot-${VERSION}.dmg.sha256
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+VERSION="${1:-$(awk '/CFBundleShortVersionString/ { gsub(/"/, "", $2); print $2; exit }' Project.yml)}"
+if [[ -z "${VERSION}" ]]; then
+    echo "Could not determine version. Pass it as the first arg or set CFBundleShortVersionString in Project.yml." >&2
+    exit 1
+fi
+
+SCHEME="WhisperPilot"
+BUILD_DIR="build"
+ARCHIVE_PATH="${BUILD_DIR}/WhisperPilot.xcarchive"
+EXPORT_DIR="${BUILD_DIR}/export"
+APP_PATH="${EXPORT_DIR}/WhisperPilot.app"
+DMG_PATH="${BUILD_DIR}/WhisperPilot-${VERSION}.dmg"
+
+# Prerequisites — fail loudly with a recovery hint rather than letting xcodebuild error out
+# halfway through with a less-actionable message.
+command -v xcodegen >/dev/null  || { echo "Missing xcodegen — run: brew install xcodegen" >&2; exit 1; }
+command -v xcodebuild >/dev/null || { echo "Missing xcodebuild — install Xcode from the App Store." >&2; exit 1; }
+command -v create-dmg >/dev/null || { echo "Missing create-dmg — run: brew install create-dmg" >&2; exit 1; }
+
+echo "▸ Regenerating Xcode project"
+./bin/regenerate
+
+echo "▸ Cleaning previous build artifacts"
+rm -rf "${BUILD_DIR}"
+mkdir -p "${EXPORT_DIR}"
+
+EXPORT_PLIST="${BUILD_DIR}/ExportOptions.plist"
+if [[ -n "${WP_DEVELOPER_ID:-}" ]]; then
+    SIGN_METHOD="developer-id"
+    SIGN_IDENTITY="${WP_DEVELOPER_ID}"
+    echo "▸ Code-sign identity: ${SIGN_IDENTITY}"
+else
+    SIGN_METHOD="none"
+    SIGN_IDENTITY="-"
+    echo "▸ No WP_DEVELOPER_ID set — building unsigned. Users will see a Gatekeeper warning."
+fi
+
+cat > "${EXPORT_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>${SIGN_METHOD}</string>
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>destination</key>
+    <string>export</string>
+</dict>
+</plist>
+EOF
+
+echo "▸ Archiving (Release, version ${VERSION})"
+xcodebuild \
+    -project WhisperPilot.xcodeproj \
+    -scheme "${SCHEME}" \
+    -configuration Release \
+    -archivePath "${ARCHIVE_PATH}" \
+    -destination "platform=macOS" \
+    MARKETING_VERSION="${VERSION}" \
+    CODE_SIGN_IDENTITY="${SIGN_IDENTITY}" \
+    archive | xcbeautify --quieter || true
+
+if [[ ! -d "${ARCHIVE_PATH}" ]]; then
+    echo "Archive failed — see Xcode output above." >&2
+    exit 1
+fi
+
+echo "▸ Exporting .app"
+xcodebuild \
+    -exportArchive \
+    -archivePath "${ARCHIVE_PATH}" \
+    -exportPath "${EXPORT_DIR}" \
+    -exportOptionsPlist "${EXPORT_PLIST}" | xcbeautify --quieter || true
+
+if [[ ! -d "${APP_PATH}" ]]; then
+    echo "Export failed — no .app at ${APP_PATH}" >&2
+    exit 1
+fi
+
+# Optional: notarize. Requires that the app was signed with Developer ID above.
+if [[ "${SIGN_METHOD}" == "developer-id" \
+   && -n "${WP_APPLE_ID:-}" \
+   && -n "${WP_APPLE_APP_PASSWORD:-}" \
+   && -n "${WP_TEAM_ID:-}" ]]; then
+    echo "▸ Zipping for notarization"
+    NOTARIZE_ZIP="${BUILD_DIR}/WhisperPilot-notarize.zip"
+    ditto -c -k --keepParent "${APP_PATH}" "${NOTARIZE_ZIP}"
+
+    echo "▸ Submitting to Apple for notarization (may take 1–10 min)"
+    xcrun notarytool submit "${NOTARIZE_ZIP}" \
+        --apple-id "${WP_APPLE_ID}" \
+        --password "${WP_APPLE_APP_PASSWORD}" \
+        --team-id "${WP_TEAM_ID}" \
+        --wait
+
+    echo "▸ Stapling notarization ticket to .app"
+    xcrun stapler staple "${APP_PATH}"
+    rm -f "${NOTARIZE_ZIP}"
+else
+    echo "▸ Skipping notarization (set WP_APPLE_ID, WP_APPLE_APP_PASSWORD, WP_TEAM_ID to enable)"
+fi
+
+echo "▸ Building DMG"
+# Use a temporary "stage" directory so create-dmg only picks up the .app, not the export
+# plist or archive folder.
+STAGE_DIR="${BUILD_DIR}/dmg-stage"
+rm -rf "${STAGE_DIR}"
+mkdir -p "${STAGE_DIR}"
+cp -R "${APP_PATH}" "${STAGE_DIR}/"
+
+create-dmg \
+    --volname "Whisper Pilot ${VERSION}" \
+    --window-pos 200 120 \
+    --window-size 600 380 \
+    --icon-size 110 \
+    --icon "WhisperPilot.app" 170 200 \
+    --hide-extension "WhisperPilot.app" \
+    --app-drop-link 430 200 \
+    --no-internet-enable \
+    "${DMG_PATH}" \
+    "${STAGE_DIR}/"
+
+if [[ "${SIGN_METHOD}" == "developer-id" ]]; then
+    echo "▸ Signing the DMG itself"
+    codesign --force --sign "${SIGN_IDENTITY}" "${DMG_PATH}"
+
+    if [[ -n "${WP_APPLE_ID:-}" && -n "${WP_APPLE_APP_PASSWORD:-}" && -n "${WP_TEAM_ID:-}" ]]; then
+        echo "▸ Notarizing the DMG"
+        xcrun notarytool submit "${DMG_PATH}" \
+            --apple-id "${WP_APPLE_ID}" \
+            --password "${WP_APPLE_APP_PASSWORD}" \
+            --team-id "${WP_TEAM_ID}" \
+            --wait
+        xcrun stapler staple "${DMG_PATH}"
+    fi
+fi
+
+SHA256=$(shasum -a 256 "${DMG_PATH}" | awk '{print $1}')
+echo "${SHA256}  $(basename "${DMG_PATH}")" > "${DMG_PATH}.sha256"
+
+echo ""
+echo "✓ DMG ready: ${DMG_PATH}"
+echo "  SHA-256:  ${SHA256}"
+echo ""
+echo "Next steps:"
+echo "  1. Upload to GitHub Releases:"
+echo "       gh release create v${VERSION} \"${DMG_PATH}\" --notes \"...\""
+echo "  2. Update Casks/whisper-pilot.rb:"
+echo "       version  \"${VERSION}\""
+echo "       sha256   \"${SHA256}\""
