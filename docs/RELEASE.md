@@ -1,24 +1,64 @@
 # Release process
 
-How to cut a new version of Whisper Pilot, ship it as a DMG, and make it installable via Homebrew.
+How to cut a new version of Whisper Pilot, ship it as a DMG, and make it installable via Homebrew. **Once the one-time setup is done, releasing is a single button-click.**
 
-## TL;DR
+## TL;DR (recommended — manual CI trigger)
+
+1. Go to [**Actions → Release**](https://github.com/vertocode/whisper-pilot/actions/workflows/release.yml) on GitHub.
+2. Click **Run workflow** (top right).
+3. Type a version (e.g. `0.2.0`), click **Run workflow** again.
+
+The workflow checks out the current `main`, builds the DMG, creates a GitHub Release `v0.2.0` with the DMG attached, and — if you've configured the tap token (see [one-time setup](#one-time-setup)) — bumps the [Homebrew tap](https://github.com/vertocode/homebrew-whisper-pilot) cask file so users running `brew upgrade --cask whisper-pilot` get the new build automatically.
+
+## Other triggers
+
+| How | What happens |
+| --- | --- |
+| `git tag v0.2.0 && git push origin v0.2.0` | Same workflow runs, version is parsed from the tag |
+| `./bin/release 0.2.0` (local) | Same DMG build, but no GitHub Release or tap update — you'd have to upload manually |
+
+## One-time setup
+
+To make `brew install` deliver a working app, the workflow needs to push to the [tap repo](https://github.com/vertocode/homebrew-whisper-pilot). The default `GITHUB_TOKEN` of a workflow can only push to its own repository, so we need a personal access token (PAT) for cross-repo writes.
+
+### 1. Make the tap repo public
 
 ```sh
-# bump the version in Project.yml (CFBundleShortVersionString), commit, then:
-git tag v0.2.0
-git push origin v0.2.0
+gh repo edit vertocode/homebrew-whisper-pilot --visibility public --accept-visibility-change-consequences
 ```
 
-The `.github/workflows/release.yml` workflow takes over from there: it builds, packages, and creates a GitHub Release with the DMG attached.
+Homebrew can't clone private repos without per-user authentication, so this is required for the "anyone can `brew install`" goal.
 
-If you don't have CI set up yet, run the same script locally:
+### 2. Create a fine-grained PAT for the tap
 
-```sh
-./bin/release 0.2.0
-```
+1. Visit [GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens](https://github.com/settings/tokens?type=beta).
+2. **Generate new token** → give it a name like `whisper-pilot-tap-write`.
+3. **Resource owner:** your user. **Expiration:** 1 year (or as long as you're comfortable).
+4. **Repository access:** Only select repositories → pick `vertocode/homebrew-whisper-pilot`.
+5. **Repository permissions:** `Contents: Read and Write`. Nothing else.
+6. Click **Generate token**, copy the value.
 
-That produces `build/WhisperPilot-0.2.0.dmg` and a sibling `.sha256`.
+### 3. Add the PAT as a secret on the whisper-pilot repo
+
+1. Visit [vertocode/whisper-pilot → Settings → Secrets and variables → Actions](https://github.com/vertocode/whisper-pilot/settings/secrets/actions).
+2. **New repository secret** → name `TAP_REPO_TOKEN`, value = the PAT from step 2.
+
+That's it. From this point onward, every release workflow run also bumps the tap cask.
+
+### Optional: enable signing & notarization (Tier 3)
+
+Set additionally:
+
+| Secret | What it is |
+| --- | --- |
+| `WP_DEVELOPER_ID_CERT_BASE64` | Your Developer ID Application certificate, exported as `.p12`, then `base64`-encoded |
+| `WP_DEVELOPER_ID_CERT_PASSWORD` | The password you set when exporting the `.p12` |
+| `WP_DEVELOPER_ID` | The certificate Common Name, e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `WP_APPLE_ID` | Your Apple ID email |
+| `WP_APPLE_APP_PASSWORD` | An app-specific password from [appleid.apple.com](https://appleid.apple.com) |
+| `WP_TEAM_ID` | Your 10-character Apple Developer Team ID |
+
+Without these, builds ship unsigned and users must right-click → Open the first time (see [Tier 1 below](#tier-1-unsigned-free-anyone-can-download)).
 
 ---
 
@@ -106,13 +146,11 @@ Casks are how non-formula macOS apps get distributed via `brew install`.
 
 There are two routes:
 
-### Route A: Personal tap (faster, what we use)
+### Route A: Personal tap (what we use)
 
-A "tap" is a GitHub repo named `homebrew-<something>` that Homebrew can install from.
+A "tap" is a GitHub repo named `homebrew-<something>` that Homebrew can install from. Ours is [vertocode/homebrew-whisper-pilot](https://github.com/vertocode/homebrew-whisper-pilot), already populated.
 
-1. Create a new repo: `vertocode/homebrew-whisper-pilot`.
-2. Add a single file: `Casks/whisper-pilot.rb`. The canonical version of that file lives in this repo at `Casks/whisper-pilot.rb` — copy it across.
-3. After each release, update `version` and `sha256` in the cask file (the values are printed at the end of `./bin/release`).
+After [one-time setup](#one-time-setup), every release run by the workflow **automatically pushes the new `version` and `sha256` to the tap**. No manual file editing.
 
 Then anyone can install:
 
@@ -120,7 +158,9 @@ Then anyone can install:
 brew install --cask vertocode/whisper-pilot/whisper-pilot
 ```
 
-The `vertocode/whisper-pilot/` prefix is Homebrew's way of saying *use my tap, not homebrew-cask*. `brew upgrade` works as expected — push a new cask, users get the new version.
+The `vertocode/whisper-pilot/` prefix is Homebrew's way of saying *use my tap, not homebrew-cask*. `brew upgrade --cask whisper-pilot` works as expected — the tap commit pushed by CI is what users pull.
+
+The `Casks/whisper-pilot.rb` checked into *this* repo is a reference copy / template — the workflow always pushes its update to the tap repo, not back here, so contributors reading the source see the cask schema but don't need to keep its `version` field in sync manually.
 
 ### Route B: Submit to homebrew-cask (more reach, more friction)
 
@@ -146,11 +186,9 @@ If you want Sparkle, add it later — it's a separate piece of work and isn't st
 ## Checklist for each release
 
 - [ ] All wanted PRs merged to `main`.
-- [ ] Bump `CFBundleShortVersionString` in `Project.yml`.
-- [ ] Run `./bin/regenerate` and verify the `.xcodeproj` builds.
+- [ ] Bump `CFBundleShortVersionString` in `Project.yml` if needed (the CI workflow passes `MARKETING_VERSION=<input>` to xcodebuild, so this is informational rather than required).
 - [ ] Update `docs/ROADMAP.md` (move shipped items out, add new ones).
-- [ ] Tag: `git tag vX.Y.Z && git push origin vX.Y.Z` — CI handles the rest.
-- [ ] Copy `version` and `sha256` from the CI output into `Casks/whisper-pilot.rb`.
-- [ ] Push the updated cask to the `homebrew-whisper-pilot` tap repo.
-- [ ] Verify the install end-to-end on a fresh user:
-      `brew install --cask vertocode/whisper-pilot/whisper-pilot`.
+- [ ] Trigger the release: either **Actions → Release → Run workflow** with the version typed in, or `git tag vX.Y.Z && git push origin vX.Y.Z`.
+- [ ] Wait for the workflow to finish. It builds the DMG, creates the GitHub Release, and bumps the tap cask.
+- [ ] On a clean Mac (or after `brew uninstall --cask whisper-pilot`), verify:
+      `brew install --cask vertocode/whisper-pilot/whisper-pilot` → the new version installs.
