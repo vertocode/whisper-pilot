@@ -18,12 +18,28 @@ actor TranscriptBuffer {
     private let retentionSeconds: TimeInterval = 1800
 
     func apply(_ update: TranscriptUpdate) {
+        let incomingTrimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
+
         if var existing = segments[update.id] {
-            existing.text = update.text
-            existing.isFinal = update.isFinal
-            existing.updatedAt = update.timestamp
-            segments[update.id] = existing
+            let existingTrimmed = existing.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Never wipe out an existing transcript with an empty update — defensive
+            // backstop in case the upstream filter doesn't catch one. The recognizer
+            // can settle on a final empty marker after a real partial; we want to
+            // keep the real text.
+            if !existingTrimmed.isEmpty && incomingTrimmed.isEmpty {
+                if update.isFinal { existing.isFinal = true }
+                existing.updatedAt = update.timestamp
+                segments[update.id] = existing
+            } else {
+                existing.text = update.text
+                existing.isFinal = update.isFinal
+                existing.updatedAt = update.timestamp
+                segments[update.id] = existing
+            }
         } else {
+            // Don't create a new segment for an empty update — that's just an empty
+            // row with a speaker label and no content.
+            guard !incomingTrimmed.isEmpty else { return }
             let segment = TranscriptSegment(
                 id: update.id,
                 text: update.text,

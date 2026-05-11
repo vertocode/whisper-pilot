@@ -203,9 +203,25 @@ private final class ChannelPipe {
                 firstCallback = false
             }
             if let result {
+                let text = result.bestTranscription.formattedString
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // SFSpeech sometimes emits empty-text results — typically partials with
+                // empty content during state transitions, or empty isFinal markers on
+                // session boundaries. Writing those into the buffer either creates rows
+                // with no text or, worse, overwrites the previous segment's real text
+                // with "". Drop them at the source. Still rotate `segmentId` on empty
+                // finals so the next non-empty result starts a fresh transcript line.
+                if trimmed.isEmpty {
+                    if result.isFinal {
+                        segmentId = UUID()
+                    }
+                    return
+                }
+
                 let update = TranscriptUpdate(
                     id: segmentId,
-                    text: result.bestTranscription.formattedString,
+                    text: text,
                     isFinal: result.isFinal,
                     channel: channel,
                     timestamp: Date()
