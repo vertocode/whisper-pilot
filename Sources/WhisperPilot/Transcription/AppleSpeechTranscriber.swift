@@ -103,6 +103,16 @@ private final class ChannelPipe {
     private static let restartDelay: TimeInterval = 0.5
     private var isFinished: Bool = false
     private let mutex = NSLock()
+    /// Rolling tail of recently-appended audio (~`replayMaxSeconds` worth). Replayed into
+    /// every new request we install so audio that arrived while the previous task was
+    /// finalizing (or dying with an error) is recovered. Without this, SFSpeech finalizing
+    /// after a comma-length pause silently drops the next ~0.5–2 s of speech — the user
+    /// sees "first phrase captured, middle vanished, third phrase captured" even though
+    /// the audio pipeline was delivering buffers the whole time. Accepts some text
+    /// duplication near task boundaries as a worthwhile trade vs. lost words.
+    private var replayBuffers: [AVAudioPCMBuffer] = []
+    private var replaySecondsBuffered: Double = 0
+    private static let replayMaxSeconds: Double = 1.2
 
     init(channel: AudioChannel, locale: Locale, sink: AsyncStream<TranscriptUpdate>.Continuation, log: Logger, autoRestart: Bool = true) throws {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
@@ -131,19 +141,37 @@ private final class ChannelPipe {
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
+        // Hold the mutex across the request.append call so a concurrent task-swap
+        // (continueAfterFinalization / actuallyRestart) can't slip in between reading
+        // `self.request` and appending — otherwise this buffer would land on the dead
+        // request the swap just replaced and be silently dropped.
         mutex.lock()
-        let currentRequest = request
-        let finished = isFinished
-        mutex.unlock()
-        guard !finished else { return }
-        currentRequest.append(buffer)
+        guard !isFinished else { mutex.unlock(); return }
+        request.append(buffer)
+        let seconds = buffer.format.sampleRate > 0
+            ? Double(buffer.frameLength) / buffer.format.sampleRate
+            : 0
+        replayBuffers.append(buffer)
+        replaySecondsBuffered += seconds
+        while replaySecondsBuffered > Self.replayMaxSeconds, let first = replayBuffers.first {
+            let firstSeconds = first.format.sampleRate > 0
+                ? Double(first.frameLength) / first.format.sampleRate
+                : 0
+            replayBuffers.removeFirst()
+            replaySecondsBuffered -= firstSeconds
+        }
         buffersAppended += 1
-        if buffersAppended == 1 {
+        let count = buffersAppended
+        let emitted = transcriptsEmitted
+        let restarts = restartCount
+        mutex.unlock()
+
+        if count == 1 {
             let rms = computeRMS(buffer)
             wpInfo("Transcriber.\(channel) FIRST buffer (frames=\(buffer.frameLength), rms=\(String(format: "%.5f", rms)))")
-        } else if buffersAppended % 100 == 0 {
+        } else if count % 100 == 0 {
             let rms = computeRMS(buffer)
-            wpInfo("Transcriber.\(channel) appended=\(buffersAppended) emitted=\(transcriptsEmitted) rms=\(String(format: "%.5f", rms)) restarts=\(restartCount)")
+            wpInfo("Transcriber.\(channel) appended=\(count) emitted=\(emitted) rms=\(String(format: "%.5f", rms)) restarts=\(restarts)")
         }
     }
 
@@ -163,6 +191,8 @@ private final class ChannelPipe {
         let oldRequest = request
         let oldTask = task
         task = nil
+        replayBuffers.removeAll()
+        replaySecondsBuffered = 0
         mutex.unlock()
         oldRequest.endAudio()
         oldTask?.cancel()
@@ -185,6 +215,7 @@ private final class ChannelPipe {
         next.shouldReportPartialResults = true
         next.requiresOnDeviceRecognition = false
         next.taskHint = .dictation
+        for buffer in replayBuffers { next.append(buffer) }
         request = next
         segmentId = UUID()
         task = nil
@@ -215,6 +246,12 @@ private final class ChannelPipe {
                 if trimmed.isEmpty {
                     if result.isFinal {
                         segmentId = UUID()
+                        self.continueAfterFinalization()
+                        // Don't fall through to error handling — we've already replaced
+                        // the request + task. A delayed scheduleRestart from a stale
+                        // error on the same callback would clobber the new request and
+                        // discard everything appended in the meantime.
+                        return
                     }
                     return
                 }
@@ -234,6 +271,9 @@ private final class ChannelPipe {
                 if result.isFinal {
                     wpInfo("Transcriber.\(channel) FINAL: \"\(update.text)\"")
                     segmentId = UUID()
+                    self.continueAfterFinalization()
+                    // See comment above — don't fall through to the error branch.
+                    return
                 }
             }
             if let error {
@@ -278,6 +318,36 @@ private final class ChannelPipe {
         }
     }
 
+    /// `SFSpeechRecognitionTask` terminates after it delivers `isFinal=true` — including
+    /// final results with empty text (which SFSpeech emits on session/utterance boundaries
+    /// when it gives up on detecting speech). After termination, every `request.append`
+    /// call is silently dropped, so the recognizer captures one phrase and then goes dead
+    /// until an error eventually triggers `scheduleRestart`. Spin up a fresh request +
+    /// task immediately so continuous speech stays transcribed without a multi-second gap.
+    ///
+    /// We also seed the new request with the recent audio tail. SFSpeech's internal
+    /// "I'm finalizing" decision happens some time before our callback fires, and any
+    /// buffers appended during that window were lost to the dead request. Replaying the
+    /// last ~1 s of audio recovers them; the cost is occasional duplicated words near
+    /// the boundary, which the user will tolerate far better than missing ones.
+    private func continueAfterFinalization() {
+        mutex.lock()
+        guard !isFinished else { mutex.unlock(); return }
+        let next = SFSpeechAudioBufferRecognitionRequest()
+        next.shouldReportPartialResults = true
+        next.requiresOnDeviceRecognition = false
+        next.taskHint = .dictation
+        for buffer in replayBuffers { next.append(buffer) }
+        let replayedCount = replayBuffers.count
+        request = next
+        task = nil
+        mutex.unlock()
+        if replayedCount > 0 {
+            wpInfo("Transcriber.\(channel) replayed \(replayedCount) buffer(s) into restarted request")
+        }
+        startTask()
+    }
+
     private func actuallyRestart() {
         mutex.lock()
         guard !isFinished else { mutex.unlock(); return }
@@ -285,10 +355,15 @@ private final class ChannelPipe {
         next.shouldReportPartialResults = true
         next.requiresOnDeviceRecognition = false
         next.taskHint = .dictation
+        for buffer in replayBuffers { next.append(buffer) }
+        let replayedCount = replayBuffers.count
         request = next
         task?.cancel()
         task = nil
         mutex.unlock()
+        if replayedCount > 0 {
+            wpInfo("Transcriber.\(channel) replayed \(replayedCount) buffer(s) into error-restarted request")
+        }
         startTask()
     }
 }
