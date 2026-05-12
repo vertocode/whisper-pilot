@@ -47,8 +47,9 @@ final class OverlayWindowController: NSWindowController {
         self.state = state
         self.settings = settings
 
+        let defaultSize = Self.defaultContentSize()
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 380),
+            contentRect: NSRect(origin: .zero, size: defaultSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -64,7 +65,10 @@ final class OverlayWindowController: NSWindowController {
         window.isOpaque = false
         window.hasShadow = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.minSize = NSSize(width: 320, height: 220)
+        // Matches the SwiftUI root's `.frame(minWidth: 380, minHeight: 320)` in
+        // OverlayView so the user can't drag the window smaller than the content's
+        // own minimum — otherwise the lanes clip and the divider becomes uncatchable.
+        window.minSize = NSSize(width: 380, height: 320)
 
         let host = NSHostingView(rootView: OverlayView(state: state, actions: actions))
         host.translatesAutoresizingMaskIntoConstraints = false
@@ -73,6 +77,12 @@ final class OverlayWindowController: NSWindowController {
         super.init(window: window)
 
         positionInTopRight(window)
+        // Persist user-driven resize and reposition across launches. First launch (no
+        // saved frame) uses the screen-relative default size + top-right placement we
+        // just configured; subsequent launches restore whatever the user last left it
+        // at. Must be called *after* the default frame is set so the autosave snapshot
+        // for first-run users captures the new default, not the prior init value.
+        window.setFrameAutosaveName("WhisperPilotOverlay")
         applyAlwaysOnTop(settings.alwaysOnTop)
         applyClickThrough(settings.clickThrough)
 
@@ -105,6 +115,17 @@ final class OverlayWindowController: NSWindowController {
             y: visible.maxY - size.height - 24
         )
         window.setFrameOrigin(origin)
+    }
+
+    /// Default content size: half the screen's visible width and height (one quarter
+    /// of the visible area), clamped to a sensible window — small enough to leave
+    /// room around the window on laptop screens, big enough to actually show both
+    /// the AI chat and live transcript without immediately needing a resize.
+    private static func defaultContentSize() -> NSSize {
+        let visible = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1440, height: 900)
+        let width = max(480, min(1200, visible.width / 2))
+        let height = max(360, min(900, visible.height / 2))
+        return NSSize(width: width, height: height)
     }
 
     private func applyAlwaysOnTop(_ on: Bool) {

@@ -25,6 +25,16 @@ struct OverlayView: View {
     @FocusState private var composerFocused: Bool
     @State private var includeScreenshot: Bool = false
     @State private var showDebugPanel: Bool = false
+    /// Fraction of the available split-pane height given to the AI/chat pane. The
+    /// remainder goes to the transcript pane. Drag the divider to adjust; bounded
+    /// to keep both panes at least `minPaneHeight` tall.
+    @State private var chatFraction: CGFloat = 0.5
+    /// Fraction captured at the start of a drag gesture so we can compute the new
+    /// fraction relative to the drag origin instead of accumulating per-frame deltas.
+    @State private var dragStartFraction: CGFloat?
+
+    private let dividerThickness: CGFloat = 6
+    private let minPaneHeight: CGFloat = 80
 
     var body: some View {
         VStack(spacing: 0) {
@@ -235,33 +245,88 @@ struct OverlayView: View {
 
     // MARK: - Content
 
+    /// The body content area. Banner + general notes live above the split because
+    /// they're brief and important — the user always wants them visible. The two
+    /// lanes (AI chat / live transcript) each get their own scroll view inside a
+    /// resizable split so a long conversation in one doesn't push the other out of
+    /// view. Dragging the divider rebalances how much space each lane gets.
     private var content: some View {
+        VStack(spacing: 0) {
+            if hasTopNotices {
+                topNotices
+                Divider().opacity(0.4)
+            }
+            GeometryReader { geo in
+                let available = max(geo.size.height - dividerThickness, 1)
+                let fraction = clampFraction(chatFraction, available: available)
+                let chatHeight = available * fraction
+                VStack(spacing: 0) {
+                    chatPane
+                        .frame(height: chatHeight)
+                    splitDivider(available: available)
+                    transcriptPane
+                        .frame(maxHeight: .infinity)
+                }
+            }
+            // GeometryReader is flexible by nature, but be explicit so the outer
+            // VStack always gives this region the remaining vertical space rather
+            // than collapsing it under one of the fixed-height neighbors.
+            .frame(maxHeight: .infinity)
+        }
+    }
+
+    private var hasTopNotices: Bool {
+        bannerSpec != nil || !generalNotes.isEmpty
+    }
+
+    private var topNotices: some View {
+        VStack(alignment: .leading, spacing: WP.Space.sm) {
+            if let banner = bannerSpec {
+                BannerView(spec: banner)
+            }
+            ForEach(generalNotes) { note in
+                MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
+            }
+        }
+        .padding(.horizontal, WP.Space.md)
+        .padding(.vertical, WP.Space.sm)
+    }
+
+    /// Top pane: AI chat. Own `ScrollView` so transcript growth never pushes new
+    /// AI messages out of view. Auto-scrolls to the latest message on new id or
+    /// streamed text.
+    private var chatPane: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                ChatLane(
+                    messages: aiMessages,
+                    isAIPaused: state.isAIPaused,
+                    onToggleAI: actions.toggleAIPaused,
+                    onDismissMessage: actions.dismissMessage
+                )
+                .padding(WP.Space.md)
+            }
+            .onChange(of: aiMessages.last?.id) { _, _ in
+                guard let last = aiMessages.last?.id else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(last, anchor: .bottom)
+                }
+            }
+            .onChange(of: aiMessages.last?.text) { _, _ in
+                guard let last = aiMessages.last?.id else { return }
+                proxy.scrollTo(last, anchor: .bottom)
+            }
+        }
+    }
+
+    /// Bottom pane: live transcript + transcript-related system notes (audio /
+    /// recognition watchdogs). Own `ScrollView` so the latest transcript line is
+    /// always visible regardless of how long the AI conversation has grown.
+    private var transcriptPane: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: WP.Space.md) {
-                    if let banner = bannerSpec {
-                        BannerView(spec: banner)
-                            .id("banner")
-                    }
-
-                    // General system notes — anything not specific to AI or transcript.
-                    ForEach(generalNotes) { note in
-                        MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
-                            .id(note.id)
-                    }
-
-                    ChatLane(
-                        messages: aiMessages,
-                        isAIPaused: state.isAIPaused,
-                        onToggleAI: actions.toggleAIPaused,
-                        onDismissMessage: actions.dismissMessage
-                    )
-                    .id("chat")
-
                     TranscriptLane(segments: state.transcript)
-                        .id("transcript")
-
-                    // Transcript-related system notes (audio/recognition watchdog, …).
                     ForEach(transcriptNotes) { note in
                         MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
                             .id(note.id)
@@ -269,35 +334,62 @@ struct OverlayView: View {
                 }
                 .padding(WP.Space.md)
             }
-            .onChange(of: state.messages.last?.id) { _, _ in
-                if let last = state.messages.last?.id {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(last, anchor: .bottom)
-                    }
-                }
-            }
-            .onChange(of: state.messages.last?.text) { _, _ in
-                if let last = state.messages.last?.id {
+            .onChange(of: state.transcript.last?.id) { _, _ in
+                guard let last = state.transcript.last?.id else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(last, anchor: .bottom)
                 }
             }
-            // Auto-follow the live transcript too — without this, transcript lines beyond
-            // what fits in the viewport just render off-screen below the fold and the user
-            // assumes recognition stopped. Trigger on both id (new segment appended) and
-            // text (existing partial growing).
-            .onChange(of: state.transcript.last?.id) { _, _ in
-                if let lastId = state.transcript.last?.id {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(lastId, anchor: .bottom)
-                    }
-                }
-            }
             .onChange(of: state.transcript.last?.text) { _, _ in
-                if let lastId = state.transcript.last?.id {
-                    proxy.scrollTo(lastId, anchor: .bottom)
-                }
+                guard let last = state.transcript.last?.id else { return }
+                proxy.scrollTo(last, anchor: .bottom)
             }
         }
+    }
+
+    /// Draggable divider between the two panes. The hit area is wider than the
+    /// visible line so the user doesn't need pixel-perfect aim; the cursor flips
+    /// to the resize indicator on hover.
+    private func splitDivider(available: CGFloat) -> some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(height: dividerThickness)
+            .overlay(
+                Rectangle()
+                    .fill(.separator.opacity(0.6))
+                    .frame(height: 1)
+            )
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering {
+                    NSCursor.resizeUpDown.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        if dragStartFraction == nil { dragStartFraction = chatFraction }
+                        guard let start = dragStartFraction else { return }
+                        let delta = value.translation.height / available
+                        chatFraction = clampFraction(start + delta, available: available)
+                    }
+                    .onEnded { _ in
+                        dragStartFraction = nil
+                    }
+            )
+            .help("Drag to resize the AI / transcript split")
+    }
+
+    /// Keep each pane at least `minPaneHeight` tall. If the window is too short to
+    /// honor that for both panes, fall back to a 50/50 split — the content will
+    /// scroll inside whichever pane runs short.
+    private func clampFraction(_ raw: CGFloat, available: CGFloat) -> CGFloat {
+        guard available > 2 * minPaneHeight else { return 0.5 }
+        let minF = minPaneHeight / available
+        let maxF = 1 - minF
+        return max(minF, min(maxF, raw))
     }
 
     private var generalNotes: [ChatMessage] {
