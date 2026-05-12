@@ -12,6 +12,7 @@ struct SettingsView: View {
             TabView {
                 generalTab.tabItem { Label("General", systemImage: "gearshape") }
                 devicesTab.tabItem { Label("Devices", systemImage: "mic.and.signal.meter") }
+                aiBehaviorTab.tabItem { Label("AI Behavior", systemImage: "sparkles") }
                 providerTab.tabItem { Label("AI Provider", systemImage: "brain") }
                 captureTab.tabItem { Label("Capture", systemImage: "waveform") }
                 overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
@@ -83,6 +84,32 @@ struct SettingsView: View {
                     }
                 }
                 FormHint(store.utteranceBoundary.description)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - AI Behavior
+
+    /// Per-feature AI toggles. All default to true so the assistant works out of
+    /// the box; flipping any of them off shrinks the prompt or skips a side
+    /// effect, trading capability for tokens / cost / latency.
+    private var aiBehaviorTab: some View {
+        Form {
+            Section("Automatic AI calls") {
+                Toggle("Periodic auto-send", isOn: $store.autoSendEnabled)
+                FormHint("Master switch for the recurring summary timer. When off, the interval below has no effect and the AI never calls itself on a schedule — only your composer messages and detected questions can trigger a response.")
+                Toggle("Auto-answer detected questions", isOn: $store.autoDetectQuestionsEnabled)
+                FormHint("When on, sentences in the transcript that look like questions automatically fire an AI call. Turn off to stop the model from chiming in on its own; you can still send manually.")
+            }
+
+            Section("Prompt context") {
+                Toggle("Include live transcript", isOn: $store.includeTranscriptInPrompt)
+                FormHint("Sends the recent conversation lines (and any resumed prior transcript) to the model on every call. Cheapest setting to flip if your transcript is long but the AI doesn't need it for what you're asking.")
+                Toggle("Include system audio (\"Other\") in AI context", isOn: $store.includeSystemAudioInPrompt)
+                FormHint("Excludes what \"Other\" said from the AI's view. The transcript pane still shows it — only the model loses access. Useful when only your side of the call should be summarized.")
+                Toggle("Include prior AI chat history", isOn: $store.includeChatHistoryInPrompt)
+                FormHint("Sends recent assistant/user turns so the model can resolve \"translate that\" / \"explain more\" follow-ups. Turn off for single-shot answers — saves the most tokens but breaks multi-turn reference.")
             }
         }
         .formStyle(.grouped)

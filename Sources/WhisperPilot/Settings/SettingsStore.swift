@@ -88,6 +88,11 @@ final class SettingsStore: ObservableObject {
         static let autoSendInterval = "ai.autoSendInterval"
         static let microphoneDeviceUID = "capture.microphoneDeviceUID"
         static let utteranceBoundary = "transcription.utteranceBoundary"
+        static let autoSendEnabled = "ai.autoSendEnabled"
+        static let autoDetectQuestionsEnabled = "ai.autoDetectQuestionsEnabled"
+        static let includeTranscriptInPrompt = "ai.includeTranscriptInPrompt"
+        static let includeSystemAudioInPrompt = "ai.includeSystemAudioInPrompt"
+        static let includeChatHistoryInPrompt = "ai.includeChatHistoryInPrompt"
     }
 
     private let defaults: UserDefaults
@@ -136,6 +141,42 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(utteranceBoundary.rawValue, forKey: Keys.utteranceBoundary) }
     }
 
+    /// Master switch for the periodic auto-send timer. When false the coordinator
+    /// never schedules the timer regardless of `autoSendInterval` — useful for users
+    /// who only want manual prompts and detected-question replies.
+    @Published var autoSendEnabled: Bool {
+        didSet { defaults.set(autoSendEnabled, forKey: Keys.autoSendEnabled) }
+    }
+
+    /// When true, the question detector's hits fire AI calls automatically. When
+    /// false, detected questions are still highlighted in the transcript but no
+    /// completion is requested.
+    @Published var autoDetectQuestionsEnabled: Bool {
+        didSet { defaults.set(autoDetectQuestionsEnabled, forKey: Keys.autoDetectQuestionsEnabled) }
+    }
+
+    /// When false, the live transcript (and any resumed prior transcript) is
+    /// dropped from the prompt context block — large token saver if the user only
+    /// wants the AI to react to their typed prompts.
+    @Published var includeTranscriptInPrompt: Bool {
+        didSet { defaults.set(includeTranscriptInPrompt, forKey: Keys.includeTranscriptInPrompt) }
+    }
+
+    /// When false, system-audio (the "Other" speaker) transcript lines are not
+    /// fed into ConversationContext, so they never appear in the AI prompt.
+    /// Transcript display is unaffected — you still see what was said, the model
+    /// just doesn't.
+    @Published var includeSystemAudioInPrompt: Bool {
+        didSet { defaults.set(includeSystemAudioInPrompt, forKey: Keys.includeSystemAudioInPrompt) }
+    }
+
+    /// When false, prior AI chat turns are excluded from each new prompt. Cheaper
+    /// per call, but breaks "translate that" / "explain more" follow-ups because
+    /// the model no longer sees what it just said.
+    @Published var includeChatHistoryInPrompt: Bool {
+        didSet { defaults.set(includeChatHistoryInPrompt, forKey: Keys.includeChatHistoryInPrompt) }
+    }
+
     var locale: Locale {
         Locale(identifier: localeIdentifier)
     }
@@ -159,5 +200,13 @@ final class SettingsStore: ObservableObject {
         self.autoSendInterval = AutoSendInterval(rawValue: defaults.string(forKey: Keys.autoSendInterval) ?? "") ?? .off
         self.microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
         self.utteranceBoundary = UtteranceBoundary(rawValue: defaults.string(forKey: Keys.utteranceBoundary) ?? "") ?? .auto
+        // All five AI behavior toggles default to true so the assistant works the way
+        // users expect on first launch. Existing settings persist; only fresh installs
+        // see the defaults.
+        self.autoSendEnabled = defaults.object(forKey: Keys.autoSendEnabled) as? Bool ?? true
+        self.autoDetectQuestionsEnabled = defaults.object(forKey: Keys.autoDetectQuestionsEnabled) as? Bool ?? true
+        self.includeTranscriptInPrompt = defaults.object(forKey: Keys.includeTranscriptInPrompt) as? Bool ?? true
+        self.includeSystemAudioInPrompt = defaults.object(forKey: Keys.includeSystemAudioInPrompt) as? Bool ?? true
+        self.includeChatHistoryInPrompt = defaults.object(forKey: Keys.includeChatHistoryInPrompt) as? Bool ?? true
     }
 }

@@ -47,6 +47,7 @@ final class AppCoordinator {
     private var settingsObserver: AnyCancellable?
     private var pausedObserver: AnyCancellable?
     private var intervalObserver: AnyCancellable?
+    private var autoSendEnabledObserver: AnyCancellable?
     private var autoSendTimer: Timer?
     private var lastAutoSendTranscriptCount: Int = 0
 
@@ -69,6 +70,10 @@ final class AppCoordinator {
         }
 
         intervalObserver = settings.$autoSendInterval
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.restartAutoSendTimer() }
+
+        autoSendEnabledObserver = settings.$autoSendEnabled
             .removeDuplicates()
             .sink { [weak self] _ in self?.restartAutoSendTimer() }
 
@@ -388,8 +393,8 @@ final class AppCoordinator {
             guard let self else { return }
             let snapshot = await self.context.snapshotWithPrior()
             var prompt = PromptBuilder.buildUserQuery(
-                context: snapshot,
-                history: history,
+                context: self.filteredSnapshot(snapshot),
+                history: self.filteredHistory(history),
                 query: text,
                 style: self.settings.responseStyle,
                 withScreenshot: withScreenshot
@@ -899,7 +904,21 @@ final class AppCoordinator {
             var transcriptsSeen = 0
             for await update in transcriber.transcripts {
                 await buffer.apply(update)
-                await context.absorb(update)
+                // The display always shows every transcript line; only AI context
+                // absorption is gated. With `includeSystemAudioInPrompt` off, the
+                // user still sees what "Other" said but the model doesn't, which
+                // is exactly the token-saving knob the user asked for.
+                let absorbIntoAIContext: Bool
+                if update.channel == .system {
+                    absorbIntoAIContext = await MainActor.run { [weak self] in
+                        self?.settings.includeSystemAudioInPrompt ?? true
+                    }
+                } else {
+                    absorbIntoAIContext = true
+                }
+                if absorbIntoAIContext {
+                    await context.absorb(update)
+                }
                 let snapshot = await buffer.snapshot()
                 self?.overlayState.transcript = snapshot
                 transcriptsSeen += 1
@@ -932,6 +951,10 @@ final class AppCoordinator {
                     wpInfo("[Coordinator] trigger fired but AI is paused — skipping")
                     continue
                 }
+                if !self.settings.autoDetectQuestionsEnabled {
+                    wpInfo("[Coordinator] trigger fired but auto-detect questions is disabled — skipping")
+                    continue
+                }
                 guard let liveAI = self.aiProvider else {
                     wpInfo("[Coordinator] trigger fired but no Gemini key — skipping")
                     continue
@@ -942,8 +965,8 @@ final class AppCoordinator {
                 let style = self.settings.responseStyle
                 let history = self.chatHistorySnapshot(excludingLast: false)
                 let prompt = PromptBuilder.build(
-                    context: snapshot,
-                    history: history,
+                    context: self.filteredSnapshot(snapshot),
+                    history: self.filteredHistory(history),
                     question: trigger.text,
                     style: style
                 )
@@ -1019,7 +1042,13 @@ final class AppCoordinator {
     private func restartAutoSendTimer() {
         autoSendTimer?.invalidate()
         autoSendTimer = nil
-        guard isRunning, !overlayState.isAIPaused, let interval = settings.autoSendInterval.seconds else { return }
+        // `autoSendEnabled` is the master switch (Settings → AI Behavior). When off
+        // we never schedule the timer regardless of which interval the user picked,
+        // so flipping it off mid-session immediately stops periodic summaries.
+        guard isRunning,
+              !overlayState.isAIPaused,
+              settings.autoSendEnabled,
+              let interval = settings.autoSendInterval.seconds else { return }
         let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.runAutoSend() }
         }
@@ -1044,8 +1073,39 @@ final class AppCoordinator {
             guard let self else { return }
             let snapshot = await self.context.snapshotWithPrior()
             let history = self.chatHistorySnapshot(excludingLast: false)
-            let prompt = PromptBuilder.buildAutoSend(context: snapshot, history: history, style: self.settings.responseStyle)
+            let prompt = PromptBuilder.buildAutoSend(
+                context: self.filteredSnapshot(snapshot),
+                history: self.filteredHistory(history),
+                style: self.settings.responseStyle
+            )
             await self.runCompletion(prompt: prompt, ai: ai, origin: .autoSend)
         }
+    }
+
+    // MARK: - AI prompt filtering
+
+    /// Applies the user's "include transcript in prompt" and "include chat history
+    /// in prompt" toggles to the snapshot before it's handed to PromptBuilder.
+    /// Live transcript lines, extracted topics, and resumed prior transcript
+    /// markdown are gated on the transcript flag; resumed prior chat markdown is
+    /// gated on the chat-history flag. `entities` is kept either way — it's a tiny
+    /// derived list and useful for the model's continuity even when both sections
+    /// are otherwise excluded.
+    private func filteredSnapshot(_ snapshot: ConversationSnapshot) -> ConversationSnapshot {
+        let includeT = settings.includeTranscriptInPrompt
+        let includeH = settings.includeChatHistoryInPrompt
+        return ConversationSnapshot(
+            recentLines: includeT ? snapshot.recentLines : [],
+            topics: includeT ? snapshot.topics : [],
+            entities: snapshot.entities,
+            priorTranscriptMarkdown: includeT ? snapshot.priorTranscriptMarkdown : nil,
+            priorChatMarkdown: includeH ? snapshot.priorChatMarkdown : nil
+        )
+    }
+
+    /// Drops the prior-turn chat history when the user has disabled it. Used by
+    /// every PromptBuilder call so the toggle takes effect uniformly.
+    private func filteredHistory(_ history: [ChatTurn]) -> [ChatTurn] {
+        settings.includeChatHistoryInPrompt ? history : []
     }
 }
