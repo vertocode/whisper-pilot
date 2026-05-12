@@ -15,7 +15,6 @@ struct TranscriptSegment: Sendable, Hashable, Identifiable {
 actor TranscriptBuffer {
     private var segments: [UUID: TranscriptSegment] = [:]
     private var order: [UUID] = []
-    private let retentionSeconds: TimeInterval = 1800
 
     func apply(_ update: TranscriptUpdate) {
         let incomingTrimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -51,7 +50,6 @@ actor TranscriptBuffer {
             segments[update.id] = segment
             order.append(update.id)
         }
-        prune()
     }
 
     func snapshot() -> [TranscriptSegment] {
@@ -68,13 +66,5 @@ actor TranscriptBuffer {
     func clear() {
         segments.removeAll()
         order.removeAll()
-    }
-
-    private func prune() {
-        let cutoff = Date().addingTimeInterval(-retentionSeconds)
-        while let first = order.first, let segment = segments[first], segment.updatedAt < cutoff {
-            order.removeFirst()
-            segments.removeValue(forKey: first)
-        }
     }
 }

@@ -142,7 +142,7 @@ private final class ChannelPipe {
 
     func append(_ buffer: AVAudioPCMBuffer) {
         // Hold the mutex across the request.append call so a concurrent task-swap
-        // (continueAfterFinalization / actuallyRestart) can't slip in between reading
+        // (continueAfterFinalization / scheduleRestart) can't slip in between reading
         // `self.request` and appending — otherwise this buffer would land on the dead
         // request the swap just replaced and be silently dropped.
         mutex.lock()
@@ -291,9 +291,16 @@ private final class ChannelPipe {
     /// detected" — every subsequent `request.append(buffer:)` is silently ignored.
     /// Recovery is to drop the request, build a fresh one, and start a new task.
     ///
-    /// Rate-limited because the recognizer can fire "No speech detected" repeatedly with
-    /// almost no time between callbacks (especially during periods of silence). Without a
-    /// cap we'd loop indefinitely and saturate the main thread with log appends.
+    /// Swap in the fresh request synchronously so `append()` calls arriving during the
+    /// rate-limit delay land on the new (live) request rather than the dead one — the
+    /// recognizer task can be attached later because `SFSpeechAudioBufferRecognitionRequest`
+    /// buffers audio added before its task starts. Without this, the rate cap (5s backoff)
+    /// silently discarded up to 5 s of speech, exactly the "transcript dies after line 3"
+    /// symptom we saw.
+    ///
+    /// Rate-limited only on *task creation* because the recognizer can fire "No speech
+    /// detected" repeatedly during silence. Without a cap we'd burn through SFSpeech's
+    /// daily task budget and saturate the main thread with log appends.
     private func scheduleRestart() {
         mutex.lock()
         guard !isFinished else { mutex.unlock(); return }
@@ -302,11 +309,25 @@ private final class ChannelPipe {
         let recentCount = recentRestartTimestamps.count
         recentRestartTimestamps.append(now)
         restartCount += 1
+
+        let next = SFSpeechAudioBufferRecognitionRequest()
+        next.shouldReportPartialResults = true
+        next.requiresOnDeviceRecognition = false
+        next.taskHint = .dictation
+        for buffer in replayBuffers { next.append(buffer) }
+        let replayedCount = replayBuffers.count
+        request = next
+        task?.cancel()
+        task = nil
         mutex.unlock()
 
+        if replayedCount > 0 {
+            wpInfo("Transcriber.\(channel) replayed \(replayedCount) buffer(s) into error-restarted request")
+        }
+
         // Don't permanently give up. SFSpeech's "No speech detected" can fire repeatedly
-        // during silence; once audio resumes we should still recognize. Slow down restart
-        // attempts when the error rate is high but never close the door.
+        // during silence; once audio resumes we should still recognize. Slow down task
+        // re-attach when the error rate is high but never close the door.
         let delay: TimeInterval = recentCount >= Self.maxRestartsPerWindow ? 5.0 : Self.restartDelay
         if recentCount >= Self.maxRestartsPerWindow {
             wpInfo("Transcriber.\(self.channel) backing off restart attempts (rate cap hit, retrying in \(Int(delay))s)")
@@ -314,8 +335,20 @@ private final class ChannelPipe {
 
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            self?.actuallyRestart()
+            self?.attachTaskIfNeeded()
         }
+    }
+
+    /// Re-attach a recognition task to the current request — but only if nothing else
+    /// already did. `cycleAtBoundary` / `continueAfterFinalization` can install their own
+    /// task between when `scheduleRestart` set up the new request and when its delayed
+    /// closure fires; double-attaching would leak a task and clobber transcripts.
+    private func attachTaskIfNeeded() {
+        mutex.lock()
+        guard !isFinished else { mutex.unlock(); return }
+        guard task == nil else { mutex.unlock(); return }
+        mutex.unlock()
+        startTask()
     }
 
     /// `SFSpeechRecognitionTask` terminates after it delivers `isFinal=true` — including
@@ -348,24 +381,6 @@ private final class ChannelPipe {
         startTask()
     }
 
-    private func actuallyRestart() {
-        mutex.lock()
-        guard !isFinished else { mutex.unlock(); return }
-        let next = SFSpeechAudioBufferRecognitionRequest()
-        next.shouldReportPartialResults = true
-        next.requiresOnDeviceRecognition = false
-        next.taskHint = .dictation
-        for buffer in replayBuffers { next.append(buffer) }
-        let replayedCount = replayBuffers.count
-        request = next
-        task?.cancel()
-        task = nil
-        mutex.unlock()
-        if replayedCount > 0 {
-            wpInfo("Transcriber.\(channel) replayed \(replayedCount) buffer(s) into error-restarted request")
-        }
-        startTask()
-    }
 }
 
 enum TranscriberError: LocalizedError {

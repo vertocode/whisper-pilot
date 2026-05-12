@@ -165,6 +165,91 @@ actor SessionStore {
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
+    /// Parses `transcript.md` back into `TranscriptSegment`s so the overlay can rehydrate
+    /// the live transcript lane when a session is resumed. Each persisted line
+    /// (`**Me** [HH:MM:SS] text` / `**Other** [HH:MM:SS] text`) becomes one finalized
+    /// segment. Anything that doesn't match (the header, blank lines) is ignored.
+    func loadTranscriptSegments(_ id: SessionID) -> [TranscriptSegment] {
+        Self.parseTranscriptMarkdown(loadTranscriptMarkdown(id))
+    }
+
+    /// Parses `chat.md` back into `ChatMessage`s so the overlay can rehydrate the chat
+    /// lane on resume. Origin metadata isn't persisted on disk, so loaded turns default
+    /// to `.userPrompt` — that just suppresses the "detected question" / "auto-send"
+    /// badge, which makes sense for historical turns.
+    func loadChatMessages(_ id: SessionID) -> [ChatMessage] {
+        Self.parseChatMarkdown(loadChatMarkdown(id))
+    }
+
+    private static let transcriptLineRegex = #/^\*\*(?<speaker>Me|Other)\*\* \[(?<time>\d{2}:\d{2}:\d{2})\] (?<text>.+)$/#
+    private static let chatHeaderRegex = #/^(?<role>You|Assistant|System) \[(?<time>\d{2}:\d{2}:\d{2})\]$/#
+
+    private static func parseTranscriptMarkdown(_ markdown: String) -> [TranscriptSegment] {
+        var segments: [TranscriptSegment] = []
+        let now = Date()
+        for line in markdown.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let match = line.firstMatch(of: transcriptLineRegex) else { continue }
+            let channel: AudioChannel = match.speaker == "Me" ? .microphone : .system
+            let timestamp = parseTime(String(match.time)) ?? now
+            segments.append(TranscriptSegment(
+                id: UUID(),
+                text: String(match.text),
+                isFinal: true,
+                channel: channel,
+                startedAt: timestamp,
+                updatedAt: timestamp
+            ))
+        }
+        return segments
+    }
+
+    private static func parseChatMarkdown(_ markdown: String) -> [ChatMessage] {
+        // `## ` always appears at the start of a turn block. Split on `\n## ` so the
+        // first chunk is the file header (or empty) and every subsequent chunk starts
+        // with `Role [HH:MM:SS]\n\nbody…`.
+        let chunks = markdown.components(separatedBy: "\n## ")
+        let now = Date()
+        var messages: [ChatMessage] = []
+        for chunk in chunks.dropFirst() {
+            guard let newlineIdx = chunk.firstIndex(of: "\n") else { continue }
+            let header = chunk[..<newlineIdx]
+            guard let match = header.firstMatch(of: chatHeaderRegex) else { continue }
+            let body = chunk[chunk.index(after: newlineIdx)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !body.isEmpty else { continue }
+            let timestamp = parseTime(String(match.time)) ?? now
+            let role: ChatMessage.Role
+            switch match.role {
+            case "You": role = .user
+            case "Assistant": role = .assistant
+            default: role = .system
+            }
+            messages.append(ChatMessage(
+                id: UUID(),
+                role: role,
+                origin: role == .system ? .system : .userPrompt,
+                text: body,
+                timestamp: timestamp,
+                isStreaming: false,
+                category: role == .system ? .general : .ai
+            ))
+        }
+        return messages
+    }
+
+    /// Combines today's date with a `HH:MM:SS` timestamp. The on-disk format throws away
+    /// the date, so this is only useful for relative ordering inside a session — good
+    /// enough for the UI, which renders messages chronologically by array position.
+    private static func parseTime(_ string: String) -> Date? {
+        let parts = string.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        var components = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        components.hour = parts[0]
+        components.minute = parts[1]
+        components.second = parts[2]
+        return Calendar.current.date(from: components)
+    }
+
     // MARK: - Helpers
 
     private func writeMetadata(_ meta: SessionMeta, to folder: URL) throws {

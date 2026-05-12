@@ -197,13 +197,20 @@ final class AppCoordinator {
             }
         }
 
-        // Transcription does NOT depend on the LLM — it runs locally via SFSpeechRecognizer.
-        // We deliberately allow listening without a Gemini API key so users can use the
-        // app as a standalone transcriber, or debug the audio pipeline independently of
-        // any AI integration. AI features (detected-question triggers, auto-send, the
-        // composer) noop until a key is present.
+        // Transcription does NOT depend on the LLM — it runs locally. We deliberately
+        // allow listening without a Gemini API key so users can use the app as a
+        // standalone transcriber, or debug the audio pipeline independently of any AI
+        // integration. AI features (detected-question triggers, auto-send, the composer)
+        // noop until a key is present.
         wpInfo("[Coordinator] starting modules")
-        let transcriber = AppleSpeechTranscriber(locale: settings.locale)
+        let transcriber: TranscriptionProvider
+        do {
+            transcriber = try await makeStartedTranscriber()
+        } catch {
+            wpError("Transcriber start failed: \(error.localizedDescription)")
+            overlayState.status = .error(error.localizedDescription)
+            return
+        }
         self.transcriber = transcriber
 
         if let key = settings.geminiAPIKey, !key.isEmpty {
@@ -214,8 +221,6 @@ final class AppCoordinator {
         }
 
         do {
-            try await transcriber.start()
-            wpInfo("[Coordinator] transcriber.start OK")
             if processTapFrames == nil {
                 try await systemCapture.start()
                 wpInfo("[Coordinator] systemCapture.start OK (SCK)")
@@ -333,20 +338,33 @@ final class AppCoordinator {
         overlayState.isAIPaused.toggle()
     }
 
-    /// Activate a session — either fresh or resumed. On resume we hand the prior
-    /// transcript + chat markdown to the conversation context so the AI sees them on the
-    /// next prompt; we do NOT replay them into the live transcript lane (that lane shows
-    /// new content only). A system note tells the user which session they're in.
+    /// Activate a session — either fresh or resumed. Always wipes the overlay's live
+    /// transcript and chat first so switching sessions never leaks the previous session's
+    /// content into the new one's UI. On resume we then rehydrate both lanes from the
+    /// session's `transcript.md` / `chat.md` and hand the raw markdown to the AI context
+    /// so the model sees prior history on its next prompt.
     func useSession(_ session: SessionMeta, resumed: Bool) async {
+        // Re-selecting the current session shouldn't wipe its in-memory state — that
+        // would discard the live transcript the user is actively building. Just keep
+        // running with whatever is already loaded.
+        if currentSession?.id == session.id { return }
+
         currentSession = session
+        overlayState.transcript = []
+        overlayState.clearChat()
+        overlayState.transcriptCount = 0
+        overlayState.audioFrameCount = 0
+        await transcriptBuffer.clear()
+        await context.reset()
+
         if resumed {
             let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
             let chat = await SessionStore.shared.loadChatMarkdown(session.id)
+            let segments = await SessionStore.shared.loadTranscriptSegments(session.id)
+            let messages = await SessionStore.shared.loadChatMessages(session.id)
+            overlayState.transcript = segments
+            overlayState.messages = messages
             await context.seedFromMarkdown(transcript: transcript, chat: chat)
-            // No system note — the user just picked this session, they know what they did.
-        } else {
-            overlayState.clearChat()
-            await context.reset()
         }
     }
 
@@ -465,6 +483,31 @@ final class AppCoordinator {
         }
     }
 
+    // MARK: - Transcriber selection
+
+    /// Constructs and starts a transcription provider. Prefers the macOS 26
+    /// `SpeechAnalyzer` framework (no per-task ~60 s cap, no silence-timeout failure
+    /// mode, native streaming) and falls back to the legacy `SFSpeechRecognizer`-based
+    /// path on older systems — or if the modern path fails to start (e.g. locale model
+    /// unavailable, asset install denied). Throws only when both paths fail.
+    private func makeStartedTranscriber() async throws -> TranscriptionProvider {
+        if #available(macOS 26.0, *) {
+            let modern = SpeechAnalyzerTranscriber(locale: settings.locale)
+            do {
+                try await modern.start()
+                wpInfo("[Coordinator] using SpeechAnalyzer (macOS 26+) transcriber")
+                return modern
+            } catch {
+                wpWarn("[Coordinator] SpeechAnalyzer start failed (\(error.localizedDescription)); falling back to SFSpeechRecognizer")
+                modern.stop()
+            }
+        }
+        let legacy = AppleSpeechTranscriber(locale: settings.locale)
+        try await legacy.start()
+        wpInfo("[Coordinator] using SFSpeechRecognizer transcriber")
+        return legacy
+    }
+
     // MARK: - Self-test
 
     /// Generates speech with `AVSpeechSynthesizer`, feeds the resulting audio buffers
@@ -556,6 +599,10 @@ final class AppCoordinator {
                 guard let converter else { return }
                 let outputCapacity = AVAudioFrameCount(Double(pcm.frameLength) * canonical.sampleRate / pcm.format.sampleRate) + 1024
                 guard let out = AVAudioPCMBuffer(pcmFormat: canonical, frameCapacity: outputCapacity) else { return }
+                // Reset before each chunk — without this the converter latches into a
+                // terminal "stream ended" state after the first endOfStream and yields
+                // 0 frames forever after. Same fix as `MicrophoneCapture.handle`.
+                converter.reset()
                 var error: NSError?
                 var consumed = false
                 converter.convert(to: out, error: &error) { _, status in
