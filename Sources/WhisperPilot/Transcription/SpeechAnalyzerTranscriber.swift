@@ -114,7 +114,13 @@ private final class Pipe: @unchecked Sendable {
 
     private let mutex = NSLock()
     private var isFinished = false
-    private var currentSegmentId = UUID()
+    /// Map from a result's `range.start` to a stable segment UUID. Each distinct
+    /// utterance the analyzer reports (i.e. each unique audio start time) becomes its
+    /// own transcript line; volatile partials for the same range update that line in
+    /// place. Without this — using a single rotating id — fast back-to-back utterances
+    /// would all share one id and `TranscriptBuffer.apply` would treat them as
+    /// revisions of one segment, so each new phrase visibly replaced the previous one.
+    private var segmentIdsByRangeStart: [CMTime: UUID] = [:]
     /// Start of the analyzer's current volatile (unfinalized) audio range. A result is
     /// considered final once its range ends at or before this point. Updated by the
     /// `volatileRangeChangedHandler` we install on the analyzer.
@@ -333,14 +339,25 @@ private final class Pipe: @unchecked Sendable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return }
 
+        let rangeStart = result.range.start
         mutex.lock()
+        // Stable id per `range.start`: each distinct utterance the analyzer reports
+        // gets its own UUID, and repeated volatile emissions for the *same* range
+        // share an id so they update the same line in place. This is what stops a
+        // new fast-spoken phrase from clobbering the previous one in `TranscriptBuffer`.
+        let segmentId: UUID
+        if let existing = segmentIdsByRangeStart[rangeStart] {
+            segmentId = existing
+        } else {
+            segmentId = UUID()
+            segmentIdsByRangeStart[rangeStart] = segmentId
+        }
         // A result is final once its range ends at or before the volatile region's
         // start — meaning the analyzer has committed that audio segment and won't
         // revise it. Before the volatile-range handler has fired even once, we
         // can't tell, so emit as volatile and let a later result for the same
         // range upgrade it.
         let isFinal = hasVolatileRange && CMTimeCompare(result.range.end, volatileStart) <= 0
-        let segmentId = currentSegmentId
         resultsSeen += 1
         let count = resultsSeen
         mutex.unlock()
@@ -353,12 +370,6 @@ private final class Pipe: @unchecked Sendable {
             timestamp: Date()
         )
         sink.yield(update)
-
-        if isFinal {
-            mutex.lock()
-            currentSegmentId = UUID()
-            mutex.unlock()
-        }
 
         if count == 1 {
             wpInfo("SpeechAnalyzer.\(channel) FIRST result: \"\(text)\" final=\(isFinal)")
