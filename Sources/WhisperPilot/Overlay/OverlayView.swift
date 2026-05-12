@@ -27,11 +27,15 @@ struct OverlayView: View {
     @State private var showDebugPanel: Bool = false
     /// Fraction of the available split-pane height given to the AI/chat pane. The
     /// remainder goes to the transcript pane. Drag the divider to adjust; bounded
-    /// to keep both panes at least `minPaneHeight` tall.
+    /// to keep both panes at least `minPaneHeight` tall. Only used when both
+    /// panes are expanded — collapse modes ignore it and use the lane's intrinsic
+    /// header height for whichever pane is dropped.
     @State private var chatFraction: CGFloat = 0.5
     /// Fraction captured at the start of a drag gesture so we can compute the new
     /// fraction relative to the drag origin instead of accumulating per-frame deltas.
     @State private var dragStartFraction: CGFloat?
+    @State private var chatCollapsed: Bool = false
+    @State private var transcriptCollapsed: Bool = false
 
     private let dividerThickness: CGFloat = 6
     private let minPaneHeight: CGFloat = 80
@@ -256,6 +260,26 @@ struct OverlayView: View {
                 topNotices
                 Divider().opacity(0.4)
             }
+            bodyPanes
+                // GeometryReader inside is flexible by nature; be explicit so the
+                // outer VStack always gives this region the remaining vertical space
+                // rather than collapsing it under one of the fixed-height neighbors.
+                .frame(maxHeight: .infinity)
+        }
+    }
+
+    /// Layout switches on which panes are collapsed:
+    /// - Both expanded → GeometryReader split with a draggable divider.
+    /// - One collapsed → the collapsed pane takes its intrinsic header height,
+    ///   the expanded one fills the rest, divider becomes a static separator.
+    /// - Both collapsed → both header bars stack at the top, rest is empty.
+    /// We branch the whole layout rather than baking the modes into one
+    /// GeometryReader because intrinsic-height children inside a constrained
+    /// VStack get tricky to size predictably across collapse transitions.
+    @ViewBuilder
+    private var bodyPanes: some View {
+        switch (chatCollapsed, transcriptCollapsed) {
+        case (false, false):
             GeometryReader { geo in
                 let available = max(geo.size.height - dividerThickness, 1)
                 let fraction = clampFraction(chatFraction, available: available)
@@ -263,15 +287,32 @@ struct OverlayView: View {
                 VStack(spacing: 0) {
                     chatPane
                         .frame(height: chatHeight)
-                    splitDivider(available: available)
+                    splitDivider(available: available, draggable: true)
                     transcriptPane
                         .frame(maxHeight: .infinity)
                 }
             }
-            // GeometryReader is flexible by nature, but be explicit so the outer
-            // VStack always gives this region the remaining vertical space rather
-            // than collapsing it under one of the fixed-height neighbors.
-            .frame(maxHeight: .infinity)
+        case (true, false):
+            VStack(spacing: 0) {
+                chatPane
+                splitDivider(available: 0, draggable: false)
+                transcriptPane
+                    .frame(maxHeight: .infinity)
+            }
+        case (false, true):
+            VStack(spacing: 0) {
+                chatPane
+                    .frame(maxHeight: .infinity)
+                splitDivider(available: 0, draggable: false)
+                transcriptPane
+            }
+        case (true, true):
+            VStack(spacing: 0) {
+                chatPane
+                splitDivider(available: 0, draggable: false)
+                transcriptPane
+                Spacer(minLength: 0)
+            }
         }
     }
 
@@ -292,66 +333,101 @@ struct OverlayView: View {
         .padding(.vertical, WP.Space.sm)
     }
 
-    /// Top pane: AI chat. Own `ScrollView` so transcript growth never pushes new
-    /// AI messages out of view. Auto-scrolls to the latest message on new id or
-    /// streamed text.
+    /// Top pane: AI chat. Own `ScrollView` (when expanded) so transcript growth
+    /// never pushes new AI messages out of view. Auto-scrolls to the latest
+    /// message on new id or streamed text. When collapsed, renders only the
+    /// header — no ScrollView, so a single-row pane doesn't show empty space
+    /// with scroll indicators.
+    @ViewBuilder
     private var chatPane: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                ChatLane(
-                    messages: aiMessages,
-                    isAIPaused: state.isAIPaused,
-                    onToggleAI: actions.toggleAIPaused,
-                    onDismissMessage: actions.dismissMessage
-                )
-                .padding(WP.Space.md)
-            }
-            .onChange(of: aiMessages.last?.id) { _, _ in
-                guard let last = aiMessages.last?.id else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
+        if chatCollapsed {
+            ChatLane(
+                messages: aiMessages,
+                isAIPaused: state.isAIPaused,
+                onToggleAI: actions.toggleAIPaused,
+                onDismissMessage: actions.dismissMessage,
+                isCollapsed: true,
+                onToggleCollapse: { chatCollapsed.toggle() }
+            )
+            .padding(WP.Space.md)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    ChatLane(
+                        messages: aiMessages,
+                        isAIPaused: state.isAIPaused,
+                        onToggleAI: actions.toggleAIPaused,
+                        onDismissMessage: actions.dismissMessage,
+                        isCollapsed: false,
+                        onToggleCollapse: { chatCollapsed.toggle() }
+                    )
+                    .padding(WP.Space.md)
+                }
+                .onChange(of: aiMessages.last?.id) { _, _ in
+                    guard let last = aiMessages.last?.id else { return }
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(last, anchor: .bottom)
+                    }
+                }
+                .onChange(of: aiMessages.last?.text) { _, _ in
+                    guard let last = aiMessages.last?.id else { return }
                     proxy.scrollTo(last, anchor: .bottom)
                 }
-            }
-            .onChange(of: aiMessages.last?.text) { _, _ in
-                guard let last = aiMessages.last?.id else { return }
-                proxy.scrollTo(last, anchor: .bottom)
             }
         }
     }
 
     /// Bottom pane: live transcript + transcript-related system notes (audio /
-    /// recognition watchdogs). Own `ScrollView` so the latest transcript line is
-    /// always visible regardless of how long the AI conversation has grown.
+    /// recognition watchdogs). Own `ScrollView` (when expanded) so the latest
+    /// transcript line is always visible regardless of how long the AI
+    /// conversation has grown. Collapses to header-only like the chat pane.
+    @ViewBuilder
     private var transcriptPane: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: WP.Space.md) {
-                    TranscriptLane(segments: state.transcript)
-                    ForEach(transcriptNotes) { note in
-                        MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
-                            .id(note.id)
+        if transcriptCollapsed {
+            TranscriptLane(
+                segments: state.transcript,
+                isCollapsed: true,
+                onToggleCollapse: { transcriptCollapsed.toggle() }
+            )
+            .padding(WP.Space.md)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: WP.Space.md) {
+                        TranscriptLane(
+                            segments: state.transcript,
+                            isCollapsed: false,
+                            onToggleCollapse: { transcriptCollapsed.toggle() }
+                        )
+                        ForEach(transcriptNotes) { note in
+                            MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
+                                .id(note.id)
+                        }
+                    }
+                    .padding(WP.Space.md)
+                }
+                .onChange(of: state.transcript.last?.id) { _, _ in
+                    guard let last = state.transcript.last?.id else { return }
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(last, anchor: .bottom)
                     }
                 }
-                .padding(WP.Space.md)
-            }
-            .onChange(of: state.transcript.last?.id) { _, _ in
-                guard let last = state.transcript.last?.id else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
+                .onChange(of: state.transcript.last?.text) { _, _ in
+                    guard let last = state.transcript.last?.id else { return }
                     proxy.scrollTo(last, anchor: .bottom)
                 }
-            }
-            .onChange(of: state.transcript.last?.text) { _, _ in
-                guard let last = state.transcript.last?.id else { return }
-                proxy.scrollTo(last, anchor: .bottom)
             }
         }
     }
 
-    /// Draggable divider between the two panes. The hit area is wider than the
-    /// visible line so the user doesn't need pixel-perfect aim; the cursor flips
-    /// to the resize indicator on hover.
-    private func splitDivider(available: CGFloat) -> some View {
-        Rectangle()
+    /// Divider between the two panes. When `draggable` is true (both expanded)
+    /// the hover cursor flips to the resize indicator and a vertical drag
+    /// rebalances `chatFraction`. When one pane is collapsed, the divider is a
+    /// static separator with no interactive behavior — there's nothing
+    /// meaningful to resize while the other pane is at a fixed intrinsic height.
+    @ViewBuilder
+    private func splitDivider(available: CGFloat, draggable: Bool) -> some View {
+        let base = Rectangle()
             .fill(Color.clear)
             .frame(height: dividerThickness)
             .overlay(
@@ -359,27 +435,32 @@ struct OverlayView: View {
                     .fill(.separator.opacity(0.6))
                     .frame(height: 1)
             )
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                if hovering {
-                    NSCursor.resizeUpDown.push()
-                } else {
-                    NSCursor.pop()
+        if draggable {
+            base
+                .contentShape(Rectangle())
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.resizeUpDown.push()
+                    } else {
+                        NSCursor.pop()
+                    }
                 }
-            }
-            .gesture(
-                DragGesture()
-                    .onChanged { value in
-                        if dragStartFraction == nil { dragStartFraction = chatFraction }
-                        guard let start = dragStartFraction else { return }
-                        let delta = value.translation.height / available
-                        chatFraction = clampFraction(start + delta, available: available)
-                    }
-                    .onEnded { _ in
-                        dragStartFraction = nil
-                    }
-            )
-            .help("Drag to resize the AI / transcript split")
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            if dragStartFraction == nil { dragStartFraction = chatFraction }
+                            guard let start = dragStartFraction else { return }
+                            let delta = value.translation.height / available
+                            chatFraction = clampFraction(start + delta, available: available)
+                        }
+                        .onEnded { _ in
+                            dragStartFraction = nil
+                        }
+                )
+                .help("Drag to resize the AI / transcript split")
+        } else {
+            base
+        }
     }
 
     /// Keep each pane at least `minPaneHeight` tall. If the window is too short to
@@ -618,6 +699,10 @@ private struct ChatLane: View {
     let isAIPaused: Bool
     let onToggleAI: () -> Void
     let onDismissMessage: (UUID) -> Void
+    /// When true, only the header is rendered. Owner manages the state and
+    /// passes a toggle closure so the lane can fire when its chevron is tapped.
+    var isCollapsed: Bool = false
+    var onToggleCollapse: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
@@ -630,17 +715,23 @@ private struct ChatLane: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
+                if let onToggleCollapse {
+                    CollapseChevron(isCollapsed: isCollapsed, action: onToggleCollapse)
+                        .help(isCollapsed ? "Show AI conversation" : "Hide AI conversation")
+                }
             }
 
-            if messages.isEmpty {
-                EmptyStatePill(
-                    icon: isAIPaused ? "pause.circle" : "sparkles",
-                    text: emptyStateText
-                )
-            } else {
-                ForEach(messages) { message in
-                    MessageBubble(message: message, onDismiss: { onDismissMessage(message.id) })
-                        .id(message.id)
+            if !isCollapsed {
+                if messages.isEmpty {
+                    EmptyStatePill(
+                        icon: isAIPaused ? "pause.circle" : "sparkles",
+                        text: emptyStateText
+                    )
+                } else {
+                    ForEach(messages) { message in
+                        MessageBubble(message: message, onDismiss: { onDismissMessage(message.id) })
+                            .id(message.id)
+                    }
                 }
             }
         }
