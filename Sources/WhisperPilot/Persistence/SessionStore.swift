@@ -165,6 +165,60 @@ actor SessionStore {
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
+    // MARK: - Session context (user-supplied notes + attached files)
+
+    private func contextURL(_ id: SessionID) -> URL {
+        sessionFolder(for: id).appendingPathComponent("context.json")
+    }
+
+    func loadContext(_ id: SessionID) -> SessionContext {
+        let url = contextURL(id)
+        guard let data = try? Data(contentsOf: url),
+              let ctx = try? makeDecoder().decode(SessionContext.self, from: data)
+        else { return SessionContext() }
+        return ctx
+    }
+
+    func saveContext(_ context: SessionContext, to id: SessionID) {
+        let url = contextURL(id)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(context)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            log.error("Context save failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    // MARK: - Global context (applied to every session's prompt)
+
+    /// Path of the app-wide global context file. Lives one level above the per-session
+    /// folders so it doesn't end up in any single session's data.
+    private var globalContextURL: URL {
+        baseURL.deletingLastPathComponent().appendingPathComponent("global-context.json")
+    }
+
+    func loadGlobalContext() -> SessionContext {
+        guard let data = try? Data(contentsOf: globalContextURL),
+              let ctx = try? makeDecoder().decode(SessionContext.self, from: data)
+        else { return SessionContext() }
+        return ctx
+    }
+
+    func saveGlobalContext(_ context: SessionContext) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(context)
+            try data.write(to: globalContextURL, options: .atomic)
+        } catch {
+            log.error("Global context save failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
     /// Parses `transcript.md` back into `TranscriptSegment`s so the overlay can rehydrate
     /// the live transcript lane when a session is resumed. Each persisted line
     /// (`**Me** [HH:MM:SS] text` / `**Other** [HH:MM:SS] text`) becomes one finalized

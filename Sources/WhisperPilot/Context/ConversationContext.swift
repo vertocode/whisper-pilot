@@ -8,6 +8,14 @@ struct ConversationSnapshot: Sendable {
     /// `PromptBuilder` includes this as a separate section so the model knows it's older context.
     var priorTranscriptMarkdown: String? = nil
     var priorChatMarkdown: String? = nil
+    /// User-supplied notes + attached files for this session, rendered as a single
+    /// markdown block by `SessionContext.promptBlock`. The coordinator passes this
+    /// in so it appears in every prompt (detected questions, Help AI, composer).
+    var sessionContextBlock: String? = nil
+    /// App-wide notes + files that apply to every session. Kept separate from
+    /// `sessionContextBlock` so the prompt builder can label them distinctly and
+    /// the model understands they're general background versus session-specific.
+    var globalContextBlock: String? = nil
 }
 
 /// Rolling memory the LLM sees on every prompt. We keep the recent transcript verbatim and a small

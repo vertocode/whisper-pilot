@@ -16,13 +16,14 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         self.session = session
     }
 
-    func streamCompletion(prompt: Prompt) -> AsyncThrowingStream<String, Error> {
+    func streamCompletion(prompt: Prompt) -> AsyncThrowingStream<AIStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     self.log.info("Gemini stream request → model=\(self.model, privacy: .public), question=\"\(prompt.question, privacy: .public)\", style=\(prompt.style.rawValue, privacy: .public)")
-                    try await stream(prompt: prompt, continuation: continuation)
-                    self.log.info("Gemini stream complete")
+                    let reason = try await stream(prompt: prompt, continuation: continuation)
+                    self.log.info("Gemini stream complete (reason=\(String(describing: reason), privacy: .public))")
+                    continuation.yield(.finish(reason))
                     continuation.finish()
                 } catch {
                     self.log.error("Gemini stream failed: \(String(describing: error), privacy: .public)")
@@ -66,13 +67,22 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
 
     // MARK: - HTTP
 
-    private func stream(prompt: Prompt, continuation: AsyncThrowingStream<String, Error>.Continuation) async throws {
+    /// Returns the final `AIFinishReason` derived from the stream's last chunk.
+    /// Yields `.delta(text)` for every chunk that carried text; the caller is
+    /// responsible for yielding the final `.finish(reason)` after this returns.
+    private func stream(prompt: Prompt, continuation: AsyncThrowingStream<AIStreamEvent, Error>.Continuation) async throws -> AIFinishReason {
         let url = endpoint(streaming: true)
         let body = try encode(requestBody(for: prompt))
         let request = makeRequest(url: url, body: body)
 
         let (bytes, response) = try await session.bytes(for: request)
-        try ensureSuccess(response: response, bytes: bytes)
+        try await ensureSuccess(response: response, bytes: bytes)
+
+        // Track the most recent finishReason we saw across all chunks. Gemini
+        // typically emits it only in the terminal chunk; if the stream ends
+        // *without* one, leave this nil so the coordinator can flag "ended
+        // without a finish reason" — usually a transport-level drop.
+        var lastReason: String?
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
@@ -80,10 +90,31 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
             if payload.isEmpty || payload == "[DONE]" { continue }
             guard let data = payload.data(using: .utf8) else { continue }
-            if let chunk = try? JSONDecoder().decode(GeminiResponse.self, from: data),
-               let text = chunk.firstText, !text.isEmpty {
-                continuation.yield(text)
+            if let chunk = try? JSONDecoder().decode(GeminiResponse.self, from: data) {
+                if let text = chunk.firstText, !text.isEmpty {
+                    continuation.yield(.delta(text))
+                }
+                if let reason = chunk.firstFinishReason {
+                    lastReason = reason
+                }
             }
+        }
+
+        return Self.parseFinishReason(lastReason)
+    }
+
+    /// Maps Gemini's `finishReason` string to our provider-agnostic enum. Treats
+    /// the absence of any reason as `.other(nil)` so the coordinator can surface
+    /// "stream ended without a finish reason" — that branch typically means a
+    /// silent connection drop, not a model decision.
+    private static func parseFinishReason(_ raw: String?) -> AIFinishReason {
+        switch raw {
+        case "STOP":         return .stop
+        case "MAX_TOKENS":   return .maxTokens
+        case "SAFETY":       return .safety
+        case "RECITATION":   return .recitation
+        case .some(let other): return .other(other)
+        case .none:          return .other(nil)
         }
     }
 
@@ -130,7 +161,12 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         return GeminiRequest(
             systemInstruction: .init(parts: [.init(text: prompt.systemInstruction)]),
             contents: [.init(role: "user", parts: parts)],
-            generationConfig: .init(temperature: 0.7, maxOutputTokens: 600)
+            // 600 tokens was tight — Detailed / Strategic styles plus a few markdown
+            // bullets can clip mid-sentence. 2000 is still well within free-tier
+            // limits and gives the model room to finish a thought (~1500 words of
+            // English output). If users report truncation we'll see `MAX_TOKENS`
+            // surfaced in the assistant bubble's diagnostic note now.
+            generationConfig: .init(temperature: 0.7, maxOutputTokens: 2000)
         )
     }
 
@@ -140,10 +176,15 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         return try encoder.encode(value)
     }
 
-    private func ensureSuccess(response: URLResponse, bytes: URLSession.AsyncBytes) throws {
+    /// On a non-2xx streaming response we need to drain the body before throwing so the
+    /// user sees Gemini's actual error message (e.g. "model not found"). Without this we'd
+    /// surface a bare "Gemini error 404" with no clue what went wrong.
+    private func ensureSuccess(response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
         guard let http = response as? HTTPURLResponse else { return }
         if !(200..<300).contains(http.statusCode) {
-            throw GeminiError.http(status: http.statusCode, body: nil)
+            let buffer = (try? await bytes.reduce(into: Data(), { $0.append($1) })) ?? Data()
+            let body = buffer.isEmpty ? nil : String(data: buffer, encoding: .utf8)
+            throw GeminiError.http(status: http.statusCode, body: body)
         }
     }
 
@@ -214,11 +255,19 @@ private struct GeminiResponse: Decodable {
             let parts: [Part]?
         }
         let content: Content?
+        let finishReason: String?
     }
     let candidates: [Candidate]?
 
     var firstText: String? {
         candidates?.first?.content?.parts?.compactMap(\.text).joined()
+    }
+
+    /// Raw `finishReason` string from the first candidate (we don't fan out beyond
+    /// candidate 0 since our generation config never asks for multiple). Decoded
+    /// as a free-form string so unknown values fall through to `.other`.
+    var firstFinishReason: String? {
+        candidates?.first?.finishReason
     }
 }
 
@@ -237,6 +286,10 @@ enum GeminiError: LocalizedError {
                 return "Gemini rate limit hit (HTTP 429). Free-tier quotas are tight; wait ~30s, switch to gemini-2.0-flash-lite in Settings, or add billing to your Google AI Studio key.\(suffix)"
             case 400:
                 return "Gemini rejected the request (HTTP 400)\(body.map { ": \($0)" } ?? "")"
+            case 404:
+                let detail = body.flatMap { extractMessage(from: $0) } ?? ""
+                let suffix = detail.isEmpty ? "" : " — \(detail)"
+                return "Gemini model not found (HTTP 404). The selected model isn't available on this API key — pick a different model in Settings (e.g. gemini-2.5-flash or gemini-2.0-flash).\(suffix)"
             case 500..<600:
                 return "Gemini server error (HTTP \(status)). Usually transient — retry in a moment."
             default:

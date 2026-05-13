@@ -73,14 +73,52 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Default version from Project.yml if unspecified.
+# --- Default version: bump patch off the latest published release ---------
+# When the caller omits --version, we auto-pick "last released version + 0.0.1"
+# so back-to-back releases don't accidentally re-publish the same tag. Source
+# of truth, in order: GitHub Releases (canonical), local git tags (offline
+# fallback), then Project.yml as a last resort. The Project.yml fallback is
+# only hit when both gh and git tags are unavailable (e.g. fresh checkout
+# with no remote auth) — it will keep the script working but you'll need to
+# bump Project.yml manually to avoid clobbering.
+bump_patch() {
+  local v="${1#v}"
+  if [[ ! "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then return 1; fi
+  echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
+}
+
+latest_released_version() {
+  local tag=""
+  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+    tag="$(gh release list --limit 50 --json tagName -q '.[].tagName' 2>/dev/null \
+      | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sed 's/^v//' \
+      | sort -V \
+      | tail -1)"
+  fi
+  if [[ -z "$tag" ]]; then
+    tag="$(git tag --list 'v*' --sort=-v:refname 2>/dev/null \
+      | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sed 's/^v//' \
+      | head -1)"
+  fi
+  [[ -n "$tag" ]] && echo "$tag"
+}
+
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(awk '/CFBundleShortVersionString/ { gsub(/"/, "", $2); print $2; exit }' Project.yml || true)"
+  LAST_RELEASED="$(latest_released_version || true)"
+  if [[ -n "$LAST_RELEASED" ]] && NEXT="$(bump_patch "$LAST_RELEASED")"; then
+    VERSION="$NEXT"
+    echo "Auto-selected version $VERSION (last released: $LAST_RELEASED)"
+  else
+    VERSION="$(awk '/CFBundleShortVersionString/ { gsub(/"/, "", $2); print $2; exit }' Project.yml || true)"
+    [[ -n "$VERSION" ]] && echo "No prior release found; falling back to Project.yml version $VERSION"
+  fi
 fi
 VERSION="${VERSION#v}"  # strip leading v if present
 
 if [[ -z "$VERSION" ]]; then
-  echo "Error: no version supplied and Project.yml has no CFBundleShortVersionString." >&2
+  echo "Error: no version supplied, no prior release found, and Project.yml has no CFBundleShortVersionString." >&2
   usage >&2
   exit 1
 fi

@@ -49,7 +49,7 @@ final class SessionsViewModel: ObservableObject {
 
 @MainActor
 final class SessionsWindowController: NSWindowController {
-    init(viewModel: SessionsViewModel) {
+    init(viewModel: SessionsViewModel, globalContext: GlobalContextStore) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 580),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -58,9 +58,17 @@ final class SessionsWindowController: NSWindowController {
         )
         window.title = "Whisper Pilot"
         window.titlebarAppearsTransparent = true
+        // Force a fully opaque, solid window background. The SwiftUI `.windowBackground`
+        // shape style and the `titlebarAppearsTransparent + fullSizeContentView` combo
+        // can otherwise allow the desktop / wallpaper underneath to bleed through,
+        // which destroys text contrast over busy backgrounds. We pin both layers (the
+        // AppKit window and the SwiftUI root) to a solid system color so the only
+        // thing behind the text is a known, opaque surface.
+        window.isOpaque = true
+        window.backgroundColor = NSColor.windowBackgroundColor
         window.center()
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: SessionsView(vm: viewModel))
+        window.contentView = NSHostingView(rootView: SessionsView(vm: viewModel, globalContext: globalContext))
         super.init(window: window)
     }
 
@@ -69,6 +77,7 @@ final class SessionsWindowController: NSWindowController {
 
 struct SessionsView: View {
     @ObservedObject var vm: SessionsViewModel
+    @ObservedObject var globalContext: GlobalContextStore
     @State private var hoveredSessionID: SessionID?
     @State private var sessionPendingDeletion: SessionMeta?
 
@@ -78,6 +87,7 @@ struct SessionsView: View {
             Divider().opacity(0.4)
             ScrollView {
                 VStack(alignment: .leading, spacing: WP.Space.xl) {
+                    globalContextSection
                     newSessionSection
                     historySection
                 }
@@ -86,7 +96,11 @@ struct SessionsView: View {
             }
         }
         .frame(minWidth: 640, minHeight: 480)
-        .background(.windowBackground)
+        // Solid system colour rather than the `.windowBackground` material — the
+        // material can pick up colour from anything behind the window (translucent
+        // titlebar, accessibility "reduce transparency" off, etc.), which hurt text
+        // contrast over colourful desktops.
+        .background(Color(nsColor: .windowBackgroundColor))
         .task { await vm.refresh() }
         .alert(
             "Delete session?",
@@ -135,7 +149,48 @@ struct SessionsView: View {
         }
         .padding(.horizontal, 24)
         .padding(.vertical, WP.Space.md + 2)
-        .background(.bar)
+        // `.bar` is a translucent material that pulls colour from whatever's behind
+        // the window. Use a solid, slightly-different system colour so the header
+        // still reads as a distinct band from the scroll area without leaking the
+        // desktop colour through.
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    /// App-wide context that gets injected into every session's AI prompt. Same
+    /// component as the per-session dropdown — only the binding target differs —
+    /// with a warning surfaced *inside* the expanded panel where users are about
+    /// to type, since this is where they'll make the cost mistake.
+    private var globalContextSection: some View {
+        VStack(alignment: .leading, spacing: WP.Space.md) {
+            SectionHeader(
+                title: "Global context",
+                subtitle: "Applied to every session. Use sparingly — see the warning inside."
+            )
+            ContextDropdown(
+                context: $globalContext.context,
+                title: "Global context",
+                notice: AnyView(
+                    HStack(alignment: .top, spacing: WP.Space.xs) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                        Text("This text and these files are sent with **every** AI prompt across **every** session. Be conservative — more context means higher token cost per call and slower responses. Only add things every conversation truly needs (e.g. your name, role, common terminology). Use per-session context inside a session for anything specific to that conversation.")
+                            .font(WP.TextStyle.micro)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(WP.Space.xs)
+                    .background(
+                        RoundedRectangle(cornerRadius: WP.Radius.sm, style: .continuous)
+                            .fill(Color.orange.opacity(0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: WP.Radius.sm, style: .continuous)
+                            .strokeBorder(Color.orange.opacity(0.25), lineWidth: 0.5)
+                    )
+                )
+            )
+        }
     }
 
     private var newSessionSection: some View {

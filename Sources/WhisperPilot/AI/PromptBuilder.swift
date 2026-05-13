@@ -26,24 +26,6 @@ enum PromptBuilder {
         )
     }
 
-    /// Triggered by the periodic auto-send timer. Asks for a brief recap + a useful next question.
-    static func buildAutoSend(context: ConversationSnapshot, history: [ChatTurn], style: ResponseStyle) -> Prompt {
-        let system = """
-        You are an ambient real-time copilot. The user has set you to summarize periodically. \
-        Give 2-3 short bullet observations about what's happened recently and one concrete \
-        follow-up question or talking point the user could raise. Be terse. \
-        If the prior chat below shows you've already covered something, don't repeat it.
-
-        Style: \(style.rawValue) — \(style.description)
-        """
-        return Prompt(
-            systemInstruction: system,
-            context: contextBlock(transcript: context, history: history),
-            question: "Periodic check-in. Summarize the last minute and propose one useful follow-up.",
-            style: style
-        )
-    }
-
     /// Triggered when the user types a prompt in the composer. The transcript AND the prior
     /// chat are both included so multi-turn references ("translate that", "explain more",
     /// "what did they say about X") resolve naturally.
@@ -79,8 +61,52 @@ enum PromptBuilder {
         )
     }
 
+    /// Triggered by the "Help AI" button. The user thinks there's an unanswered question
+    /// in the recent transcript that the auto-detector missed. We hand the model the
+    /// same full context as a normal user query but instruct it to *find* the question
+    /// itself rather than receiving one pre-extracted from the transcript.
+    static func buildHelpAI(context: ConversationSnapshot, history: [ChatTurn], style: ResponseStyle) -> Prompt {
+        let system = """
+        You are an ambient real-time copilot. The user pressed "Help AI" because they think \
+        there's an unanswered question in the recent transcript that they could use help with.
+
+        Your job:
+        1. Find the most recent question directed at the user in the live meeting transcript \
+           below. Lines from "Other" are the most common source. The question may not end \
+           with a question mark — recognize implicit asks ("walk me through...", "tell me \
+           about...", "so why did you...").
+        2. Answer that question concisely, using the full conversation as context.
+        3. If you genuinely cannot find a question, say so in one short line and instead \
+           offer a brief summary of what was just discussed or a useful follow-up the user \
+           could raise.
+
+        Lead with the answer. Do not preface with "I found the question:" — the user already \
+        sees, via a separate UI element, that they triggered this. Just answer.
+
+        Style: \(style.rawValue) — \(style.description)
+        """
+        return Prompt(
+            systemInstruction: system,
+            context: contextBlock(transcript: context, history: history),
+            question: "Identify and answer the most recent unanswered question in the transcript.",
+            style: style
+        )
+    }
+
     private static func contextBlock(transcript: ConversationSnapshot, history: [ChatTurn]) -> String {
         var sections: [String] = []
+
+        // Global context (applies to every session) goes first as the broadest
+        // background, then session context (specific to this conversation) layers
+        // on top. Both are explicitly user-attached, so the model should treat them
+        // as authoritative when answering things like "based on my notes" / "what
+        // does the attached file say about X".
+        if let globalContext = transcript.globalContextBlock {
+            sections.append("Global context provided by the user (applies to every session):\n\(globalContext)")
+        }
+        if let sessionContext = transcript.sessionContextBlock {
+            sections.append("Session context provided by the user (specific to this session):\n\(sessionContext)")
+        }
 
         if let priorTranscript = transcript.priorTranscriptMarkdown {
             sections.append("Prior session transcript (resumed):\n\(priorTranscript)")

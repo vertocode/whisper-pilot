@@ -18,7 +18,10 @@ struct SettingsView: View {
                 overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
             }
         }
-        .frame(minWidth: 560, idealWidth: 620, minHeight: 480, idealHeight: 520)
+        // Sized so all six tabs fit on a single row — narrower windows collapse the
+        // trailing tabs behind a `>>` overflow chevron, which hides the AI Provider /
+        // Capture / Overlay panes behind an extra click.
+        .frame(minWidth: 820, idealWidth: 880, minHeight: 480, idealHeight: 520)
         .padding(WP.Space.md)
         .onAppear {
             apiKeyDraft = store.geminiAPIKey ?? ""
@@ -69,15 +72,6 @@ struct SettingsView: View {
             }
 
             Section {
-                Picker("Auto-send to AI", selection: $store.autoSendInterval) {
-                    ForEach(AutoSendInterval.allCases, id: \.self) { interval in
-                        Text(interval.displayName).tag(interval)
-                    }
-                }
-                FormHint("When AI is active and this is on, the assistant proactively summarizes the recent conversation at the chosen interval. Question detection still fires independently.")
-            }
-
-            Section {
                 Picker("Transcript line break", selection: $store.utteranceBoundary) {
                     ForEach(UtteranceBoundary.allCases, id: \.self) { boundary in
                         Text(boundary.displayName).tag(boundary)
@@ -97,10 +91,8 @@ struct SettingsView: View {
     private var aiBehaviorTab: some View {
         Form {
             Section("Automatic AI calls") {
-                Toggle("Periodic auto-send", isOn: $store.autoSendEnabled)
-                FormHint("Master switch for the recurring summary timer. When off, the interval below has no effect and the AI never calls itself on a schedule — only your composer messages and detected questions can trigger a response.")
                 Toggle("Auto-answer detected questions", isOn: $store.autoDetectQuestionsEnabled)
-                FormHint("When on, sentences in the transcript that look like questions automatically fire an AI call. Turn off to stop the model from chiming in on its own; you can still send manually.")
+                FormHint("When on, sentences in the transcript that look like questions automatically fire an AI call. Turn off to stop the model from chiming in on its own; you can still send manually or use the Help AI button.")
             }
 
             Section("Prompt context") {
@@ -185,11 +177,12 @@ struct SettingsView: View {
                 }
 
                 Picker("Model", selection: $store.geminiModel) {
-                    Text("gemini-2.0-flash").tag("gemini-2.0-flash")
-                    Text("gemini-2.0-flash-lite").tag("gemini-2.0-flash-lite")
                     Text("gemini-2.5-flash").tag("gemini-2.5-flash")
+                    Text("gemini-2.0-flash-lite").tag("gemini-2.0-flash-lite")
                     Text("gemini-2.5-pro").tag("gemini-2.5-pro")
+                    Text("gemini-2.0-flash (legacy)").tag("gemini-2.0-flash")
                 }
+                FormHint("If the selected model returns a 404, Whisper Pilot will auto-switch to a working one and retry. `gemini-2.0-flash` was retired for new Google AI Studio keys — pick `gemini-2.5-flash` unless you specifically need a different model.")
 
                 HStack(spacing: WP.Space.xs) {
                     Image(systemName: "lock.fill")

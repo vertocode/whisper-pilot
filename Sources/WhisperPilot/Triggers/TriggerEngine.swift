@@ -21,7 +21,12 @@ actor TriggerEngine {
     private let detector = QuestionDetector()
     private let threshold: Double = 0.6
     private let cooldown: TimeInterval = 8
-    private let pauseRequirement: TimeInterval = 0.7
+    /// How long the system audio must be quiet after a candidate question before we
+    /// fire. Kept short (was 0.7) because the prior latency was dominated by SFSpeech
+    /// taking many seconds to finalize, not by the pause check — once we accept
+    /// non-final segments, the pause is the only thing holding us back, and a longer
+    /// pause just delays the response without filtering out anything meaningful.
+    private let pauseRequirement: TimeInterval = 0.35
 
     private var lastFireAt: Date = .distantPast
     private var lastFiredText: String = ""
@@ -53,9 +58,15 @@ actor TriggerEngine {
     }
 
     func consider(segment: TranscriptSegment) {
-        guard segment.channel == .system, segment.isFinal else { return }
+        // Accept non-final segments. SFSpeech's `.auto` boundary mode often holds
+        // back finalization for tens of seconds; by then the speaker has long moved
+        // on and our "real-time" copilot has missed the moment. Partials are stable
+        // enough at speech-end (VAD pause) to score on. attemptFire still gates on
+        // the post-utterance pause, so the partial we react to is whatever the
+        // recognizer's best hypothesis was when the speaker actually stopped.
+        guard segment.channel == .system else { return }
         let score = detector.score(segment)
-        triggerLog.debug("Considered segment (score=\(score, privacy: .public)): \"\(segment.text, privacy: .public)\"")
+        triggerLog.debug("Considered segment (final=\(segment.isFinal, privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .public)\"")
         guard score >= threshold else { return }
         triggerLog.info("Pending candidate (score=\(score, privacy: .public)): \"\(segment.text, privacy: .public)\"")
         pendingCandidate = segment

@@ -15,6 +15,10 @@ final class AppCoordinator {
     let settings = SettingsStore()
     let permissions = PermissionsManager()
     let overlayState = OverlayState()
+    /// App-wide context appended to every prompt regardless of session. Exposed for
+    /// the Sessions home page to bind its `ContextDropdown` against. Persisted to
+    /// `<App Support>/<bundle>/global-context.json` independently of any session.
+    let globalContext = GlobalContextStore()
 
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "Coordinator")
 
@@ -32,9 +36,28 @@ final class AppCoordinator {
 
     private var transcriber: TranscriptionProvider?
     private var aiProvider: AIProvider?
+    /// Model the active `aiProvider` was built with. Used to detect drift when the user
+    /// changes the model in Settings (provider needs rebuilding) and to know what to
+    /// migrate *away from* during a 404 auto-fallback.
+    private var aiProviderModel: String?
+
+    /// Fallback chain used when a model 404s mid-call (typically because Google retired
+    /// it for new keys). We try the first entry that isn't the currently-failing model.
+    /// Order is cheap-first so the auto-migration lands on the closest-equivalent option.
+    private static let aiFallbackChain: [String] = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-pro",
+    ]
 
     private var consumerTasks: [Task<Void, Never>] = []
-    private var inFlightCompletion: Task<Void, Never>?
+    /// Currently-streaming AI completions, keyed by the assistant message ID they
+    /// render into. Tracked as a dictionary (not a single slot) because a follow-up
+    /// detected question can arrive while the answer to the previous one is still
+    /// streaming — and silently cancelling the in-flight reply produced the
+    /// "responses cut mid-sentence" bug. Each completion finishes independently;
+    /// `stopListening` cancels the whole set.
+    private var inFlightCompletions: [UUID: Task<Void, Never>] = [:]
     /// IDs of currently-displayed watchdog warnings, so we can dismiss them when the
     /// underlying problem resolves itself (e.g. audio frames start flowing).
     private var noFramesWarningID: UUID?
@@ -46,10 +69,19 @@ final class AppCoordinator {
     private var pendingBoundaryTasks: [AudioChannel: Task<Void, Never>] = [:]
     private var settingsObserver: AnyCancellable?
     private var pausedObserver: AnyCancellable?
-    private var intervalObserver: AnyCancellable?
-    private var autoSendEnabledObserver: AnyCancellable?
-    private var autoSendTimer: Timer?
-    private var lastAutoSendTranscriptCount: Int = 0
+    /// Subscribes to `overlayState.$sessionContext` and schedules a debounced save.
+    /// Manual debouncing rather than Combine's `.debounce` because the latter reads
+    /// `currentSession?.id` at fire time, which lets a fast session switch route
+    /// session A's pending save into session B's file. This sink instead captures
+    /// the session ID synchronously per-emission via `scheduleContextSave`.
+    private var sessionContextSaver: AnyCancellable?
+    /// In-flight debounced save for the session context. Holding the session ID
+    /// alongside the value means switching sessions can flush this to the correct
+    /// file (the *old* one) before swapping `currentSession`.
+    private var pendingContextSave: (id: SessionID, value: SessionContext, work: DispatchWorkItem)?
+    /// Set during `openSession` so the just-loaded context value doesn't immediately
+    /// schedule a write back (it would be a no-op, but avoids triggering touches).
+    private var isLoadingSessionContext: Bool = false
 
     private(set) var isRunning = false
     /// Set for the duration of `startListening`. Prevents the user from double-clicking
@@ -63,26 +95,71 @@ final class AppCoordinator {
         // before/without ever clicking ▶ Play. AI prompts are independent of listening.
         if let key = settings.geminiAPIKey, !key.isEmpty {
             aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
+            aiProviderModel = settings.geminiModel
         }
 
         settingsObserver = settings.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in self?.refreshDerivedState() }
         }
 
-        intervalObserver = settings.$autoSendInterval
-            .removeDuplicates()
-            .sink { [weak self] _ in self?.restartAutoSendTimer() }
-
-        autoSendEnabledObserver = settings.$autoSendEnabled
-            .removeDuplicates()
-            .sink { [weak self] _ in self?.restartAutoSendTimer() }
-
         pausedObserver = overlayState.$isAIPaused
             .removeDuplicates()
-            .sink { [weak self] _ in
+            .sink { _ in
                 // The toggle button itself is the visual indicator — no system note needed.
-                self?.restartAutoSendTimer()
             }
+
+        sessionContextSaver = overlayState.$sessionContext
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] (context: SessionContext) in
+                self?.scheduleContextSave(context)
+            }
+    }
+
+    /// Debounces saves of the session context to disk so typing bursts don't
+    /// generate per-keystroke writes. Crucially, the target session ID is captured
+    /// here at scheduling time, not at fire time — without that, a session switch
+    /// during the debounce window would write the wrong session's content into the
+    /// new session's `context.json`.
+    private func scheduleContextSave(_ value: SessionContext) {
+        if isLoadingSessionContext { return }
+        guard let id = currentSession?.id else { return }
+
+        if let pending = pendingContextSave {
+            if pending.id == id {
+                // Same session — just re-arm the timer with the latest value.
+                pending.work.cancel()
+            } else {
+                // Different session somehow already has a pending save (race with
+                // useSession). Flush it to its *captured* session before scheduling
+                // the new one, so we never lose content or cross-write files.
+                pending.work.cancel()
+                let toSave = pending.value
+                let oldID = pending.id
+                Task { await SessionStore.shared.saveContext(toSave, to: oldID) }
+            }
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let pending = self.pendingContextSave else { return }
+            let toSave = pending.value
+            let targetID = pending.id
+            self.pendingContextSave = nil
+            Task { await SessionStore.shared.saveContext(toSave, to: targetID) }
+        }
+        pendingContextSave = (id: id, value: value, work: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    /// Cancels any pending debounced save and writes its value to the session it
+    /// was *captured for* — synchronously awaiting the save before returning so a
+    /// caller about to swap `currentSession` knows the old session's content is
+    /// safely on disk first.
+    private func flushPendingContextSave() async {
+        guard let pending = pendingContextSave else { return }
+        pending.work.cancel()
+        pendingContextSave = nil
+        await SessionStore.shared.saveContext(pending.value, to: pending.id)
     }
 
     func bootstrap() async {
@@ -96,6 +173,11 @@ final class AppCoordinator {
     func shutdown() async {
         log.info("Shutdown")
         await stopListening()
+        // The session context flush already happens inside `stopListening`. Global
+        // context lives outside of any session, so make sure its in-flight debounce
+        // is drained too — otherwise the last edit in the Sessions home page can
+        // vanish when the app terminates mid-debounce.
+        await globalContext.flush()
     }
 
     private func refreshDerivedState() {
@@ -103,11 +185,16 @@ final class AppCoordinator {
         // not we're actively listening — composer prompts work independently.
         let key = settings.geminiAPIKey ?? ""
         if !key.isEmpty {
-            if aiProvider == nil {
+            // Rebuild the provider when either the key changes (provider absent) or the
+            // user picks a different model in Settings. Without the model check, switching
+            // models in Settings had no effect until the next app launch.
+            if aiProvider == nil || aiProviderModel != settings.geminiModel {
                 aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
+                aiProviderModel = settings.geminiModel
             }
         } else if aiProvider != nil {
             aiProvider = nil
+            aiProviderModel = nil
             overlayState.appendSystemNote("ℹ️ Gemini key removed. Transcription still running; AI features disabled.", category: .general)
         }
 
@@ -244,7 +331,6 @@ final class AppCoordinator {
         }
 
         startPipeline(transcriber: transcriber, ai: aiProvider)
-        restartAutoSendTimer()
 
         isRunning = true
         // Keep status as `.starting` here — the mixer-output consumer flips it to
@@ -312,10 +398,11 @@ final class AppCoordinator {
         consumerTasks.removeAll()
         for task in pendingBoundaryTasks.values { task.cancel() }
         pendingBoundaryTasks.removeAll()
-        inFlightCompletion?.cancel()
-        inFlightCompletion = nil
-        autoSendTimer?.invalidate()
-        autoSendTimer = nil
+        for task in inFlightCompletions.values { task.cancel() }
+        inFlightCompletions.removeAll()
+        // Persist any in-flight context edit before tearing the session down so the
+        // last few keystrokes of the user's notes don't disappear on stop.
+        await flushPendingContextSave()
 
         if let stop = processTapStop {
             stop()
@@ -354,6 +441,13 @@ final class AppCoordinator {
         // running with whatever is already loaded.
         if currentSession?.id == session.id { return }
 
+        // Flush any debounced session-context save BEFORE swapping `currentSession`.
+        // Without this, a fast switch from A→B after typing in A would either lose
+        // A's edit (if the debounce gets reset by the load-emission for B) or
+        // worse, write A's content into B's file. The flush captures the *old*
+        // session's ID from the pending save record itself.
+        await flushPendingContextSave()
+
         currentSession = session
         overlayState.transcript = []
         overlayState.clearChat()
@@ -361,6 +455,15 @@ final class AppCoordinator {
         overlayState.audioFrameCount = 0
         await transcriptBuffer.clear()
         await context.reset()
+
+        // Hydrate the session-level context (user notes + attached files) from disk.
+        // `isLoadingSessionContext` suppresses the debounced saver so the load itself
+        // doesn't trigger a write back. Always set the published value, even when the
+        // loaded context is empty, so the dropdown reflects the new session cleanly.
+        let loadedContext = await SessionStore.shared.loadContext(session.id)
+        isLoadingSessionContext = true
+        overlayState.sessionContext = loadedContext
+        isLoadingSessionContext = false
 
         if resumed {
             let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
@@ -410,6 +513,36 @@ final class AppCoordinator {
                 }
             }
             await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
+        }
+    }
+
+    /// "Help AI" button: the user thinks there's an unanswered question in the recent
+    /// transcript that the auto-detector missed. We don't pre-extract the question
+    /// (the heuristic is what failed in the first place); instead we hand the model
+    /// the same context block a user prompt would get and instruct it to find the
+    /// question on its own. Honored even when AI is paused — it's an explicit manual
+    /// invocation, like the composer.
+    func requestHelpAI() {
+        guard let ai = aiProvider else {
+            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            return
+        }
+        overlayState.appendAutoTriggerPreamble(
+            origin: .helpAI,
+            text: "Scanning recent transcript for a question…"
+        )
+        overlayState.status = .thinking
+        wpInfo("[Coordinator] Help AI requested")
+        let history = chatHistorySnapshot(excludingLast: false)
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await self.context.snapshotWithPrior()
+            let prompt = PromptBuilder.buildHelpAI(
+                context: self.filteredSnapshot(snapshot),
+                history: self.filteredHistory(history),
+                style: self.settings.responseStyle
+            )
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .helpAI)
         }
     }
 
@@ -904,6 +1037,22 @@ final class AppCoordinator {
             var transcriptsSeen = 0
             for await update in transcriber.transcripts {
                 await buffer.apply(update)
+                // Feed every system-channel partial straight to the trigger engine so
+                // `pendingCandidate` is kept fresh as the recognizer hypothesizes. By
+                // the time VAD reports speech-end, the latest text is already scored
+                // and ready to fire — no waiting for finalization, which is what made
+                // detected questions arrive 30s late.
+                if update.channel == .system {
+                    let liveSegment = TranscriptSegment(
+                        id: update.id,
+                        text: update.text,
+                        isFinal: update.isFinal,
+                        channel: update.channel,
+                        startedAt: update.timestamp,
+                        updatedAt: update.timestamp
+                    )
+                    await engine.consider(segment: liveSegment)
+                }
                 // The display always shows every transcript line; only AI context
                 // absorption is gated. With `includeSystemAudioInPrompt` off, the
                 // user still sees what "Other" said but the model doesn't, which
@@ -960,6 +1109,11 @@ final class AppCoordinator {
                     continue
                 }
                 self.log.info("→ Trigger fired, building prompt")
+                // Surface the detected question as a user-style bubble in the AI pane so
+                // the user can see *what* the detector picked up — without this, a fired
+                // trigger only shows up as an unlabeled assistant reply, and a failed call
+                // shows up as nothing at all.
+                self.overlayState.appendAutoTriggerPreamble(origin: .detectedQuestion, text: trigger.text)
                 self.overlayState.status = .thinking
                 let snapshot = await self.context.snapshotWithPrior()
                 let style = self.settings.responseStyle
@@ -998,27 +1152,51 @@ final class AppCoordinator {
             }
         }
 
-        if let last = await transcriptBuffer.lastFinalized() {
+        // Hand the most recent segment on the system channel to the trigger engine
+        // regardless of finalization state — `.auto` SFSpeech mode can delay
+        // finalization by tens of seconds, and we want the trigger to fire on the
+        // post-utterance VAD pause, not on the eventual finalize.
+        if let last = await transcriptBuffer.lastSegment(on: .system) {
             await triggerEngine.consider(segment: last)
         }
     }
 
-    private func runCompletion(prompt: Prompt, ai: AIProvider, origin: ChatMessage.Origin) async {
-        inFlightCompletion?.cancel()
+    private func runCompletion(prompt: Prompt, ai: AIProvider, origin: ChatMessage.Origin, hasAttemptedFallback: Bool = false) async {
+        // Reserve the assistant bubble + register the task BEFORE starting the stream
+        // so concurrent completions each have their own slot in `inFlightCompletions`
+        // and their own message ID. Multiple completions can stream in parallel —
+        // this is intentional: a follow-up detected question shouldn't cut off the
+        // previous answer.
+        let messageId = overlayState.beginAssistantStream(origin: origin)
+        overlayState.status = .streaming
         let task = Task { [weak self] in
             guard let self else { return }
-            let messageId = self.overlayState.beginAssistantStream(origin: origin)
-            self.overlayState.status = .streaming
             do {
                 var deltaCount = 0
-                for try await delta in ai.streamCompletion(prompt: prompt) {
+                // If the provider never sends a `.finish(reason)`, the stream
+                // ended without a clean terminal event — treat that as an unknown
+                // / dropped-connection finish so the user gets a diagnostic note
+                // instead of a silently-truncated bubble.
+                var finishReason: AIFinishReason = .other(nil)
+                for try await event in ai.streamCompletion(prompt: prompt) {
                     if Task.isCancelled { break }
-                    deltaCount += 1
-                    self.overlayState.appendDelta(to: messageId, delta)
+                    switch event {
+                    case .delta(let text):
+                        deltaCount += 1
+                        self.overlayState.appendDelta(to: messageId, text)
+                    case .finish(let reason):
+                        finishReason = reason
+                    }
                 }
-                self.log.info("Stream complete (\(deltaCount) deltas)")
+                self.log.info("Stream complete (\(deltaCount) deltas, reason=\(String(describing: finishReason), privacy: .public))")
                 self.overlayState.finishAssistant(id: messageId)
-                self.overlayState.status = .listening
+                if let diagnostic = finishReason.diagnosticMessage {
+                    // Non-clean finishes are loud failures the user needs to know
+                    // about — otherwise a MAX_TOKENS cut looks like a model that
+                    // just stopped mid-thought for no reason.
+                    self.overlayState.appendSystemNote("⚠️ AI reply was incomplete — \(diagnostic).", category: .ai)
+                    wpWarn("AI stream finished with non-stop reason: \(diagnostic)")
+                }
                 if let finalText = self.overlayState.messages.first(where: { $0.id == messageId })?.text,
                    !finalText.isEmpty {
                     self.persistChatTurn(role: "Assistant", text: finalText)
@@ -1026,60 +1204,66 @@ final class AppCoordinator {
             } catch is CancellationError {
                 self.overlayState.finishAssistant(id: messageId)
             } catch {
+                // 404 means the selected model isn't reachable on this key — almost always
+                // because Google retired it for new users (e.g. `gemini-2.0-flash`). Try
+                // the next entry in the fallback chain once before surfacing the error.
+                if !hasAttemptedFallback,
+                   case let GeminiError.http(status, _) = error,
+                   status == 404,
+                   let (fromModel, newAI) = self.migrateToFallbackModel() {
+                    self.overlayState.finishAssistant(id: messageId)
+                    let note = "ℹ️ Model \(fromModel) is unavailable on your API key. Auto-switched to \(self.settings.geminiModel) and retrying."
+                    self.overlayState.appendSystemNote(note, category: .ai)
+                    wpInfo("AI model fallback: \(fromModel) → \(self.settings.geminiModel)")
+                    // Drop this task from the in-flight map BEFORE recursing — the
+                    // recursive call registers its own new entry, and we don't want
+                    // the outer cleanup-on-exit below to fire twice for one logical
+                    // request.
+                    self.inFlightCompletions[messageId] = nil
+                    await self.runCompletion(prompt: prompt, ai: newAI, origin: origin, hasAttemptedFallback: true)
+                    return
+                }
                 let message = error.localizedDescription
                 wpError("AI stream failed: \(message)")
                 self.overlayState.finishAssistant(id: messageId)
-                self.overlayState.status = .error(message)
                 self.overlayState.appendSystemNote("⚠️ \(message)", category: .ai)
             }
+            self.completionFinished(messageId: messageId)
         }
-        inFlightCompletion = task
+        inFlightCompletions[messageId] = task
         await task.value
     }
 
-    // MARK: - Auto-send
-
-    private func restartAutoSendTimer() {
-        autoSendTimer?.invalidate()
-        autoSendTimer = nil
-        // `autoSendEnabled` is the master switch (Settings → AI Behavior). When off
-        // we never schedule the timer regardless of which interval the user picked,
-        // so flipping it off mid-session immediately stops periodic summaries.
-        guard isRunning,
-              !overlayState.isAIPaused,
-              settings.autoSendEnabled,
-              let interval = settings.autoSendInterval.seconds else { return }
-        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.runAutoSend() }
+    /// Called by every non-fallback exit path of `runCompletion`. Removes the task
+    /// from the in-flight map and, only when nothing else is still streaming, flips
+    /// the status pill back to `.listening` (or `.idle` if we've been stopped in
+    /// the meantime). With concurrent completions, we can't just unconditionally
+    /// flip after each one — that would prematurely declare "done" while another
+    /// stream is still arriving.
+    private func completionFinished(messageId: UUID) {
+        inFlightCompletions[messageId] = nil
+        guard inFlightCompletions.isEmpty else { return }
+        switch overlayState.status {
+        case .streaming, .thinking, .error:
+            overlayState.status = isRunning ? .listening : .idle
+        default:
+            break
         }
-        RunLoop.main.add(timer, forMode: .common)
-        autoSendTimer = timer
-        lastAutoSendTranscriptCount = overlayState.transcriptCount
-        wpInfo("[Coordinator] auto-send timer scheduled every \(interval)s")
     }
 
-    private func runAutoSend() {
-        guard isRunning, !overlayState.isAIPaused else { return }
-        guard let ai = aiProvider else { return }
-        // Skip the tick if no new transcript content has accumulated since the last send.
-        let currentCount = overlayState.transcriptCount
-        if currentCount <= lastAutoSendTranscriptCount {
-            wpInfo("[Coordinator] auto-send tick skipped — no new transcripts since last send")
-            return
-        }
-        lastAutoSendTranscriptCount = currentCount
-        wpInfo("[Coordinator] auto-send tick firing")
-        Task { [weak self] in
-            guard let self else { return }
-            let snapshot = await self.context.snapshotWithPrior()
-            let history = self.chatHistorySnapshot(excludingLast: false)
-            let prompt = PromptBuilder.buildAutoSend(
-                context: self.filteredSnapshot(snapshot),
-                history: self.filteredHistory(history),
-                style: self.settings.responseStyle
-            )
-            await self.runCompletion(prompt: prompt, ai: ai, origin: .autoSend)
-        }
+    /// Picks the next model from `aiFallbackChain` that isn't the currently-failing one,
+    /// updates `settings.geminiModel` (so Settings UI reflects the migration and the
+    /// choice persists), and rebuilds `aiProvider`. Returns `(oldModel, newProvider)` or
+    /// `nil` if no API key is configured.
+    private func migrateToFallbackModel() -> (String, AIProvider)? {
+        guard let key = settings.geminiAPIKey, !key.isEmpty else { return nil }
+        let current = settings.geminiModel
+        guard let next = Self.aiFallbackChain.first(where: { $0 != current }) else { return nil }
+        settings.geminiModel = next
+        let provider = GeminiProvider(apiKey: key, model: next)
+        aiProvider = provider
+        aiProviderModel = next
+        return (current, provider)
     }
 
     // MARK: - AI prompt filtering
@@ -1094,12 +1278,20 @@ final class AppCoordinator {
     private func filteredSnapshot(_ snapshot: ConversationSnapshot) -> ConversationSnapshot {
         let includeT = settings.includeTranscriptInPrompt
         let includeH = settings.includeChatHistoryInPrompt
+        // The session context block (user notes + attached files) isn't gated by any
+        // toggle — it's an explicit choice the user made to attach this material, so
+        // they presumably want it in every prompt until they remove it.
+        var enriched = snapshot
+        enriched.sessionContextBlock = overlayState.sessionContext.promptBlock
+        enriched.globalContextBlock = globalContext.context.promptBlock
         return ConversationSnapshot(
-            recentLines: includeT ? snapshot.recentLines : [],
-            topics: includeT ? snapshot.topics : [],
-            entities: snapshot.entities,
+            recentLines: includeT ? enriched.recentLines : [],
+            topics: includeT ? enriched.topics : [],
+            entities: enriched.entities,
             priorTranscriptMarkdown: includeT ? snapshot.priorTranscriptMarkdown : nil,
-            priorChatMarkdown: includeH ? snapshot.priorChatMarkdown : nil
+            priorChatMarkdown: includeH ? snapshot.priorChatMarkdown : nil,
+            sessionContextBlock: enriched.sessionContextBlock,
+            globalContextBlock: enriched.globalContextBlock
         )
     }
 

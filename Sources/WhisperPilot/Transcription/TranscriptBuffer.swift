@@ -125,6 +125,17 @@ actor TranscriptBuffer {
         return nil
     }
 
+    /// Most recent segment on the given channel regardless of finalization state.
+    /// Used by the trigger engine so we can react to a question the *moment* the
+    /// speaker pauses, instead of waiting for SFSpeech to finalize — which with
+    /// `utteranceBoundary = .auto` can take 30+ seconds.
+    func lastSegment(on channel: AudioChannel) -> TranscriptSegment? {
+        for id in order.reversed() {
+            if let s = segments[id], s.channel == channel { return s }
+        }
+        return nil
+    }
+
     func clear() {
         segments.removeAll()
         order.removeAll()

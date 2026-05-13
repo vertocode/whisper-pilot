@@ -40,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("[WP] action.sendUserPrompt fired (\(text.count) chars, screenshot=\(withScreenshot))")
                 self?.coordinator.sendUserPrompt(text, withScreenshot: withScreenshot)
             },
+            requestHelpAI: { [weak self] in
+                print("[WP] action.requestHelpAI fired")
+                self?.coordinator.requestHelpAI()
+            },
             goToSessions: { [weak self] in
                 print("[WP] action.goToSessions fired")
                 Task { [weak self] in
@@ -80,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vm.onResume = { [weak self] meta in self?.openSession(meta, resumed: true) }
         sessionsViewModel = vm
 
-        let sessions = SessionsWindowController(viewModel: vm)
+        let sessions = SessionsWindowController(viewModel: vm, globalContext: coordinator.globalContext)
         sessionsWindow = sessions
         sessions.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)

@@ -122,6 +122,17 @@ struct SmokeTestRunner {
             let withYou = detector.score(systemSegment("How does this affect you in production?"))
             let withoutYou = detector.score(systemSegment("How does this affect production stability?"))
             await expect(withYou > withoutYou, "presence of 'you' raises score")
+
+            // Regression: filler-prefixed questions used to score below threshold because
+            // the interrogative starter ("why") was masked by the "okay, so" preamble.
+            await expect(
+                detector.score(systemSegment("Okay, so why did you choose that particular major and at that particular school?")) >= 0.6,
+                "filler-prefixed question must still clear threshold"
+            )
+            await expect(
+                detector.score(systemSegment("Yeah but how come you didn't ship the migration last week?")) >= 0.6,
+                "yeah/but-prefixed question must still clear threshold"
+            )
         }
     }
 

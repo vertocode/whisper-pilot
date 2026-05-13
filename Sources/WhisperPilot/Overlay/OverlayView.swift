@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Renders the brand logo with a graceful fallback to an SF Symbol when the asset catalog
 /// hasn't been recompiled yet.
@@ -346,6 +347,7 @@ struct OverlayView: View {
                 isAIPaused: state.isAIPaused,
                 onToggleAI: actions.toggleAIPaused,
                 onDismissMessage: actions.dismissMessage,
+                sessionContext: $state.sessionContext,
                 isCollapsed: true,
                 onToggleCollapse: { chatCollapsed.toggle() }
             )
@@ -358,6 +360,7 @@ struct OverlayView: View {
                         isAIPaused: state.isAIPaused,
                         onToggleAI: actions.toggleAIPaused,
                         onDismissMessage: actions.dismissMessage,
+                        sessionContext: $state.sessionContext,
                         isCollapsed: false,
                         onToggleCollapse: { chatCollapsed.toggle() }
                     )
@@ -518,21 +521,49 @@ struct OverlayView: View {
                 .help("Send to AI (⌘⏎)")
             }
 
-            Button(action: { includeScreenshot.toggle() }) {
-                HStack(spacing: WP.Space.xs) {
-                    Image(systemName: includeScreenshot ? "eye.fill" : "eye")
-                        .font(.system(size: 10))
-                    Text("See my screen")
-                        .font(WP.TextStyle.micro)
-                    if includeScreenshot {
-                        Text("· attached")
-                            .font(WP.TextStyle.tag)
+            HStack(spacing: WP.Space.sm) {
+                Button(action: { includeScreenshot.toggle() }) {
+                    HStack(spacing: WP.Space.xs) {
+                        Image(systemName: includeScreenshot ? "eye.fill" : "eye")
+                            .font(.system(size: 10))
+                        Text("See my screen")
+                            .font(WP.TextStyle.micro)
+                        if includeScreenshot {
+                            Text("· attached")
+                                .font(WP.TextStyle.tag)
+                        }
                     }
+                    .chip(includeScreenshot ? .accent : .neutral)
                 }
-                .chip(includeScreenshot ? .accent : .neutral)
+                .buttonStyle(.plain)
+                .help("When on, the AI receives a screenshot of your current display along with this message.")
+
+                // Manual fallback when the question detector misses a question — the AI
+                // gets the same full context but is told to *find* the unanswered question
+                // itself, then answer it. Green to read as "go / help me now" against the
+                // accent-blue submit affordance.
+                Button(action: { actions.requestHelpAI() }) {
+                    HStack(spacing: WP.Space.xs) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Help AI")
+                            .font(WP.TextStyle.micro)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(Color.green.opacity(0.18))
+                    )
+                    .overlay(
+                        Capsule().strokeBorder(Color.green.opacity(0.45), lineWidth: 0.75)
+                    )
+                    .foregroundStyle(Color.green)
+                }
+                .buttonStyle(.plain)
+                .help("Ask the AI to find any unanswered question in the recent transcript and answer it, using full context.")
+
+                Spacer(minLength: 0)
             }
-            .buttonStyle(.plain)
-            .help("When on, the AI receives a screenshot of your current display along with this message.")
         }
         .padding(.horizontal, WP.Space.md)
         .padding(.vertical, WP.Space.sm + 2)
@@ -699,6 +730,10 @@ private struct ChatLane: View {
     let isAIPaused: Bool
     let onToggleAI: () -> Void
     let onDismissMessage: (UUID) -> Void
+    /// Two-way binding to the session's user-supplied context (notes + attached
+    /// files). Edits flow through `OverlayState.sessionContext`; the coordinator
+    /// debounces saves to disk.
+    @Binding var sessionContext: SessionContext
     /// When true, only the header is rendered. Owner manages the state and
     /// passes a toggle closure so the lane can fire when its chevron is tapped.
     var isCollapsed: Bool = false
@@ -722,6 +757,8 @@ private struct ChatLane: View {
             }
 
             if !isCollapsed {
+                ContextDropdown(context: $sessionContext)
+
                 if messages.isEmpty {
                     EmptyStatePill(
                         icon: isAIPaused ? "pause.circle" : "sparkles",
@@ -861,7 +898,21 @@ private struct MessageBubble: View {
         return parsed ?? AttributedString(raw)
     }
 
+    /// User-role messages double as auto-trigger preambles when their origin is
+    /// `.detectedQuestion` or `.helpAI`. Those preambles need their own icon /
+    /// label / color so the user can tell at a glance which subsystem fired the
+    /// AI call, instead of seeing every chat row labeled "You".
+    private var isAutoDetectedQuestion: Bool {
+        message.role == .user && message.origin == .detectedQuestion
+    }
+
+    private var isHelpAIPreamble: Bool {
+        message.role == .user && message.origin == .helpAI
+    }
+
     private var roleIcon: String {
+        if isAutoDetectedQuestion { return "questionmark.bubble.fill" }
+        if isHelpAIPreamble       { return "sparkles" }
         switch message.role {
         case .user: return "person.fill"
         case .assistant: return "sparkles"
@@ -870,6 +921,8 @@ private struct MessageBubble: View {
     }
 
     private var roleLabel: String {
+        if isAutoDetectedQuestion { return "Auto-detected question" }
+        if isHelpAIPreamble       { return "Help AI" }
         switch message.role {
         case .user: return "You"
         case .assistant: return "Assistant"
@@ -878,6 +931,8 @@ private struct MessageBubble: View {
     }
 
     private var roleColor: Color {
+        if isAutoDetectedQuestion { return .orange }
+        if isHelpAIPreamble       { return .green }
         switch message.role {
         case .user: return .purple
         case .assistant: return .blue
@@ -885,15 +940,22 @@ private struct MessageBubble: View {
         }
     }
 
+    /// Suppress the trailing origin badge on the preamble bubbles — the role label
+    /// itself already says "Auto-detected question" / "Help AI", so a redundant tag
+    /// would just be visual noise. We still show it on the assistant's reply so the
+    /// user can correlate reply ↔ trigger.
     private var originBadge: String? {
+        if isAutoDetectedQuestion || isHelpAIPreamble { return nil }
         switch message.origin {
         case .detectedQuestion: return "· detected question"
-        case .autoSend: return "· auto-send"
+        case .helpAI: return "· help AI"
         case .userPrompt, .system: return nil
         }
     }
 
     private var bubbleBackground: AnyShapeStyle {
+        if isAutoDetectedQuestion { return AnyShapeStyle(Color.orange.opacity(0.08)) }
+        if isHelpAIPreamble       { return AnyShapeStyle(Color.green.opacity(0.10)) }
         switch message.role {
         case .user: return AnyShapeStyle(Color.purple.opacity(0.08))
         case .assistant: return AnyShapeStyle(Color.blue.opacity(0.07))
@@ -902,6 +964,8 @@ private struct MessageBubble: View {
     }
 
     private var bubbleStroke: Color {
+        if isAutoDetectedQuestion { return Color.orange.opacity(0.20) }
+        if isHelpAIPreamble       { return Color.green.opacity(0.25) }
         switch message.role {
         case .user: return Color.purple.opacity(0.18)
         case .assistant: return Color.blue.opacity(0.18)

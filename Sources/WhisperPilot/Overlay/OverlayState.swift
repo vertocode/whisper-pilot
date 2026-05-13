@@ -105,10 +105,12 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     enum Origin: String, Sendable {
         /// Triggered automatically by the question detector reading the transcript.
         case detectedQuestion
-        /// Periodic auto-send timer (configurable interval in Settings).
-        case autoSend
         /// User typed it in the composer.
         case userPrompt
+        /// User pressed the "Help AI" button — manual scan-and-answer of recent
+        /// transcript for an unanswered question. Acts like a typed prompt but the
+        /// model is explicitly told to identify the question itself.
+        case helpAI
         /// User-visible system note (e.g. "AI paused").
         case system
     }
@@ -158,6 +160,12 @@ final class OverlayState: ObservableObject {
     @Published var isMicrophoneMuted: Bool = false
     @Published var isSystemAudioMuted: Bool = false
 
+    /// User-supplied context for this session — free-form notes plus attached files.
+    /// Edited via the Context dropdown in the AI lane and persisted to disk by the
+    /// coordinator on every change. Surfaces in every AI prompt as authoritative
+    /// background material above the live transcript.
+    @Published var sessionContext: SessionContext = SessionContext()
+
     nonisolated let statusStream: AsyncStream<OverlayStatus>
     nonisolated private let statusContinuation: AsyncStream<OverlayStatus>.Continuation
 
@@ -174,6 +182,18 @@ final class OverlayState: ObservableObject {
     @discardableResult
     func appendUserMessage(_ text: String) -> UUID {
         let msg = ChatMessage(id: UUID(), role: .user, origin: .userPrompt, text: text, timestamp: Date(), isStreaming: false, category: .ai)
+        messages.append(msg)
+        trim()
+        return msg.id
+    }
+
+    /// Inserts a "what just fired" bubble for an auto-triggered prompt so the user can
+    /// see which question was picked up by the detector or what was asked by Help AI.
+    /// The actual AI reply still appears below it as a separate streaming assistant
+    /// bubble. Intended origins: `.detectedQuestion`, `.helpAI`.
+    @discardableResult
+    func appendAutoTriggerPreamble(origin: ChatMessage.Origin, text: String) -> UUID {
+        let msg = ChatMessage(id: UUID(), role: .user, origin: origin, text: text, timestamp: Date(), isStreaming: false, category: .ai)
         messages.append(msg)
         trim()
         return msg.id

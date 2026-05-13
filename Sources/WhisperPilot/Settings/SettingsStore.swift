@@ -47,34 +47,6 @@ enum UtteranceBoundary: String, CaseIterable, Codable, Sendable {
     }
 }
 
-enum AutoSendInterval: String, CaseIterable, Codable, Sendable {
-    case off
-    case every30s
-    case every1m
-    case every2m
-    case every5m
-
-    var seconds: TimeInterval? {
-        switch self {
-        case .off: return nil
-        case .every30s: return 30
-        case .every1m: return 60
-        case .every2m: return 120
-        case .every5m: return 300
-        }
-    }
-
-    var displayName: String {
-        switch self {
-        case .off: return "Off"
-        case .every30s: return "Every 30 seconds"
-        case .every1m: return "Every minute"
-        case .every2m: return "Every 2 minutes"
-        case .every5m: return "Every 5 minutes"
-        }
-    }
-}
-
 @MainActor
 final class SettingsStore: ObservableObject {
     private enum Keys {
@@ -85,10 +57,8 @@ final class SettingsStore: ObservableObject {
         static let clickThrough = "overlay.clickThrough"
         static let localeIdentifier = "transcription.locale"
         static let geminiAPIKey = "gemini.api_key"
-        static let autoSendInterval = "ai.autoSendInterval"
         static let microphoneDeviceUID = "capture.microphoneDeviceUID"
         static let utteranceBoundary = "transcription.utteranceBoundary"
-        static let autoSendEnabled = "ai.autoSendEnabled"
         static let autoDetectQuestionsEnabled = "ai.autoDetectQuestionsEnabled"
         static let includeTranscriptInPrompt = "ai.includeTranscriptInPrompt"
         static let includeSystemAudioInPrompt = "ai.includeSystemAudioInPrompt"
@@ -121,10 +91,6 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(localeIdentifier, forKey: Keys.localeIdentifier) }
     }
 
-    @Published var autoSendInterval: AutoSendInterval {
-        didSet { defaults.set(autoSendInterval.rawValue, forKey: Keys.autoSendInterval) }
-    }
-
     /// Stable Core Audio device UID for the chosen microphone. `nil` means "follow the
     /// system default input device".
     @Published var microphoneDeviceUID: String? {
@@ -139,13 +105,6 @@ final class SettingsStore: ObservableObject {
 
     @Published var utteranceBoundary: UtteranceBoundary {
         didSet { defaults.set(utteranceBoundary.rawValue, forKey: Keys.utteranceBoundary) }
-    }
-
-    /// Master switch for the periodic auto-send timer. When false the coordinator
-    /// never schedules the timer regardless of `autoSendInterval` — useful for users
-    /// who only want manual prompts and detected-question replies.
-    @Published var autoSendEnabled: Bool {
-        didSet { defaults.set(autoSendEnabled, forKey: Keys.autoSendEnabled) }
     }
 
     /// When true, the question detector's hits fire AI calls automatically. When
@@ -191,19 +150,17 @@ final class SettingsStore: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.geminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-2.0-flash"
+        self.geminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-2.5-flash"
         self.responseStyle = ResponseStyle(rawValue: defaults.string(forKey: Keys.responseStyle) ?? "") ?? .concise
         self.captureMicrophone = defaults.object(forKey: Keys.captureMicrophone) as? Bool ?? false
         self.alwaysOnTop = defaults.object(forKey: Keys.alwaysOnTop) as? Bool ?? true
         self.clickThrough = defaults.object(forKey: Keys.clickThrough) as? Bool ?? false
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier
-        self.autoSendInterval = AutoSendInterval(rawValue: defaults.string(forKey: Keys.autoSendInterval) ?? "") ?? .off
         self.microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
         self.utteranceBoundary = UtteranceBoundary(rawValue: defaults.string(forKey: Keys.utteranceBoundary) ?? "") ?? .auto
-        // All five AI behavior toggles default to true so the assistant works the way
-        // users expect on first launch. Existing settings persist; only fresh installs
-        // see the defaults.
-        self.autoSendEnabled = defaults.object(forKey: Keys.autoSendEnabled) as? Bool ?? true
+        // AI behavior toggles default to true so the assistant works the way users
+        // expect on first launch. Existing settings persist; only fresh installs see
+        // the defaults.
         self.autoDetectQuestionsEnabled = defaults.object(forKey: Keys.autoDetectQuestionsEnabled) as? Bool ?? true
         self.includeTranscriptInPrompt = defaults.object(forKey: Keys.includeTranscriptInPrompt) as? Bool ?? true
         self.includeSystemAudioInPrompt = defaults.object(forKey: Keys.includeSystemAudioInPrompt) as? Bool ?? true

@@ -23,7 +23,7 @@ Whisper Pilot listens to anything your Mac can hear — meetings, podcasts, tuto
 
 ## Install
 
-> **Alpha note:** the first signed release (`v0.1.0`) isn't cut yet. Until then, [build from source](docs/CONTRIBUTING.md#project-setup).
+> **Alpha note:** releases are unsigned for now, so macOS Gatekeeper will warn on first launch — see the [Direct download](#direct-download) section for the one-time unblock. Prefer to build it yourself? See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md#project-setup).
 
 ### Homebrew
 
