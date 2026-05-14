@@ -22,7 +22,12 @@ final class AppCoordinator {
 
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "Coordinator")
 
-    private let audioMixer = AudioMixer()
+    /// Recreated at every `startListening`. `AudioMixer.output` is a single-use
+    /// AsyncStream — once the previous session's consumer is cancelled, the same
+    /// stream instance no longer reliably delivers frames to a new iterator. A
+    /// fresh mixer (and therefore a fresh output stream) per session avoids the
+    /// "loads forever, transcript never starts" symptom on the second session.
+    private var audioMixer = AudioMixer()
     private let systemCapture = SystemAudioCapture()
     private let micCapture = MicrophoneCapture()
     /// When Core Audio Process Tap is in use, this stream is its output. The pipeline
@@ -32,7 +37,10 @@ final class AppCoordinator {
     private let vad = VoiceActivityDetector()
     private let transcriptBuffer = TranscriptBuffer()
     private let context = ConversationContext()
-    private let triggerEngine = TriggerEngine()
+    /// Recreated at every `startListening`, same reasoning as `audioMixer` above:
+    /// the events AsyncStream is single-use and a new pipeline needs a fresh one
+    /// so trigger events from the new session aren't lost to a dead iterator.
+    private var triggerEngine = TriggerEngine()
 
     private var transcriber: TranscriptionProvider?
     private var aiProvider: AIProvider?
@@ -62,6 +70,17 @@ final class AppCoordinator {
     /// underlying problem resolves itself (e.g. audio frames start flowing).
     private var noFramesWarningID: UUID?
     private var noTranscriptsWarningID: UUID?
+    /// IDs of two startup notes shown while status is still `.starting`. Both get
+    /// dismissed as soon as we leave `.starting` (either to `.listening` once a
+    /// frame arrives, or to `.error` if something fails). Without these the user
+    /// has no signal that a model download is in progress and they sit on a
+    /// "loading forever" spinner on first launch.
+    private var slowStartupNoteID: UUID?
+    private var stuckStartupNoteID: UUID?
+    /// ID of the "Transcription is running. Add a Gemini API key…" note. Tracking
+    /// it lets us avoid appending a duplicate on a stop+start cycle within the
+    /// same session, and dismiss it the moment a key is set.
+    private var transcriptionOnlyNoteID: UUID?
     /// Per-channel scheduled "cycle the recognizer" tasks, used to debounce VAD boundary
     /// events. Mid-sentence pauses (~0.4 s) shouldn't split a transcript line — only
     /// genuine end-of-utterance pauses should. A pending task is cancelled when speech
@@ -192,6 +211,9 @@ final class AppCoordinator {
                 aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
                 aiProviderModel = settings.geminiModel
             }
+            // A key was set while the transcription-only note is on screen — dismiss
+            // it now, otherwise it lingers as misleading "Add a Gemini API key" copy.
+            dismissTranscriptionOnlyNote()
         } else if aiProvider != nil {
             aiProvider = nil
             aiProviderModel = nil
@@ -222,11 +244,22 @@ final class AppCoordinator {
         isStartingUp = true
         defer { isStartingUp = false }
         wpInfo("[Coordinator] ▶ startListening")
+        // Fresh AsyncStream instances per session — see the property declarations
+        // for why. Doing this here (rather than at `stopListening` time) keeps the
+        // instances valid for any UI / debug code that reads them between sessions.
+        audioMixer = AudioMixer()
+        triggerEngine = TriggerEngine()
         // Surface the "spinning up" state immediately so the user gets feedback on the
         // Play click. We hold .starting until the first audio frame arrives (in the
         // mixer-output consumer below) so the visible transition lines up with the
         // pipeline actually being live, not just with our setup code returning.
         overlayState.status = .starting
+        // Kick off the startup watchdog BEFORE any awaits — `makeStartedTranscriber()`
+        // can block for tens of seconds on first launch while macOS downloads the
+        // on-device speech model, and the normal no-frames watchdog doesn't start
+        // until after `isRunning = true`. Without this the user sits on an opaque
+        // "Starting…" spinner with no signal at all.
+        startStartupWatchdog()
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
 
@@ -301,15 +334,24 @@ final class AppCoordinator {
         } catch {
             wpError("Transcriber start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
+            dismissStartupNotes()
             return
         }
         self.transcriber = transcriber
 
         if let key = settings.geminiAPIKey, !key.isEmpty {
-            // refreshDerivedState already keeps aiProvider in sync; nothing to do here.
-        } else {
+            // Key present — make sure no stale "transcription-only" note is hanging
+            // around from an earlier run in this session.
+            dismissTranscriptionOnlyNote()
+        } else if transcriptionOnlyNoteID == nil {
+            // Append exactly once per session. Without this guard, a stop+start cycle
+            // (or returning to the same session via the back button) would stack a
+            // second identical note on top of the first.
             wpInfo("[Coordinator] no Gemini key — transcription-only mode")
-            overlayState.appendSystemNote("ℹ️ Transcription is running. Add a Gemini API key in Settings to enable AI suggestions.", category: .general)
+            transcriptionOnlyNoteID = overlayState.appendSystemNote(
+                "ℹ️ Transcription is running. Add a Gemini API key in Settings to enable AI suggestions.",
+                category: .general
+            )
         }
 
         do {
@@ -327,6 +369,7 @@ final class AppCoordinator {
         } catch {
             wpError("Pipeline start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
+            dismissStartupNotes()
             return
         }
 
@@ -383,6 +426,64 @@ final class AppCoordinator {
         }
     }
 
+    /// Dismiss the "transcription is running, add a Gemini key" note. Called when a
+    /// key gets set (via Settings) or when a fresh session starts.
+    private func dismissTranscriptionOnlyNote() {
+        if let id = transcriptionOnlyNoteID {
+            overlayState.removeMessage(id: id)
+            transcriptionOnlyNoteID = nil
+        }
+    }
+
+    /// Dismiss the slow / stuck startup notes once startup actually progresses
+    /// (status leaves `.starting`). Called from the mixer-output consumer's
+    /// first-frame branch and from any startup-failure path.
+    private func dismissStartupNotes() {
+        if let id = slowStartupNoteID {
+            overlayState.removeMessage(id: id)
+            slowStartupNoteID = nil
+        }
+        if let id = stuckStartupNoteID {
+            overlayState.removeMessage(id: id)
+            stuckStartupNoteID = nil
+        }
+    }
+
+    /// Watchdog for the "first run on a fresh install" hang. The existing
+    /// `startNoFramesWatchdog` only runs after `isRunning = true`, which means it
+    /// never fires when `makeStartedTranscriber()` is the thing blocking — and
+    /// that's exactly when first-launch model downloads on macOS 26 (SpeechAnalyzer)
+    /// can take 30s–2min. Without this, the user just stares at a "Starting…"
+    /// spinner with no clue what's happening.
+    ///
+    /// Fires only while `status == .starting`, so it auto-cancels itself once
+    /// startup completes (or fails).
+    private func startStartupWatchdog() {
+        // ~8s: gentle nudge — "this is taking a while, here's probably why".
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self else { return }
+            guard self.overlayState.status == .starting else { return }
+            let message = "Startup is taking longer than usual. On a fresh install macOS may be downloading on-device speech recognition models in the background — this can take 30 seconds to a few minutes. Hang tight."
+            wpInfo(message)
+            self.slowStartupNoteID = self.overlayState.appendSystemNote("ℹ️ \(message)", category: .general)
+        }
+
+        // ~30s: louder warning with actionable diagnostics. By this point either the
+        // model download is genuinely slow (slow network) or something more serious
+        // is blocking (permission prompt dismissed, recognizer unavailable for the
+        // chosen locale, etc.).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let self else { return }
+            guard self.overlayState.status == .starting else { return }
+            let locale = self.settings.localeIdentifier
+            let message = "Still starting after 30 seconds. Possible causes: (a) the on-device speech model is downloading on a slow connection — wait a bit longer; (b) Speech Recognition permission was denied — check System Settings → Privacy & Security → Speech Recognition; (c) the chosen locale (\(locale)) isn't supported on this Mac — try \"en-US\" in Settings → General → Locale. Click ⏹ to abort."
+            wpWarn(message)
+            self.stuckStartupNoteID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .general)
+        }
+    }
+
     /// Dismiss the no-transcripts warning, if any. Called when the first transcript arrives.
     private func dismissNoTranscriptsWarning() {
         if let id = noTranscriptsWarningID {
@@ -420,6 +521,9 @@ final class AppCoordinator {
         overlayState.status = .idle
         overlayState.audioFrameCount = 0
         overlayState.transcriptCount = 0
+        // Tear down any startup notes still floating from a stuck startup that the
+        // user just bailed out of with Stop.
+        dismissStartupNotes()
     }
 
     func toggleListening() async {
@@ -451,6 +555,14 @@ final class AppCoordinator {
         currentSession = session
         overlayState.transcript = []
         overlayState.clearChat()
+        // `clearChat()` wipes the messages array but our tracked note IDs are
+        // separate state — nil them out so the next `startListening` doesn't see
+        // a stale ID and skip its (now legitimately needed) re-append.
+        transcriptionOnlyNoteID = nil
+        noFramesWarningID = nil
+        noTranscriptsWarningID = nil
+        slowStartupNoteID = nil
+        stuckStartupNoteID = nil
         overlayState.transcriptCount = 0
         overlayState.audioFrameCount = 0
         await transcriptBuffer.clear()
@@ -994,6 +1106,9 @@ final class AppCoordinator {
                         guard let self else { return }
                         self.overlayState.audioFrameCount = 1
                         self.dismissNoFramesWarning()
+                        // Dismiss the "this is taking a while" startup notes —
+                        // the pipeline is clearly alive now.
+                        self.dismissStartupNotes()
                         // First real audio frame — promote from the "starting" loading
                         // state to "listening". Guard against overwriting later states
                         // (thinking/streaming/error) in case something else changed
