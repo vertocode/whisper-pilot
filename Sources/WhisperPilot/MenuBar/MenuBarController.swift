@@ -25,10 +25,11 @@ final class MenuBarController {
 
     private func configure() {
         if let button = item.button {
-            // Prefer the brand logo from the asset catalog so the status item visually
-            // matches the rest of the app. Fall back to an SF Symbol, then a text label,
-            // so something is always visible regardless of bundle state.
-            if let logo = NSImage(named: "WhisperPilotLogo") {
+            // Brand logo first, with the same two-step fallback chain `BrandLogo`
+            // uses (asset catalog → raw PNG → SF Symbol → text). Keeps the menu
+            // bar icon visually consistent with the Sessions header and the
+            // Settings header, regardless of how the app was built.
+            if let logo = BrandLogo.loadBrandLogo() {
                 logo.size = NSSize(width: 18, height: 18)
                 button.image = logo
                 button.imagePosition = .imageOnly

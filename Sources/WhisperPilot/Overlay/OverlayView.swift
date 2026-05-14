@@ -2,11 +2,14 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Renders the brand logo with a graceful fallback to an SF Symbol when the asset catalog
-/// hasn't been recompiled yet.
+/// Renders the brand logo with two layered fallbacks:
+///   1. The `WhisperPilotLogo` imageset from the asset catalog.
+///   2. The raw `whisper-logo-nobg.png` file bundled directly (works even when
+///      the asset catalog isn't compiled into the running binary).
+///   3. The SF Symbol `waveform.circle.fill` as a last-ditch placeholder.
 struct BrandLogo: View {
     var body: some View {
-        if let nsImage = NSImage(named: "WhisperPilotLogo") {
+        if let nsImage = Self.loadBrandLogo() {
             Image(nsImage: nsImage)
                 .resizable()
                 .scaledToFit()
@@ -16,6 +19,23 @@ struct BrandLogo: View {
                 .scaledToFit()
                 .foregroundStyle(.tint)
         }
+    }
+
+    /// Shared brand-logo loader. Used by `BrandLogo` for SwiftUI surfaces and by
+    /// `MenuBarController` for the status item. Returns the best available image
+    /// or `nil` if neither path resolved.
+    static func loadBrandLogo() -> NSImage? {
+        if let asset = NSImage(named: "WhisperPilotLogo") {
+            return asset
+        }
+        // Asset catalog miss — happens when running outputs that don't compile
+        // xcassets (e.g. `swift run` builds). Fall back to the raw PNG bundled
+        // alongside the asset catalog via `Project.yml`'s `resources` list.
+        if let url = Bundle.main.url(forResource: "whisper-logo-nobg", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        return nil
     }
 }
 
