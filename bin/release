@@ -24,6 +24,23 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Fail loudly. With just `set -e` a build failure mid-script exits non-zero, but
+# in a noisy log (xcodebuild can dump 50+ errors) the actual "release aborted"
+# signal is easy to miss. This trap prints a banner pointing at the last command
+# attempted so the reader knows *exactly* where the script gave up, and confirms
+# no Release / tap update happened. Stays in effect for the entire script.
+__on_error() {
+  local exit_code=$?
+  local last_cmd=${BASH_COMMAND}
+  printf '\n\033[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n' >&2
+  printf '\033[1;31m✗ RELEASE FAILED\033[0m (exit %s)\n' "$exit_code" >&2
+  printf '   Last command: %s\n' "$last_cmd" >&2
+  printf '   Nothing was published. Fix the error above and re-run.\n' >&2
+  printf '\033[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n' >&2
+  exit "$exit_code"
+}
+trap __on_error ERR
+
 # --- Help ------------------------------------------------------------------
 usage() {
   cat <<'EOF'
