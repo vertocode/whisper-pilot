@@ -10,7 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/vertocode/whisper-pilot/releases"><img alt="Status" src="https://img.shields.io/badge/status-alpha-orange"></a>
+  <a href="https://github.com/vertocode/whisper-pilot/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/vertocode/whisper-pilot?display_name=tag&color=blue"></a>
+  <a href="https://github.com/vertocode/whisper-pilot/releases"><img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange" title="Alpha: under active development, expect bugs and breaking changes"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <a href="#requirements"><img alt="macOS" src="https://img.shields.io/badge/macOS-14%2B-lightgrey"></a>
 </p>
