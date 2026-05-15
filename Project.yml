@@ -22,7 +22,10 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources/WhisperPilot
-    resources:
+      # xcodegen has no `resources:` field — it derives the build phase from the
+      # file extension under `sources:`. Listing `resources:` here silently
+      # discarded the asset catalog AND the brand-logo PNG, which is why every
+      # release before v0.1.2 shipped with no AppIcon and no Resources/ folder.
       - path: Resources/Assets.xcassets
       # Brand logo PNG also bundled as a loose resource so `Bundle.main.url(...)`
       # can find it. Belt-and-suspenders alongside the imageset in Assets.xcassets:
