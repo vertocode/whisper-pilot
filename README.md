@@ -23,7 +23,7 @@ Whisper Pilot listens to anything your Mac can hear — meetings, podcasts, tuto
 
 ## Install
 
-> **Alpha note:** releases are unsigned for now, so macOS Gatekeeper will warn on first launch — see the [Direct download](#direct-download) section for the one-time unblock. Prefer to build it yourself? See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md#project-setup).
+> **Alpha note:** releases are not yet signed with an Apple Developer ID, so macOS Gatekeeper will block the first launch. See [Allow the app through Gatekeeper](#allow-the-app-through-gatekeeper) below for the one-time unblock — it takes about ten seconds. Prefer to build from source? See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md#project-setup).
 
 ### Homebrew
 
@@ -37,13 +37,28 @@ Update with `brew upgrade --cask whisper-pilot`. Uninstall with `brew uninstall 
 
 Grab the latest `.dmg` from the [Releases page](https://github.com/vertocode/whisper-pilot/releases) and drag `WhisperPilot.app` into `/Applications`.
 
-> macOS Gatekeeper will warn until releases are notarized. To bypass: right-click the app → **Open** → **Open**. Or in Terminal: `xattr -dr com.apple.quarantine /Applications/WhisperPilot.app`.
+### Allow the app through Gatekeeper
+
+Because Whisper Pilot isn't signed with an Apple Developer ID yet, the first launch (whether installed via Homebrew or the `.dmg`) shows a dialog like *"WhisperPilot can't be opened because Apple cannot check it for malicious software."* This is expected.
+
+To allow it:
+
+1. Open **System Settings → Privacy & Security**.
+2. Scroll down to the **Security** section — you'll see a line that says *"WhisperPilot was blocked to protect your Mac."*
+3. Click **Open Anyway** next to that line. macOS asks you to confirm with your password / Touch ID.
+4. Launch Whisper Pilot again. This time a smaller dialog appears with an **Open** button — click it once. From then on, the app launches normally with no prompts.
+
+If you prefer the Terminal: `xattr -dr com.apple.quarantine /Applications/WhisperPilot.app` removes the quarantine attribute and skips the dialog entirely.
 
 ### First run
 
 1. Launch — the Sessions window opens. Click **Start new** to enter the overlay.
 2. Open Settings from the overlay's `…` menu → **AI Provider** tab → paste your [Gemini API key](https://aistudio.google.com/app/apikey). Stored in Keychain.
-3. Click **▶** in the overlay. macOS will prompt for **Screen Recording** permission — grant it. (Microphone is requested separately and only if you enable *Capture microphone*.)
+3. Click **▶** in the overlay. macOS will prompt for **Microphone** permission (so your own voice can be transcribed) and, on older macOS versions that fall back to ScreenCaptureKit, **Screen Recording** (used only for the system-audio capture path — no video is recorded). Grant whichever it asks for.
+
+### Report a bug
+
+Hit a problem during install or use? Please [open an issue](https://github.com/vertocode/whisper-pilot/issues) — include your macOS version, what you ran, and any messages from the overlay's log panel. Pull requests with a fix are even better.
 
 ## Requirements
 
