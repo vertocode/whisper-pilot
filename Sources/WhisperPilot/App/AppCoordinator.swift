@@ -396,7 +396,10 @@ final class AppCoordinator {
             if self.overlayState.audioFrameCount == 0 {
                 let method = self.processTapFrames != nil ? "Core Audio Process Tap" : "ScreenCaptureKit"
                 let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
-                let message = "No audio frames after 6 seconds. \(method) started but isn't delivering audio. Default output device is “\(outName)”. Check that audio is actually playing through that device — virtual / aggregate / Bluetooth devices sometimes bypass the macOS audio mixdown that we capture from."
+                let micHint = self.settings.captureMicrophone
+                    ? "Microphone capture is on — speak audibly into the mic, or play system audio through your default output device (“\(outName)”)."
+                    : "Microphone capture is off. Either enable Capture Microphone in Settings → Capture so your voice is transcribed, or play system audio through your default output device (“\(outName)”)."
+                let message = "No audio frames after 6 seconds. \(method) is set up but isn't receiving any audio. \(micHint) Virtual / aggregate / Bluetooth output devices sometimes bypass the macOS audio mixdown that we capture from."
                 wpWarn(message)
                 self.noFramesWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             } else if self.overlayState.transcriptCount == 0 {
@@ -478,7 +481,17 @@ final class AppCoordinator {
             guard let self else { return }
             guard self.overlayState.status == .starting else { return }
             let locale = self.settings.localeIdentifier
-            let message = "Still starting after 30 seconds. Possible causes: (a) the on-device speech model is downloading on a slow connection — wait a bit longer; (b) Speech Recognition permission was denied — check System Settings → Privacy & Security → Speech Recognition; (c) the chosen locale (\(locale)) isn't supported on this Mac — try \"en-US\" in Settings → General → Locale. Click ⏹ to abort."
+            // Only suggest an alternate locale when the current one isn't already
+            // en-US — telling the user "try en-US" while they're *on* en-US is
+            // exactly the kind of useless hint that wastes their time during a
+            // real bug hunt.
+            let localeHint = locale.lowercased().hasPrefix("en-us")
+                ? "the chosen locale (\(locale)) might not have a working on-device model on this Mac — try another locale (e.g. en-GB) in Settings → General → Locale"
+                : "the chosen locale (\(locale)) might not be supported on this Mac — try \"en-US\" in Settings → General → Locale"
+            let micHint = self.settings.captureMicrophone
+                ? "no audio is reaching the recognizer — speak into your mic, or play system audio through your default output device"
+                : "Capture Microphone is off and no system audio is playing — enable mic capture in Settings → Capture, or start playing audio"
+            let message = "Still starting after 30 seconds. Possible causes: (a) \(micHint); (b) the on-device speech model is downloading on a slow connection — wait a bit longer; (c) Speech Recognition permission was denied — check System Settings → Privacy & Security → Speech Recognition; (d) \(localeHint). Click ⏹ to abort."
             wpWarn(message)
             self.stuckStartupNoteID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .general)
         }
@@ -741,11 +754,18 @@ final class AppCoordinator {
     /// path on older systems — or if the modern path fails to start (e.g. locale model
     /// unavailable, asset install denied). Throws only when both paths fail.
     private func makeStartedTranscriber() async throws -> TranscriptionProvider {
+        // Tell the transcriber only about channels we'll actually feed. Without
+        // the mic flag, an unused mic pipe still spins up its own recognizer task
+        // that fires "No speech detected" after a silent timeout — pure noise in
+        // the user's log and a misleading signal during debugging.
+        var channels: Set<AudioChannel> = [.system]
+        if settings.captureMicrophone { channels.insert(.microphone) }
+
         if #available(macOS 26.0, *) {
             let modern = SpeechAnalyzerTranscriber(locale: settings.locale)
             do {
-                try await modern.start()
-                wpInfo("[Coordinator] using SpeechAnalyzer (macOS 26+) transcriber")
+                try await modern.start(enabledChannels: channels)
+                wpInfo("[Coordinator] using SpeechAnalyzer (macOS 26+) transcriber (channels=\(channels))")
                 return modern
             } catch {
                 wpWarn("[Coordinator] SpeechAnalyzer start failed (\(error.localizedDescription)); falling back to SFSpeechRecognizer")
@@ -753,8 +773,8 @@ final class AppCoordinator {
             }
         }
         let legacy = AppleSpeechTranscriber(locale: settings.locale)
-        try await legacy.start()
-        wpInfo("[Coordinator] using SFSpeechRecognizer transcriber")
+        try await legacy.start(enabledChannels: channels)
+        wpInfo("[Coordinator] using SFSpeechRecognizer transcriber (channels=\(channels))")
         return legacy
     }
 
@@ -799,7 +819,9 @@ final class AppCoordinator {
 
         let testTranscriber = AppleSpeechTranscriber(locale: settings.locale, autoRestart: false)
         do {
-            try await testTranscriber.start()
+            // Self-test only synthesizes mic-channel audio, so don't bother
+            // spinning up the system-channel recognizer pipe.
+            try await testTranscriber.start(enabledChannels: [.microphone])
         } catch {
             overlayState.appendSystemNote("❌ Self-test failed: couldn't start recognizer (\(error.localizedDescription)).", category: .transcript)
             return

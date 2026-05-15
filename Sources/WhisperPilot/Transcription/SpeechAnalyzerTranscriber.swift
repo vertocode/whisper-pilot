@@ -31,34 +31,41 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
         self.continuation = captured
     }
 
-    func start() async throws {
-        wpInfo("SpeechAnalyzer.start (locale=\(locale.identifier))")
+    func start(enabledChannels: Set<AudioChannel>) async throws {
+        wpInfo("SpeechAnalyzer.start (locale=\(locale.identifier), channels=\(enabledChannels))")
         try await ensureAuthorization()
 
-        // Build both channel pipes in parallel — asset install + format probe can take
-        // a noticeable moment on first launch; doing them concurrently halves startup.
-        async let micPipe = Pipe.make(channel: .microphone, locale: locale, sink: continuation)
-        async let sysPipe = Pipe.make(channel: .system, locale: locale, sink: continuation)
+        // Only build pipes for channels that will actually receive audio. Skipping
+        // an unused channel avoids spinning up its SpeechAnalyzer + a download of
+        // the locale's model for a pipe that would never see a buffer.
+        let wantMic = enabledChannels.contains(.microphone)
+        let wantSys = enabledChannels.contains(.system)
+
+        // Build the requested pipes in parallel — asset install + format probe can
+        // take a noticeable moment on first launch; doing them concurrently halves
+        // startup when both are wanted.
+        async let micPipe: Pipe? = wantMic ? Pipe.make(channel: .microphone, locale: locale, sink: continuation) : nil
+        async let sysPipe: Pipe? = wantSys ? Pipe.make(channel: .system, locale: locale, sink: continuation) : nil
         let mic = try await micPipe
         let sys = try await sysPipe
 
         if !installPipes(mic: mic, sys: sys) {
-            mic.finish()
-            sys.finish()
+            mic?.finish()
+            sys?.finish()
             return
         }
-        wpInfo("SpeechAnalyzer: both channel pipes ready")
+        wpInfo("SpeechAnalyzer: channel pipes ready (mic=\(mic != nil), sys=\(sys != nil))")
     }
 
     /// Non-async wrapper around the locked dict update — Swift 6 strict concurrency
     /// rejects `NSLock.lock()` from an async function. Returns `false` if `stop()`
     /// raced ahead of us; the caller is then responsible for finishing the pipes.
-    private func installPipes(mic: Pipe, sys: Pipe) -> Bool {
+    private func installPipes(mic: Pipe?, sys: Pipe?) -> Bool {
         mutex.lock()
         defer { mutex.unlock() }
         if isStopped { return false }
-        pipes[.microphone] = mic
-        pipes[.system] = sys
+        if let mic { pipes[.microphone] = mic }
+        if let sys { pipes[.system] = sys }
         return true
     }
 

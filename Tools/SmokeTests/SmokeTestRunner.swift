@@ -219,7 +219,7 @@ struct SmokeTestRunner {
 
             let transcriber = AppleSpeechTranscriber(locale: Locale(identifier: "en-US"))
             do {
-                try await transcriber.start()
+                try await transcriber.start(enabledChannels: [.microphone])
             } catch {
                 await expect(false, "transcriber.start() threw: \(error.localizedDescription)")
                 return

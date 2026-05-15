@@ -152,7 +152,12 @@ final class SettingsStore: ObservableObject {
         self.defaults = defaults
         self.geminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-2.5-flash"
         self.responseStyle = ResponseStyle(rawValue: defaults.string(forKey: Keys.responseStyle) ?? "") ?? .concise
-        self.captureMicrophone = defaults.object(forKey: Keys.captureMicrophone) as? Bool ?? false
+        // Default to ON so the common first-time-test case (solo user speaking into
+        // their Mac's mic) produces transcripts immediately. With this off, a user
+        // sitting in silence on a Mac with no system audio playing sees a spinner
+        // forever because nothing feeds the mixer. macOS will request mic permission
+        // on the first Play; once granted, transcription "just works".
+        self.captureMicrophone = defaults.object(forKey: Keys.captureMicrophone) as? Bool ?? true
         self.alwaysOnTop = defaults.object(forKey: Keys.alwaysOnTop) as? Bool ?? true
         self.clickThrough = defaults.object(forKey: Keys.clickThrough) as? Bool ?? false
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier

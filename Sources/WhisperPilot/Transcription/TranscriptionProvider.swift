@@ -11,7 +11,11 @@ struct TranscriptUpdate: Sendable, Hashable, Identifiable {
 
 protocol TranscriptionProvider: AnyObject, Sendable {
     var transcripts: AsyncStream<TranscriptUpdate> { get }
-    func start() async throws
+    /// Spin up recognizer pipes for the given channels only. Callers should pass
+    /// just the channels whose audio will actually be fed in — creating an idle
+    /// pipe for an unused channel produces misleading "No speech detected"
+    /// log noise from a recognizer that's correctly timing out on empty input.
+    func start(enabledChannels: Set<AudioChannel>) async throws
     func stop()
     func feed(_ buffer: AVAudioPCMBuffer, channel: AudioChannel)
     /// Tells the transcriber that an utterance boundary was detected on this channel

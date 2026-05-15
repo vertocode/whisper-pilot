@@ -26,14 +26,18 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
         super.init()
     }
 
-    func start() async throws {
-        print("[WP][Transcriber] start() begin (locale=\(locale.identifier), autoRestart=\(autoRestart))")
-        log.info("Starting transcriber for locale=\(self.locale.identifier, privacy: .public)…")
+    func start(enabledChannels: Set<AudioChannel>) async throws {
+        print("[WP][Transcriber] start() begin (locale=\(locale.identifier), autoRestart=\(autoRestart), channels=\(enabledChannels))")
+        log.info("Starting transcriber for locale=\(self.locale.identifier, privacy: .public) channels=\(String(describing: enabledChannels), privacy: .public)…")
         try await ensureAuthorization()
         print("[WP][Transcriber] auth ok")
-        systemPipe = try ChannelPipe(channel: .system, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
-        micPipe = try ChannelPipe(channel: .microphone, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
-        print("[WP][Transcriber] both channel pipes ready")
+        if enabledChannels.contains(.system) {
+            systemPipe = try ChannelPipe(channel: .system, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
+        }
+        if enabledChannels.contains(.microphone) {
+            micPipe = try ChannelPipe(channel: .microphone, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
+        }
+        print("[WP][Transcriber] channel pipes ready (system=\(systemPipe != nil), mic=\(micPipe != nil))")
     }
 
     func stop() {
