@@ -104,7 +104,12 @@ private final class ChannelPipe {
     private var recentRestartTimestamps: [Date] = []
     private static let maxRestartsPerWindow = 5
     private static let restartWindow: TimeInterval = 30
-    private static let restartDelay: TimeInterval = 0.5
+    /// RMS threshold above which we consider a buffer to contain speech-level
+    /// audio. Used to gate task (re)attachment so a long silence doesn't churn
+    /// through "No speech detected" → restart → "No speech detected" cycles.
+    /// Empirical floor: room noise on a typical Mac mic sits around 0.001–0.003;
+    /// real speech is 0.05–0.20. 0.005 cleanly separates the two.
+    private static let speechRmsThreshold: Float = 0.005
     private var isFinished: Bool = false
     private let mutex = NSLock()
     /// Rolling tail of recently-appended audio (~`replayMaxSeconds` worth). Replayed into
@@ -149,6 +154,7 @@ private final class ChannelPipe {
         // (continueAfterFinalization / scheduleRestart) can't slip in between reading
         // `self.request` and appending — otherwise this buffer would land on the dead
         // request the swap just replaced and be silently dropped.
+        let rms = computeRMS(buffer)
         mutex.lock()
         guard !isFinished else { mutex.unlock(); return }
         request.append(buffer)
@@ -168,14 +174,23 @@ private final class ChannelPipe {
         let count = buffersAppended
         let emitted = transcriptsEmitted
         let restarts = restartCount
+        // If we currently have no recognition task and this buffer carries
+        // speech-level audio, lazily attach one. This is the recovery path
+        // after `scheduleRestart` deliberately leaves the task slot empty
+        // during silence — without it, a long silence would keep firing
+        // "No speech detected" → restart → silence-timeout loops that hit
+        // the rate cap and ate audio during the 5 s backoff window.
+        let needsTaskAttach = task == nil && rms >= Self.speechRmsThreshold
         mutex.unlock()
 
         if count == 1 {
-            let rms = computeRMS(buffer)
             wpInfo("Transcriber.\(channel) FIRST buffer (frames=\(buffer.frameLength), rms=\(String(format: "%.5f", rms)))")
         } else if count % 100 == 0 {
-            let rms = computeRMS(buffer)
             wpInfo("Transcriber.\(channel) appended=\(count) emitted=\(emitted) rms=\(String(format: "%.5f", rms)) restarts=\(restarts)")
+        }
+
+        if needsTaskAttach {
+            startTask()
         }
     }
 
@@ -230,8 +245,17 @@ private final class ChannelPipe {
     }
 
     private func startTask() {
+        // Reserve the task slot under the mutex so concurrent callers (append
+        // from the audio thread + cycleAtBoundary from main, etc.) can't both
+        // race in and create duplicate tasks.
+        mutex.lock()
+        guard !isFinished else { mutex.unlock(); return }
+        guard task == nil else { mutex.unlock(); return }
+        let currentRequest = request
+        mutex.unlock()
+
         var firstCallback = true
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+        let newTask = recognizer.recognitionTask(with: currentRequest) { [weak self] result, error in
             guard let self else { return }
             if firstCallback {
                 wpInfo("Transcriber.\(channel) recognitionTask first callback (result=\(result != nil), error=\(error != nil))")
@@ -281,30 +305,57 @@ private final class ChannelPipe {
                 }
             }
             if let error {
-                wpError("Transcriber.\(channel) recognition error: \(error.localizedDescription)")
+                // "No speech detected" (SFSpeech error 1110) is benign — it fires after
+                // the recognizer's internal silence timeout and only means we sat in
+                // silence too long. Log at info, not error, so it doesn't spam the
+                // user's alert badge during a quiet conversation.
+                let nserror = error as NSError
+                let isNoSpeech = nserror.domain == "kAFAssistantErrorDomain" && nserror.code == 1110
+                if isNoSpeech {
+                    wpInfo("Transcriber.\(channel) silence timeout (no speech in window) — task will reattach when speech resumes")
+                } else {
+                    wpError("Transcriber.\(channel) recognition error: \(error.localizedDescription)")
+                }
                 segmentId = UUID()
                 if self.autoRestart {
                     self.scheduleRestart()
                 }
             }
         }
-        wpInfo("Transcriber.\(channel) recognitionTask started (restart#\(restartCount))")
+        // Commit the new task into the slot we reserved at the top. If we lost
+        // the race (another caller installed a task while we were creating
+        // ours, or stop() raced ahead), throw this one away.
+        mutex.lock()
+        if isFinished || task != nil {
+            mutex.unlock()
+            newTask.cancel()
+            return
+        }
+        task = newTask
+        let currentRestart = restartCount
+        mutex.unlock()
+        wpInfo("Transcriber.\(channel) recognitionTask started (restart#\(currentRestart))")
     }
 
     /// `SFSpeechRecognitionTask` enters a terminal state after errors like "No speech
     /// detected" — every subsequent `request.append(buffer:)` is silently ignored.
-    /// Recovery is to drop the request, build a fresh one, and start a new task.
+    /// Recovery is to drop the request, build a fresh one, and leave the task slot
+    /// empty for `append()` to fill in once it sees non-silent audio.
     ///
-    /// Swap in the fresh request synchronously so `append()` calls arriving during the
-    /// rate-limit delay land on the new (live) request rather than the dead one — the
-    /// recognizer task can be attached later because `SFSpeechAudioBufferRecognitionRequest`
-    /// buffers audio added before its task starts. Without this, the rate cap (5s backoff)
-    /// silently discarded up to 5 s of speech, exactly the "transcript dies after line 3"
-    /// symptom we saw.
+    /// The previous version of this method scheduled a delayed `startTask()` via a
+    /// `Task.sleep` timer. That looked safe but produced a noisy failure mode in
+    /// long silences: the new task fired the same "No speech detected" timeout
+    /// 30–60 s later, triggering another restart, which itself timed out, and so
+    /// on. After 5 such restarts the rate cap kicked in and audio captured during
+    /// the 5-second backoff went unrecognized — exactly the "transcription cuts a
+    /// lot" symptom reported on Mac mini installs running the legacy
+    /// `SFSpeechRecognizer` path.
     ///
-    /// Rate-limited only on *task creation* because the recognizer can fire "No speech
-    /// detected" repeatedly during silence. Without a cap we'd burn through SFSpeech's
-    /// daily task budget and saturate the main thread with log appends.
+    /// Lazy attach via `append()` (gated on `speechRmsThreshold`) eliminates that
+    /// loop: during silence we sit with `task == nil` and burn no recognizer
+    /// quota; the moment a buffer arrives with speech-level RMS, `append()` calls
+    /// `startTask()` and resumes recognition. The replay buffer guarantees the
+    /// first ~1.2 s of speech is fed in along with the request.
     private func scheduleRestart() {
         mutex.lock()
         guard !isFinished else { mutex.unlock(); return }
@@ -326,33 +377,16 @@ private final class ChannelPipe {
         mutex.unlock()
 
         if replayedCount > 0 {
-            wpInfo("Transcriber.\(channel) replayed \(replayedCount) buffer(s) into error-restarted request")
+            wpInfo("Transcriber.\(channel) replayed \(replayedCount) buffer(s) into restart-fresh request (awaiting speech)")
         }
 
-        // Don't permanently give up. SFSpeech's "No speech detected" can fire repeatedly
-        // during silence; once audio resumes we should still recognize. Slow down task
-        // re-attach when the error rate is high but never close the door.
-        let delay: TimeInterval = recentCount >= Self.maxRestartsPerWindow ? 5.0 : Self.restartDelay
         if recentCount >= Self.maxRestartsPerWindow {
-            wpInfo("Transcriber.\(self.channel) backing off restart attempts (rate cap hit, retrying in \(Int(delay))s)")
+            // Surfaced only as info now — with the lazy-attach model, the rate
+            // cap is more of an indicator that something else is wrong (mic
+            // model misconfig, very noisy env producing spurious timeouts)
+            // rather than a problem actively losing audio.
+            wpInfo("Transcriber.\(self.channel) restart rate cap reached (\(recentCount) in \(Int(Self.restartWindow))s) — still waiting for the next non-silent buffer to attach a task")
         }
-
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            self?.attachTaskIfNeeded()
-        }
-    }
-
-    /// Re-attach a recognition task to the current request — but only if nothing else
-    /// already did. `cycleAtBoundary` / `continueAfterFinalization` can install their own
-    /// task between when `scheduleRestart` set up the new request and when its delayed
-    /// closure fires; double-attaching would leak a task and clobber transcripts.
-    private func attachTaskIfNeeded() {
-        mutex.lock()
-        guard !isFinished else { mutex.unlock(); return }
-        guard task == nil else { mutex.unlock(); return }
-        mutex.unlock()
-        startTask()
     }
 
     /// `SFSpeechRecognitionTask` terminates after it delivers `isFinal=true` — including
