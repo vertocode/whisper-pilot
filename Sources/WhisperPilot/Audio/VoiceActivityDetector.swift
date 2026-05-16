@@ -22,6 +22,14 @@ actor VoiceActivityDetector {
 
     private var states: [AudioChannel: ChannelState] = [:]
 
+    /// Drop all per-channel state — used when the pipeline restarts so a half-finished
+    /// utterance from the previous session doesn't poison the new session's first
+    /// frames (which would otherwise be silently classified as "still speaking" and
+    /// never emit a `.speechStarted` event until silence broke the spell).
+    func reset() {
+        states.removeAll()
+    }
+
     func feed(_ frame: AudioFrame) -> VoiceActivityEvent? {
         let rms = computeRMS(frame.buffer)
         var state = states[frame.channel] ?? ChannelState()

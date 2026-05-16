@@ -28,8 +28,15 @@ final class AppCoordinator {
     /// fresh mixer (and therefore a fresh output stream) per session avoids the
     /// "loads forever, transcript never starts" symptom on the second session.
     private var audioMixer = AudioMixer()
-    private let systemCapture = SystemAudioCapture()
-    private let micCapture = MicrophoneCapture()
+    /// Recreated for the same reason as `audioMixer` — their `frames`
+    /// `AsyncStream`s are single-iterator and the previous session's iteration
+    /// (owned by the now-cancelled mixer consumer) leaves the stream in a state
+    /// where the new mixer's iterator never receives the new buffers. Symptom
+    /// was "first session transcribes fine, every subsequent session sits on a
+    /// spinner / shows status .listening but produces no transcripts until the
+    /// app is killed and relaunched."
+    private var systemCapture = SystemAudioCapture()
+    private var micCapture = MicrophoneCapture()
     /// When Core Audio Process Tap is in use, this stream is its output. The pipeline
     /// reads from whichever of `processTapFrames` or `systemCapture.frames` is active.
     private var processTapFrames: AsyncStream<AudioFrame>?
@@ -249,6 +256,12 @@ final class AppCoordinator {
         // instances valid for any UI / debug code that reads them between sessions.
         audioMixer = AudioMixer()
         triggerEngine = TriggerEngine()
+        systemCapture = SystemAudioCapture()
+        micCapture = MicrophoneCapture()
+        // VAD holds per-channel `isSpeaking` state; if the previous session ended
+        // mid-utterance, that state lingers and the next session's first frames are
+        // mis-classified (no `.speechStarted` until silence is detected first).
+        await vad.reset()
         // Surface the "spinning up" state immediately so the user gets feedback on the
         // Play click. We hold .starting until the first audio frame arrives (in the
         // mixer-output consumer below) so the visible transition lines up with the
