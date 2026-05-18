@@ -1,10 +1,17 @@
 name: Release
 
-# Manual: Actions → Release → Run workflow, type a version, click Run.
-# Automatic: push a tag like `v0.2.0` and the same workflow fires.
+# Manual only: Actions → Release → Run workflow, type a version, click Run.
 #
-# Both paths invoke ./bin/release, the exact same script you can run locally.
-# Local equivalent: `./bin/release --version 0.2.0`
+# The tag-push trigger used to live here too, but it caused a self-race when
+# someone ran `./bin/release` locally: the local script created the v* tag as a
+# side effect of `gh release create`, which fired this same workflow on CI, which
+# re-ran `./bin/release` on a different runner that built a binary with a
+# different SHA and `--clobber`-ed the asset on the GitHub Release. The tap
+# commit had already been pushed with the *local* SHA, so it ended up
+# mismatching the asset on disk and `brew install` failed verification.
+#
+# Both paths still invoke ./bin/release, the exact same script you can run
+# locally. Local equivalent: `./bin/release --version 0.2.0`
 #
 # Signing/notarization is optional. Set these as repo Secrets to enable:
 #   WP_DEVELOPER_ID_CERT_BASE64, WP_DEVELOPER_ID_CERT_PASSWORD,
@@ -13,9 +20,6 @@ name: Release
 #   TAP_REPO_TOKEN  (fine-grained PAT with Contents:Write on vertocode/homebrew-whisper-pilot)
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -42,11 +46,7 @@ jobs:
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
+          VERSION="${{ github.event.inputs.version }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # Explicitly select the newest installed Xcode so we don't accidentally
