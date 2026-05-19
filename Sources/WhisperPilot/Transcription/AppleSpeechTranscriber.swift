@@ -112,6 +112,18 @@ private final class ChannelPipe {
     private static let speechRmsThreshold: Float = 0.005
     private var isFinished: Bool = false
     private let mutex = NSLock()
+    /// Last non-empty partial text seen for the current `segmentId`. SFSpeech
+    /// will only emit `isFinal=true` if we call `endAudio()` on its request, and
+    /// our default `utteranceBoundary = .auto` setting deliberately never does
+    /// that. Without a synthetic final the partials never reach
+    /// `ConversationContext.absorb` (which gates on `isFinal`), the AI never
+    /// sees what the user said, and `transcript.md` stays empty. We remember
+    /// the last partial and re-emit it as `isFinal=true` whenever the segment
+    /// ends — VAD boundary, scheduled restart, or transcriber stop.
+    private var pendingSegmentLastText: String = ""
+    /// Set when SFSpeech itself delivered an `isFinal=true` for the current
+    /// segment, so the synthetic-final emitter knows not to double-fire.
+    private var pendingSegmentHasNaturalFinal: Bool = false
     /// Rolling tail of recently-appended audio (~`replayMaxSeconds` worth). Replayed into
     /// every new request we install so audio that arrived while the previous task was
     /// finalizing (or dying with an error) is recovered. Without this, SFSpeech finalizing
@@ -205,6 +217,11 @@ private final class ChannelPipe {
     }
 
     func finish() {
+        // Flush a synthetic final for the in-flight utterance *before* marking
+        // `isFinished` — otherwise the helper short-circuits on the isFinished
+        // guard and we leak the last partial. This ensures the last words the
+        // user spoke before clicking Stop make it into transcript.md / context.
+        emitSyntheticFinalIfPendingAndAdvanceSegment()
         mutex.lock()
         isFinished = true
         let oldRequest = request
@@ -236,12 +253,44 @@ private final class ChannelPipe {
         next.taskHint = .dictation
         for buffer in replayBuffers { next.append(buffer) }
         request = next
-        segmentId = UUID()
         task = nil
         mutex.unlock()
+        // Race window: SFSpeech *might* deliver isFinal=true between endAudio()
+        // and cancel(). To avoid losing this utterance from context / transcript.md
+        // when it doesn't, flush a synthetic final now (which also advances
+        // segmentId). If the natural final does arrive later it'll be ignored by
+        // downstream consumers because `pendingSegmentHasNaturalFinal` was reset.
+        emitSyntheticFinalIfPendingAndAdvanceSegment()
         oldRequest.endAudio()
         oldTask?.cancel()
         startTask()
+    }
+
+    /// If we have a non-empty partial that SFSpeech never finalized for us,
+    /// emit it now as `isFinal=true` so downstream consumers (context.absorb,
+    /// transcript.md persistence) actually ingest the line. Always advances
+    /// `segmentId` so the next utterance starts fresh. No-op if the current
+    /// segment already received a natural `isFinal=true` or has no text.
+    private func emitSyntheticFinalIfPendingAndAdvanceSegment() {
+        mutex.lock()
+        let needs = !pendingSegmentHasNaturalFinal && !pendingSegmentLastText.isEmpty
+        let text = pendingSegmentLastText
+        let id = segmentId
+        let ch = channel
+        pendingSegmentLastText = ""
+        pendingSegmentHasNaturalFinal = false
+        segmentId = UUID()
+        mutex.unlock()
+        if needs {
+            sink.yield(TranscriptUpdate(
+                id: id,
+                text: text,
+                isFinal: true,
+                channel: ch,
+                timestamp: Date()
+            ))
+            wpInfo("Transcriber.\(ch) synthetic FINAL: \"\(text)\"")
+        }
     }
 
     private func startTask() {
@@ -273,7 +322,7 @@ private final class ChannelPipe {
                 // finals so the next non-empty result starts a fresh transcript line.
                 if trimmed.isEmpty {
                     if result.isFinal {
-                        segmentId = UUID()
+                        self.emitSyntheticFinalIfPendingAndAdvanceSegment()
                         self.continueAfterFinalization()
                         // Don't fall through to error handling — we've already replaced
                         // the request + task. A delayed scheduleRestart from a stale
@@ -297,11 +346,27 @@ private final class ChannelPipe {
                     wpInfo("Transcriber.\(channel) FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
                 }
                 if result.isFinal {
+                    // SFSpeech naturally finalized — consumers got their
+                    // isFinal=true via the yield above. Just reset pending state
+                    // and advance the segment id for the next utterance.
+                    self.mutex.lock()
+                    self.segmentId = UUID()
+                    self.pendingSegmentLastText = ""
+                    self.pendingSegmentHasNaturalFinal = false
+                    self.mutex.unlock()
                     wpInfo("Transcriber.\(channel) FINAL: \"\(update.text)\"")
-                    segmentId = UUID()
                     self.continueAfterFinalization()
                     // See comment above — don't fall through to the error branch.
                     return
+                } else {
+                    // Remember the latest partial so we can synthesize an
+                    // isFinal=true from it if SFSpeech never delivers one (the
+                    // default `utteranceBoundary = .auto` path never calls
+                    // endAudio, so the only natural finals come from silence
+                    // timeouts that we explicitly catch as errors).
+                    self.mutex.lock()
+                    self.pendingSegmentLastText = text
+                    self.mutex.unlock()
                 }
             }
             if let error {
@@ -316,7 +381,13 @@ private final class ChannelPipe {
                 } else {
                     wpError("Transcriber.\(channel) recognition error: \(error.localizedDescription)")
                 }
-                segmentId = UUID()
+                // The segment is dead. Flush a synthetic final from the last
+                // non-empty partial so downstream consumers (ConversationContext,
+                // transcript.md persistence) see *something* for this utterance —
+                // without it the user speaks, sees the live transcript, and then
+                // the AI claims to not know what was said because no isFinal=true
+                // ever reached the context.
+                self.emitSyntheticFinalIfPendingAndAdvanceSegment()
                 if self.autoRestart {
                     self.scheduleRestart()
                 }
