@@ -154,6 +154,14 @@ final class OverlayState: ObservableObject {
 
     @Published var audioFrameCount: Int = 0
     @Published var transcriptCount: Int = 0
+    /// Per-channel frame counters. Lets the no-frames watchdog tell the user
+    /// *which* side of the pipeline is silent — e.g., "mic is delivering audio
+    /// but ProcessTap hasn't produced a single system frame", which is the
+    /// usual signature of an output-device routing problem (Bluetooth /
+    /// aggregate / virtual driver) where capture starts cleanly but the
+    /// macOS audio mixdown we tap doesn't include the playing audio.
+    @Published var systemAudioFrameCount: Int = 0
+    @Published var microphoneFrameCount: Int = 0
 
     /// Per-channel mute. When true, captured frames for that channel are dropped before
     /// reaching VAD/transcription. Capture itself keeps running so the resume is instant.

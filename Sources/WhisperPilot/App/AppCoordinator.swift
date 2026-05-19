@@ -406,17 +406,34 @@ final class AppCoordinator {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             guard let self, self.isRunning else { return }
+            let sysCount = self.overlayState.systemAudioFrameCount
+            let micCount = self.overlayState.microphoneFrameCount
+            let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
+            let method = self.processTapFrames != nil ? "Core Audio Process Tap" : "ScreenCaptureKit"
             if self.overlayState.audioFrameCount == 0 {
-                let method = self.processTapFrames != nil ? "Core Audio Process Tap" : "ScreenCaptureKit"
-                let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
                 let micHint = self.settings.captureMicrophone
                     ? "Microphone capture is on — speak audibly into the mic, or play system audio through your default output device (“\(outName)”)."
                     : "Microphone capture is off. Either enable Capture Microphone in Settings → Capture so your voice is transcribed, or play system audio through your default output device (“\(outName)”)."
                 let message = "No audio frames after 6 seconds. \(method) is set up but isn't receiving any audio. \(micHint) Virtual / aggregate / Bluetooth output devices sometimes bypass the macOS audio mixdown that we capture from."
                 wpWarn(message)
                 self.noFramesWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
+            } else if sysCount == 0 && micCount > 0 {
+                // Mic is delivering, system is not. Classic ProcessTap / output-device
+                // routing problem — the audio you're playing isn't going through the
+                // mixdown we tap into. Tell the user exactly what's happening so they
+                // don't waste time wondering whether it's a transcription bug.
+                let message = "Microphone is delivering audio (\(micCount) frames) but no system audio frames have arrived via \(method). Your audio is likely playing through an output device (“\(outName)”) whose route bypasses the macOS audio mixdown — typical for Bluetooth headsets, virtual / aggregate devices, and some external DACs. Try switching your output to the built-in speakers temporarily, or play audio through a different app, to confirm."
+                wpWarn(message)
+                self.noFramesWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
+            } else if sysCount > 0 && micCount == 0 && self.settings.captureMicrophone {
+                // The reverse: system audio works but mic doesn't, even though
+                // capture mic is enabled. Most likely a permission or device
+                // selection problem.
+                let message = "System audio is being captured (\(sysCount) frames) but no microphone frames have arrived. Check System Settings → Privacy & Security → Microphone, and confirm the input device in Settings → Devices points at the mic you're using."
+                wpWarn(message)
+                self.noFramesWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             } else if self.overlayState.transcriptCount == 0 {
-                let message = "Audio is flowing (\(self.overlayState.audioFrameCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video."
+                let message = "Audio is flowing (sys=\(sysCount), mic=\(micCount) frames) but no transcripts yet. Speak audibly or play a clearly-spoken video."
                 wpWarn(message)
                 self.noTranscriptsWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             }
@@ -547,6 +564,8 @@ final class AppCoordinator {
         overlayState.status = .idle
         overlayState.audioFrameCount = 0
         overlayState.transcriptCount = 0
+        overlayState.systemAudioFrameCount = 0
+        overlayState.microphoneFrameCount = 0
         // Tear down any startup notes still floating from a stuck startup that the
         // user just bailed out of with Stop.
         dismissStartupNotes()
@@ -591,6 +610,8 @@ final class AppCoordinator {
         stuckStartupNoteID = nil
         overlayState.transcriptCount = 0
         overlayState.audioFrameCount = 0
+        overlayState.systemAudioFrameCount = 0
+        overlayState.microphoneFrameCount = 0
         await transcriptBuffer.clear()
         await context.reset()
 
@@ -1156,6 +1177,18 @@ final class AppCoordinator {
                 if framesProcessed % 25 == 0 {
                     let count = framesProcessed
                     Task { @MainActor [weak self] in self?.overlayState.audioFrameCount = count }
+                }
+                // Bump the per-channel counter for every frame so the watchdog can
+                // tell which side is silent. Cheaper to do unconditionally than to
+                // sample — the @Published assignment coalesces if the value didn't
+                // change observably.
+                let frameChannel = frame.channel
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    switch frameChannel {
+                    case .system: self.overlayState.systemAudioFrameCount += 1
+                    case .microphone: self.overlayState.microphoneFrameCount += 1
+                    }
                 }
                 // Per-channel mute gate. When muted, the captured frame is dropped before
                 // VAD/transcription so the recognizer doesn't waste cycles on audio the
