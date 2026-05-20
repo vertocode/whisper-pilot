@@ -91,6 +91,16 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
     /// produces cleaner, less fragmented lines than legacy SFSpeech did.
     func notifyVADBoundary(channel: AudioChannel) {}
 
+    /// SpeechAnalyzer naturally emits `isFinal=true` once its volatile range
+    /// advances past a result. We don't have a clean way to ask it to commit
+    /// early without closing the entire input stream (which would tear down
+    /// the analyzer mid-session). Returning empty here is correct — the
+    /// recently-spoken text will reach the context async on the analyzer's
+    /// own cadence, which for the macOS 26 path is typically fast enough that
+    /// the pre-prompt flush isn't needed. The hook exists in the protocol so
+    /// the SFSpeech path (Mac mini / older macOS) can use it.
+    func collectPendingFinals() -> [TranscriptUpdate] { [] }
+
     deinit {
         continuation.finish()
     }

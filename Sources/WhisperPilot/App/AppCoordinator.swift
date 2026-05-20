@@ -653,6 +653,7 @@ final class AppCoordinator {
 
         Task { [weak self] in
             guard let self else { return }
+            await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             var prompt = PromptBuilder.buildUserQuery(
                 context: self.filteredSnapshot(snapshot),
@@ -695,6 +696,7 @@ final class AppCoordinator {
         let history = chatHistorySnapshot(excludingLast: false)
         Task { [weak self] in
             guard let self else { return }
+            await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             let prompt = PromptBuilder.buildHelpAI(
                 context: self.filteredSnapshot(snapshot),
@@ -1298,7 +1300,8 @@ final class AppCoordinator {
                 // shows up as nothing at all.
                 self.overlayState.appendAutoTriggerPreamble(origin: .detectedQuestion, text: trigger.text)
                 self.overlayState.status = .thinking
-                let snapshot = await self.context.snapshotWithPrior()
+                await self.absorbPendingTranscripts()
+            let snapshot = await self.context.snapshotWithPrior()
                 let style = self.settings.responseStyle
                 let history = self.chatHistorySnapshot(excludingLast: false)
                 let prompt = PromptBuilder.build(
@@ -1458,6 +1461,35 @@ final class AppCoordinator {
     /// gated on the chat-history flag. `entities` is kept either way — it's a tiny
     /// derived list and useful for the model's continuity even when both sections
     /// are otherwise excluded.
+    /// Force the active transcriber to flush any in-progress partials as
+    /// synthetic finals, then synchronously absorb them into `ConversationContext`
+    /// before we snapshot for a prompt build. Without this, a user who speaks
+    /// and then immediately asks the AI gets "I don't know what you said" —
+    /// SFSpeech doesn't naturally emit `isFinal=true` until it hits its silence
+    /// timeout (~30–60s later), and `context.absorb` only ingests finals.
+    ///
+    /// Direct absorb (rather than relying on the async transcripts-stream
+    /// consumer) is essential: we need the context snapshot taken immediately
+    /// after this call to include the freshly-flushed lines.
+    private func absorbPendingTranscripts() async {
+        guard let transcriber else { return }
+        let pendings = transcriber.collectPendingFinals()
+        for update in pendings {
+            // Respect the same per-channel inclusion gates the normal consumer
+            // applies — system-audio prompt inclusion can be toggled off in
+            // Settings, in which case the model shouldn't see system lines.
+            let shouldAbsorb: Bool
+            if update.channel == .system {
+                shouldAbsorb = settings.includeSystemAudioInPrompt
+            } else {
+                shouldAbsorb = true
+            }
+            if shouldAbsorb {
+                await context.absorb(update)
+            }
+        }
+    }
+
     private func filteredSnapshot(_ snapshot: ConversationSnapshot) -> ConversationSnapshot {
         let includeT = settings.includeTranscriptInPrompt
         let includeH = settings.includeChatHistoryInPrompt

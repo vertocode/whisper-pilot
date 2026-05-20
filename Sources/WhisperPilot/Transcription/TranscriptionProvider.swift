@@ -23,4 +23,13 @@ protocol TranscriptionProvider: AnyObject, Sendable {
     /// so the next partial begins a new transcript line — without this, dictation-mode
     /// recognizers tend to keep overwriting one ever-growing segment.
     func notifyVADBoundary(channel: AudioChannel)
+    /// Collect synthetic `isFinal=true` updates for any in-progress partials the
+    /// recognizer hasn't naturally finalized yet, yield them via the `transcripts`
+    /// stream (so the buffer + transcript.md catch up), and return them so the
+    /// coordinator can directly absorb them into the AI context BEFORE building a
+    /// prompt. Without this, a user who speaks and immediately asks the AI gets
+    /// "I don't know what you said" because partials never reached
+    /// `ConversationContext` (which gates on `isFinal=true`). Idempotent: a second
+    /// call with no new partial in between returns an empty array.
+    func collectPendingFinals() -> [TranscriptUpdate]
 }

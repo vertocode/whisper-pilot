@@ -62,6 +62,10 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
         }
     }
 
+    func collectPendingFinals() -> [TranscriptUpdate] {
+        [systemPipe?.takePendingFinal(), micPipe?.takePendingFinal()].compactMap { $0 }
+    }
+
     deinit {
         continuation.finish()
     }
@@ -266,6 +270,38 @@ private final class ChannelPipe {
         startTask()
     }
 
+    /// Emit a synthetic `isFinal=true` for the current segment without
+    /// advancing it. Used by the coordinator's pre-prompt flush so the AI sees
+    /// what the user just spoke, even when the recognizer hasn't naturally
+    /// finalized yet. Returns the emitted update so the caller can also
+    /// absorb it into `ConversationContext` synchronously (the async stream
+    /// path is too late for a freshly-built prompt). Idempotent — once a flush
+    /// has fired, the next call returns `nil` until the next partial arrives
+    /// and re-arms the flag.
+    fileprivate func takePendingFinal() -> TranscriptUpdate? {
+        mutex.lock()
+        let needs = !pendingSegmentHasNaturalFinal && !pendingSegmentLastText.isEmpty
+        let text = pendingSegmentLastText
+        let id = segmentId
+        let ch = channel
+        // Mark the segment as finalized so subsequent flushes / cycle calls
+        // don't double-emit. A later natural-final from SFSpeech (or a new
+        // partial) will reset this flag and re-arm flushing.
+        pendingSegmentHasNaturalFinal = true
+        mutex.unlock()
+        guard needs else { return nil }
+        let update = TranscriptUpdate(
+            id: id,
+            text: text,
+            isFinal: true,
+            channel: ch,
+            timestamp: Date()
+        )
+        sink.yield(update)
+        wpInfo("Transcriber.\(ch) flushed synthetic FINAL: \"\(text)\"")
+        return update
+    }
+
     /// If we have a non-empty partial that SFSpeech never finalized for us,
     /// emit it now as `isFinal=true` so downstream consumers (context.absorb,
     /// transcript.md persistence) actually ingest the line. Always advances
@@ -363,9 +399,13 @@ private final class ChannelPipe {
                     // isFinal=true from it if SFSpeech never delivers one (the
                     // default `utteranceBoundary = .auto` path never calls
                     // endAudio, so the only natural finals come from silence
-                    // timeouts that we explicitly catch as errors).
+                    // timeouts that we explicitly catch as errors). Also clear
+                    // `hasNaturalFinal` so the next flush (synthetic or natural)
+                    // re-emits — the new partial means the previous final no
+                    // longer reflects what's being said.
                     self.mutex.lock()
                     self.pendingSegmentLastText = text
+                    self.pendingSegmentHasNaturalFinal = false
                     self.mutex.unlock()
                 }
             }

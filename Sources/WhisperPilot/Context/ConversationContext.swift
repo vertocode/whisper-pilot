@@ -22,7 +22,17 @@ struct ConversationSnapshot: Sendable {
 /// set of extracted topics/entities so the model has continuity across turns without us re-sending
 /// the whole transcript.
 actor ConversationContext {
-    private var lines: [(channel: AudioChannel, text: String, at: Date)] = []
+    /// One line per finalized utterance. Keyed by `id` so a second isFinal for
+    /// the same segment (e.g., the natural SFSpeech final following our
+    /// synthesized one, or a pre-prompt flush followed by a VAD-end cycle)
+    /// updates the existing line in place rather than appending a duplicate.
+    private struct Line {
+        let id: UUID
+        let channel: AudioChannel
+        var text: String
+        var at: Date
+    }
+    private var lines: [Line] = []
     private var topics = OrderedSet<String>(maxSize: 24)
     private var entities = OrderedSet<String>(maxSize: 32)
     private let retentionSeconds: TimeInterval = 300
@@ -31,7 +41,12 @@ actor ConversationContext {
 
     func absorb(_ update: TranscriptUpdate) {
         guard update.isFinal, !update.text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        lines.append((update.channel, update.text, update.timestamp))
+        if let idx = lines.firstIndex(where: { $0.id == update.id }) {
+            lines[idx].text = update.text
+            lines[idx].at = update.timestamp
+        } else {
+            lines.append(Line(id: update.id, channel: update.channel, text: update.text, at: update.timestamp))
+        }
         prune()
 
         let extracted = extractor.extract(from: update.text)
@@ -44,9 +59,9 @@ actor ConversationContext {
     }
 
     func snapshot() -> ConversationSnapshot {
-        let formatted = lines.map { entry -> String in
-            let speaker = entry.channel == .system ? "Other" : "Me"
-            return "\(speaker): \(entry.text)"
+        let formatted = lines.map { line -> String in
+            let speaker = line.channel == .system ? "Other" : "Me"
+            return "\(speaker): \(line.text)"
         }
         return ConversationSnapshot(
             recentLines: formatted,
