@@ -290,7 +290,11 @@ final class AppCoordinator {
         // pure audio capture, no Screen Recording prompt, no "screen is being recorded"
         // mode that breaks Live Captions and confuses some macOS audio routing setups.
         // ScreenCaptureKit remains the fallback for older OSes or when the tap fails.
-        if #available(macOS 14.4, *) {
+        // The `forceScreenCaptureKitForSystemAudio` opt-out is for Macs (some Mac mini
+        // configurations) where ProcessTap creates without error but silently delivers
+        // zero frames — flipping the setting forces the SCK path, which triggers the
+        // Screen Recording permission prompt and reliably captures audio there.
+        if #available(macOS 14.4, *), !settings.forceScreenCaptureKitForSystemAudio {
             let pt = ProcessAudioCapture()
             do {
                 try await pt.start()
@@ -300,6 +304,8 @@ final class AppCoordinator {
             } catch {
                 wpWarn("Process Tap unavailable (\(error.localizedDescription)); falling back to ScreenCaptureKit")
             }
+        } else if settings.forceScreenCaptureKitForSystemAudio {
+            wpInfo("[Coordinator] ProcessTap skipped by user setting (forceScreenCaptureKitForSystemAudio = true)")
         }
 
         if processTapFrames == nil {

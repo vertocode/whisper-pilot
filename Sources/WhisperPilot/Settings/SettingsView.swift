@@ -205,6 +205,10 @@ struct SettingsView: View {
                 Toggle("Capture microphone", isOn: $store.captureMicrophone)
                 FormHint("System audio (everything macOS plays — Teams, Meet, Slack, browser) is always captured. Microphone is optional and lets the assistant attribute who said what.")
             }
+            Section("System audio capture method") {
+                Toggle("Force ScreenCaptureKit (requires Screen Recording permission)", isOn: $store.forceScreenCaptureKitForSystemAudio)
+                FormHint("By default Whisper Pilot uses Core Audio Process Taps (macOS 14.4+) which capture system audio without asking for Screen Recording permission. On some Macs the Process Tap reports success but silently delivers no frames — if you see “Mic is delivering audio but no system audio frames” in the transcript pane, flip this on. macOS will then ask for Screen Recording permission on the next Play, and system audio capture should start working.")
+            }
         }
         .formStyle(.grouped)
     }

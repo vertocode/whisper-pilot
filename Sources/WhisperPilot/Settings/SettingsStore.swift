@@ -53,6 +53,7 @@ final class SettingsStore: ObservableObject {
         static let geminiModel = "gemini.model"
         static let responseStyle = "response.style"
         static let captureMicrophone = "capture.microphone"
+        static let forceScreenCaptureKitForSystemAudio = "capture.forceScreenCaptureKitForSystemAudio"
         static let alwaysOnTop = "overlay.alwaysOnTop"
         static let clickThrough = "overlay.clickThrough"
         static let localeIdentifier = "transcription.locale"
@@ -77,6 +78,18 @@ final class SettingsStore: ObservableObject {
 
     @Published var captureMicrophone: Bool {
         didSet { defaults.set(captureMicrophone, forKey: Keys.captureMicrophone) }
+    }
+
+    /// When true, we skip the Core Audio Process Tap path (macOS 14.4+) and
+    /// always use ScreenCaptureKit for system audio. The Process Tap is
+    /// preferred by default because it doesn't ask for Screen Recording
+    /// permission, but on some Macs (notably some Mac mini configurations) it
+    /// creates without error and then silently delivers zero frames — system
+    /// audio never reaches the transcriber. Flipping this on forces SCK, which
+    /// triggers macOS's Screen Recording permission prompt and reliably
+    /// captures system audio in those environments.
+    @Published var forceScreenCaptureKitForSystemAudio: Bool {
+        didSet { defaults.set(forceScreenCaptureKitForSystemAudio, forKey: Keys.forceScreenCaptureKitForSystemAudio) }
     }
 
     @Published var alwaysOnTop: Bool {
@@ -158,6 +171,10 @@ final class SettingsStore: ObservableObject {
         // forever because nothing feeds the mixer. macOS will request mic permission
         // on the first Play; once granted, transcription "just works".
         self.captureMicrophone = defaults.object(forKey: Keys.captureMicrophone) as? Bool ?? true
+        // Default to false: ProcessTap is genuinely better when it works (no
+        // Screen Recording prompt, lower overhead). Users on Macs where it
+        // silently fails can flip this in Settings → Capture.
+        self.forceScreenCaptureKitForSystemAudio = defaults.object(forKey: Keys.forceScreenCaptureKitForSystemAudio) as? Bool ?? false
         self.alwaysOnTop = defaults.object(forKey: Keys.alwaysOnTop) as? Bool ?? true
         self.clickThrough = defaults.object(forKey: Keys.clickThrough) as? Bool ?? false
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier
