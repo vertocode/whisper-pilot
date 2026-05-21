@@ -36,6 +36,11 @@ final class LogBuffer: ObservableObject {
         if level == .warn || level == .error {
             unseenAlertCount += 1
         }
+        // Mirror every entry into the on-disk crash log. The in-memory buffer
+        // above is gone the instant the process dies; the file persists. On
+        // next launch, `CrashLogger.logTail()` is what the user can paste into
+        // a bug report when the app vanished without leaving a Cocoa dialog.
+        CrashLogger.shared.writeLine("[\(level.rawValue.uppercased())] \(message)")
     }
 
     func clearAlertBadge() {

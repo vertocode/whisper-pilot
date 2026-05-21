@@ -13,6 +13,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // Start the crash logger BEFORE anything else so the earliest possible
+        // wpInfo / wpError lines + any startup crash land on disk. The
+        // unclean-shutdown check immediately below uses its sentinel.
+        CrashLogger.shared.start()
+        if CrashLogger.shared.wasLastRunUnclean() {
+            wpWarn("Previous Whisper Pilot session did not shut down cleanly — see runtime.log for the last activity before it died. Log: \(CrashLogger.shared.logFilePath)")
+            if let tail = CrashLogger.shared.logTail(bytes: 4_000), !tail.isEmpty {
+                // Trim to the last few lines so the UI alert badge isn't overwhelmed
+                // — the full log is still on disk for deeper inspection.
+                let lastLines = tail.split(separator: "\n").suffix(20).joined(separator: "\n")
+                wpWarn("Tail of previous runtime.log:\n\(lastLines)")
+            }
+        }
         print("[WP] applicationDidFinishLaunching")
 
         let actions = OverlayActions(
@@ -102,6 +115,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Task { await coordinator.shutdown() }
+        // Mark a clean shutdown so the next launch doesn't false-alarm
+        // "previous run ended unexpectedly". Runs after the coordinator's
+        // own shutdown is queued — the sentinel removal is what differentiates
+        // a clean exit from a kernel-killed one.
+        CrashLogger.shared.markCleanShutdown()
     }
 
     func showSettings() {
