@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Subtle "Buy me a coffee" link that deep-links into vertocode.com's
-/// donation modal via the `?coffee=true` query param so the user lands
-/// directly on the form rather than the footer of the portfolio site.
+/// Subtle "Buy me a coffee" link that opens vertocode.com's dedicated
+/// donation page (`/coffee`). The page renders a full payment form via
+/// `CoffeeForm.vue` on the portfolio — card + PIX, your choice.
 ///
 /// Reused from three surfaces — the overlay footer, the Sessions home page
 /// header, and the Settings header — so style + copy + target URL stay in
@@ -16,7 +16,7 @@ struct SupportLink: View {
 
     let style: Style
 
-    private static let url = URL(string: "https://vertocode.com/?coffee=true")!
+    private static let url = URL(string: "https://vertocode.com/coffee")!
 
     var body: some View {
         Link(destination: Self.url) {
