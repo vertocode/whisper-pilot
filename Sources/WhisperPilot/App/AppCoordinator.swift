@@ -454,6 +454,35 @@ final class AppCoordinator {
                 wpWarn(message)
                 self.noTranscriptsWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             }
+
+            // Specific case: system audio frames are flowing but produce no
+            // transcripts, while mic transcripts work fine — the classic
+            // "ProcessTap reads an empty mixdown" scenario on Macs where the
+            // output device (USB / Bluetooth / aggregate) bypasses the global
+            // audio mixdown. The audio in the captured buffer is bit-for-bit
+            // zero, so no amount of gain helps. Switching to ScreenCaptureKit
+            // uses a different capture mechanism and usually works in this
+            // setup — surface the fix as a one-click button rather than
+            // expecting the user to dig through Settings → Capture.
+            let sysFrames = self.overlayState.systemAudioFrameCount
+            let sysTranscripts = self.overlayState.systemTranscriptCount
+            let micTranscripts = self.overlayState.microphoneTranscriptCount
+            let usingProcessTap = (self.processTapFrames != nil)
+            let forceSCKAlreadyOn = self.settings.forceScreenCaptureKitForSystemAudio
+            if usingProcessTap,
+               !forceSCKAlreadyOn,
+               sysFrames > 100,
+               sysTranscripts == 0,
+               micTranscripts > 0 {
+                let message = "System audio frames are arriving (sys=\(sysFrames)) but contain silence — the macOS audio mixdown that Core Audio Process Tap reads from looks empty. This usually happens when the Mac's output device (USB headset, Bluetooth headphones, aggregate / virtual driver) routes audio in a way that bypasses the mixdown. Switching to ScreenCaptureKit uses a different capture path and typically works around it."
+                wpWarn(message)
+                self.overlayState.appendSystemNote(
+                    "⚠️ \(message)",
+                    category: .transcript,
+                    actionLabel: "Enable ScreenCaptureKit & retry",
+                    actionKind: .enableForceSCKAndRestart
+                )
+            }
         }
     }
 
@@ -572,6 +601,8 @@ final class AppCoordinator {
         overlayState.transcriptCount = 0
         overlayState.systemAudioFrameCount = 0
         overlayState.microphoneFrameCount = 0
+        overlayState.systemTranscriptCount = 0
+        overlayState.microphoneTranscriptCount = 0
         // Tear down any startup notes still floating from a stuck startup that the
         // user just bailed out of with Stop.
         dismissStartupNotes()
@@ -618,6 +649,8 @@ final class AppCoordinator {
         overlayState.audioFrameCount = 0
         overlayState.systemAudioFrameCount = 0
         overlayState.microphoneFrameCount = 0
+        overlayState.systemTranscriptCount = 0
+        overlayState.microphoneTranscriptCount = 0
         await transcriptBuffer.clear()
         await context.reset()
 
@@ -1266,6 +1299,20 @@ final class AppCoordinator {
                 if transcriptsSeen == 1 {
                     wpInfo("First transcript update received")
                     self?.dismissNoTranscriptsWarning()
+                }
+                // Per-channel finalized-transcript counters. The watchdog uses
+                // these to tell apart "ProcessTap is delivering silent buffers
+                // → no system transcripts" from "user just hasn't spoken yet
+                // → no mic transcripts" — they have very different remedies.
+                if update.isFinal {
+                    let channel = update.channel
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        switch channel {
+                        case .system: self.overlayState.systemTranscriptCount += 1
+                        case .microphone: self.overlayState.microphoneTranscriptCount += 1
+                        }
+                    }
                 }
 
                 // Persist finalized transcript lines to the active session's transcript.md

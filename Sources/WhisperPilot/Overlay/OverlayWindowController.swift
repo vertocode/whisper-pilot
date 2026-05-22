@@ -34,6 +34,11 @@ struct OverlayActions {
     var toggleSystemAudioMute: () -> Void
     /// Save the current session's transcript markdown to a user-chosen location.
     var exportTranscript: () -> Void
+    /// Run an inline button action embedded in a system note (e.g., the
+    /// no-transcripts watchdog's "Enable Force ScreenCaptureKit and retry"
+    /// button). The handler is responsible for both the side effect and any
+    /// UI confirmation message.
+    var runChatAction: (ChatMessageAction) -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

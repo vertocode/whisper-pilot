@@ -105,6 +105,19 @@ enum OverlayStatus: Equatable, Sendable {
     }
 }
 
+/// Inline button actions a system note can attach. The note's text gives the
+/// user context; tapping the button dispatches one of these to the coordinator
+/// (via `OverlayActions.runChatAction`). Add new cases here when you want to
+/// surface a "fix" affordance from a diagnostic message without making the
+/// user dig through Settings.
+enum ChatMessageAction: String, Sendable {
+    /// Flip `settings.forceScreenCaptureKitForSystemAudio` on and immediately
+    /// restart listening so SCK takes over the system-audio capture path.
+    /// Used by the no-transcripts watchdog when the symptom matches the
+    /// "ProcessTap delivers silent frames" case.
+    case enableForceSCKAndRestart
+}
+
 struct ChatMessage: Identifiable, Equatable, Sendable {
     enum Role: String, Sendable { case user, assistant, system }
     enum Origin: String, Sendable {
@@ -137,6 +150,11 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     let timestamp: Date
     var isStreaming: Bool
     var category: Category
+    /// Optional inline button rendered next to the text. When set, both
+    /// `actionLabel` and `actionKind` must be non-nil — the label is what
+    /// shows on the button, the kind is what gets dispatched on tap.
+    var actionLabel: String? = nil
+    var actionKind: ChatMessageAction? = nil
 }
 
 @MainActor
@@ -167,6 +185,12 @@ final class OverlayState: ObservableObject {
     /// macOS audio mixdown we tap doesn't include the playing audio.
     @Published var systemAudioFrameCount: Int = 0
     @Published var microphoneFrameCount: Int = 0
+    /// Per-channel finalized-transcript counters. Lets the no-transcripts
+    /// watchdog tell the difference between "system audio is producing
+    /// silent buffers" (frames > 0, sys transcripts == 0) and "user just
+    /// hasn't said anything yet" (both transcript counts == 0).
+    @Published var systemTranscriptCount: Int = 0
+    @Published var microphoneTranscriptCount: Int = 0
 
     /// Per-channel mute. When true, captured frames for that channel are dropped before
     /// reaching VAD/transcription. Capture itself keeps running so the resume is instant.
@@ -231,8 +255,23 @@ final class OverlayState: ObservableObject {
     }
 
     @discardableResult
-    func appendSystemNote(_ text: String, category: ChatMessage.Category = .general) -> UUID {
-        let msg = ChatMessage(id: UUID(), role: .system, origin: .system, text: text, timestamp: Date(), isStreaming: false, category: category)
+    func appendSystemNote(
+        _ text: String,
+        category: ChatMessage.Category = .general,
+        actionLabel: String? = nil,
+        actionKind: ChatMessageAction? = nil
+    ) -> UUID {
+        let msg = ChatMessage(
+            id: UUID(),
+            role: .system,
+            origin: .system,
+            text: text,
+            timestamp: Date(),
+            isStreaming: false,
+            category: category,
+            actionLabel: actionLabel,
+            actionKind: actionKind
+        )
         messages.append(msg)
         trim()
         return msg.id

@@ -347,7 +347,7 @@ struct OverlayView: View {
                 BannerView(spec: banner)
             }
             ForEach(generalNotes) { note in
-                MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
+                MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) }, onRunAction: actions.runChatAction)
             }
         }
         .padding(.horizontal, WP.Space.md)
@@ -367,6 +367,7 @@ struct OverlayView: View {
                 isAIPaused: state.isAIPaused,
                 onToggleAI: actions.toggleAIPaused,
                 onDismissMessage: actions.dismissMessage,
+                onRunAction: actions.runChatAction,
                 sessionContext: $state.sessionContext,
                 isCollapsed: true,
                 onToggleCollapse: { chatCollapsed.toggle() }
@@ -380,6 +381,7 @@ struct OverlayView: View {
                         isAIPaused: state.isAIPaused,
                         onToggleAI: actions.toggleAIPaused,
                         onDismissMessage: actions.dismissMessage,
+                        onRunAction: actions.runChatAction,
                         sessionContext: $state.sessionContext,
                         isCollapsed: false,
                         onToggleCollapse: { chatCollapsed.toggle() }
@@ -423,7 +425,7 @@ struct OverlayView: View {
                             onToggleCollapse: { transcriptCollapsed.toggle() }
                         )
                         ForEach(transcriptNotes) { note in
-                            MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) })
+                            MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) }, onRunAction: actions.runChatAction)
                                 .id(note.id)
                         }
                     }
@@ -750,6 +752,7 @@ private struct ChatLane: View {
     let isAIPaused: Bool
     let onToggleAI: () -> Void
     let onDismissMessage: (UUID) -> Void
+    let onRunAction: (ChatMessageAction) -> Void
     /// Two-way binding to the session's user-supplied context (notes + attached
     /// files). Edits flow through `OverlayState.sessionContext`; the coordinator
     /// debounces saves to disk.
@@ -786,8 +789,12 @@ private struct ChatLane: View {
                     )
                 } else {
                     ForEach(messages) { message in
-                        MessageBubble(message: message, onDismiss: { onDismissMessage(message.id) })
-                            .id(message.id)
+                        MessageBubble(
+                            message: message,
+                            onDismiss: { onDismissMessage(message.id) },
+                            onRunAction: onRunAction
+                        )
+                        .id(message.id)
                     }
                 }
             }
@@ -849,6 +856,10 @@ private struct AIToggleButton: View {
 private struct MessageBubble: View {
     let message: ChatMessage
     var onDismiss: (() -> Void)? = nil
+    /// Dispatcher for inline action buttons embedded in system notes — e.g.
+    /// the no-transcripts watchdog's "Enable ScreenCaptureKit & retry" button.
+    /// Nil = the message has no actionable button (most cases).
+    var onRunAction: ((ChatMessageAction) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.xs + 2) {
@@ -888,6 +899,20 @@ private struct MessageBubble: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .tint(.accentColor)
+            // Inline action button — currently only used by the watchdog to
+            // offer "Enable ScreenCaptureKit & retry" when system audio is
+            // captured but silent. Rendered below the message text so it's
+            // visually grouped with the explanation it acts on.
+            if let label = message.actionLabel,
+               let actionKind = message.actionKind,
+               let onRunAction {
+                Button(label) {
+                    onRunAction(actionKind)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .padding(.top, 2)
+            }
         }
         .padding(WP.Space.md - 2)
         .background(

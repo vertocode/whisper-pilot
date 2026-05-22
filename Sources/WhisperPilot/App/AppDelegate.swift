@@ -85,6 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             exportTranscript: { [weak self] in
                 self?.exportCurrentTranscript()
+            },
+            runChatAction: { [weak self] action in
+                self?.handleChatAction(action)
             }
         )
 
@@ -111,6 +114,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         Task { await coordinator.bootstrap() }
+    }
+
+    /// Resolve an inline-button action posted from a system note. Today there's
+    /// only one such action — flipping the Force-SCK setting and bouncing the
+    /// listening pipeline so the change takes effect immediately — but new
+    /// cases get added here as future watchdog messages grow buttons.
+    func handleChatAction(_ action: ChatMessageAction) {
+        switch action {
+        case .enableForceSCKAndRestart:
+            coordinator.settings.forceScreenCaptureKitForSystemAudio = true
+            // The capture-path decision is made inside `startListening`, so a
+            // running session needs a stop+start to pick up the new setting.
+            // If nothing is running, just save the setting and let the user
+            // click ▶ themselves — bouncing nothing would surface a confusing
+            // "Starting…" state.
+            Task { [coordinator] in
+                if await coordinator.isRunning {
+                    await coordinator.stopListening()
+                    await coordinator.startListening()
+                }
+                await MainActor.run {
+                    coordinator.overlayState.appendSystemNote(
+                        "ℹ️ ScreenCaptureKit enabled for system audio. macOS will ask for Screen Recording permission on the next Play if it hasn't already.",
+                        category: .transcript
+                    )
+                }
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
