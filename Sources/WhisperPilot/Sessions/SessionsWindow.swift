@@ -139,6 +139,11 @@ struct SessionsView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            // Expanded form: the Sessions window has plenty of horizontal
+            // room in its header bar, and this is one of the surfaces a
+            // returning user is most likely to be looking at — better
+            // discoverability than the cramped overlay composer row.
+            SupportLink(style: .expanded)
             Button {
                 NSWorkspace.shared.open(SessionStore.shared.rootURL)
             } label: {

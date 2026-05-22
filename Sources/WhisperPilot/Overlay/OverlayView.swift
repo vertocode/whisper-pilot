@@ -585,6 +585,11 @@ struct OverlayView: View {
                 .help("Ask the AI to find any unanswered question in the recent transcript and answer it, using full context.")
 
                 Spacer(minLength: 0)
+
+                // Unobtrusive contribute link in the composer row. Compact form
+                // because the row already holds two pill-buttons and an arrow
+                // submit — adding a full label here would crowd the layout.
+                SupportLink(style: .compact)
             }
         }
         .padding(.horizontal, WP.Space.md)

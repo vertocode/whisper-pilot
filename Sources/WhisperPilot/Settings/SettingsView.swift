@@ -44,6 +44,10 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            // Shown across every Settings tab — one place a user already opens
+            // when they're looking up where things live, so it's a natural
+            // spot to put the optional "say thanks" affordance.
+            SupportLink(style: .expanded)
         }
         .padding(.horizontal, WP.Space.xs)
         .padding(.bottom, WP.Space.xs)
