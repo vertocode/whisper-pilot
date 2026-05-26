@@ -93,6 +93,68 @@ enum PromptBuilder {
         )
     }
 
+    /// Triggered by the "Summary" button. Asks the model to produce a self-
+    /// contained recap of the meeting using the full transcript + AI chat as
+    /// context. Style is ignored — the directive overrides it so a user with
+    /// Concise selected still gets a usable summary instead of a one-liner.
+    static func buildSummary(context: ConversationSnapshot, history: [ChatTurn]) -> Prompt {
+        let system = """
+        You are summarizing a meeting that's still in progress. Use the live transcript and \
+        prior AI chat below as your only source of truth — do not invent anything that isn't \
+        in the conversation.
+
+        Produce a clear recap covering:
+        - What was discussed (1–3 sentences of context).
+        - Key points or decisions raised.
+        - Any open questions or unresolved topics.
+
+        Use short bullet groups under brief headings, or plain prose if the content is small. \
+        Keep it readable in under a minute. If the transcript is empty or only contains small \
+        talk, say so in one short line instead of padding.
+        """
+        return Prompt(
+            systemInstruction: system,
+            context: contextBlock(transcript: context, history: history),
+            question: "Summarize the meeting so far based on the transcript and AI chat above.",
+            // .detailed framing matches the directive's expectation of a multi-section reply.
+            style: .detailed
+        )
+    }
+
+    /// Triggered by the "Action items" button. Extracts commitments / TODOs
+    /// from the transcript + AI chat. If genuinely none, the model is told to
+    /// say so explicitly rather than fabricate placeholder items.
+    static func buildActionItems(context: ConversationSnapshot, history: [ChatTurn]) -> Prompt {
+        let system = """
+        You are extracting action items from a meeting that's still in progress. Use the live \
+        transcript and prior AI chat below as your only source of truth — do not fabricate \
+        items, and do not infer commitments that weren't actually expressed.
+
+        An action item is anything someone committed to do, was asked to do, or clearly needs \
+        to do as a result of this conversation. Look for:
+        - Explicit commitments: "I'll send the doc", "I'll review the PR by Friday".
+        - Requests / assignments: "can you take a look at this", "Hector should ping the team".
+        - Clear follow-ups: "we need to schedule a sync about X", "let's double-check Y".
+
+        For each action item, list:
+        - Who owns it (use the name if it appears in the transcript; otherwise "Me" or "Other").
+        - What needs to be done (one short sentence).
+        - When it's due, only if a deadline was actually mentioned.
+
+        Format as a short numbered list, one item per line.
+
+        If you genuinely cannot find any action items in the transcript, respond with exactly \
+        this single line and nothing else:
+        "I analyzed the entire transcript but found no pending action items."
+        """
+        return Prompt(
+            systemInstruction: system,
+            context: contextBlock(transcript: context, history: history),
+            question: "List the pending action items from the meeting so far.",
+            style: .detailed
+        )
+    }
+
     private static func contextBlock(transcript: ConversationSnapshot, history: [ChatTurn]) -> String {
         var sections: [String] = []
 

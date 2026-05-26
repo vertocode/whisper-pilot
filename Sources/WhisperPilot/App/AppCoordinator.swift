@@ -767,6 +767,61 @@ final class AppCoordinator {
         }
     }
 
+    /// "Summary" button — recap the meeting from the live transcript + AI chat.
+    /// Same plumbing as Help AI: flush pending transcripts so the snapshot is
+    /// current, then call the model with the dedicated summary prompt.
+    func requestSummary() {
+        guard let ai = aiProvider else {
+            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            return
+        }
+        overlayState.appendAutoTriggerPreamble(
+            origin: .summary,
+            text: "Summarizing the meeting so far…"
+        )
+        overlayState.status = .thinking
+        wpInfo("[Coordinator] Summary requested")
+        let history = chatHistorySnapshot(excludingLast: false)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.absorbPendingTranscripts()
+            let snapshot = await self.context.snapshotWithPrior()
+            let prompt = PromptBuilder.buildSummary(
+                context: self.filteredSnapshot(snapshot),
+                history: self.filteredHistory(history)
+            )
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .summary)
+        }
+    }
+
+    /// "Action items" button — pull explicit commitments / asks out of the
+    /// transcript. The prompt instructs the model to say "no action items
+    /// found" verbatim if nothing qualifies, so the user always gets a
+    /// definitive answer instead of a hedged "maybe…" reply.
+    func requestActionItems() {
+        guard let ai = aiProvider else {
+            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            return
+        }
+        overlayState.appendAutoTriggerPreamble(
+            origin: .actionItems,
+            text: "Extracting action items from the transcript…"
+        )
+        overlayState.status = .thinking
+        wpInfo("[Coordinator] Action items requested")
+        let history = chatHistorySnapshot(excludingLast: false)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.absorbPendingTranscripts()
+            let snapshot = await self.context.snapshotWithPrior()
+            let prompt = PromptBuilder.buildActionItems(
+                context: self.filteredSnapshot(snapshot),
+                history: self.filteredHistory(history)
+            )
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .actionItems)
+        }
+    }
+
     /// Captures the primary display via ScreenCaptureKit, downsamples to ≤1280 px wide so
     /// we don't ship 4K frames to the model, and JPEG-encodes at quality 0.7. Returns nil
     /// if Screen Recording permission isn't granted or no display is shareable.

@@ -63,6 +63,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("[WP] action.requestHelpAI fired")
                 self?.coordinator.requestHelpAI()
             },
+            requestSummary: { [weak self] in
+                print("[WP] action.requestSummary fired")
+                self?.coordinator.requestSummary()
+            },
+            requestActionItems: { [weak self] in
+                print("[WP] action.requestActionItems fired")
+                self?.coordinator.requestActionItems()
+            },
             goToSessions: { [weak self] in
                 print("[WP] action.goToSessions fired")
                 Task { [weak self] in

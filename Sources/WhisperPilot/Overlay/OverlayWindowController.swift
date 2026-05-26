@@ -17,6 +17,12 @@ struct OverlayActions {
     /// "Help AI" button: ask the AI to find any unanswered question in the recent
     /// transcript and answer it. No user text needed.
     var requestHelpAI: () -> Void
+    /// "Summary" button: AI produces a recap of the meeting from the full
+    /// transcript + AI chat. Available at any point during the session.
+    var requestSummary: () -> Void
+    /// "Action items" button: AI pulls explicit commitments / TODOs from the
+    /// transcript + AI chat, or reports that no action items are pending.
+    var requestActionItems: () -> Void
     /// Stops listening, hides the overlay, brings the Sessions window back to front so
     /// the user can pick a different session or start a new one.
     var goToSessions: () -> Void

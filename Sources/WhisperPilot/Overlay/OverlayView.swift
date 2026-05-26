@@ -584,6 +584,49 @@ struct OverlayView: View {
                 .buttonStyle(.plain)
                 .help("Ask the AI to find any unanswered question in the recent transcript and answer it, using full context.")
 
+                // Summary: recap the whole meeting on demand. Blue so the row reads
+                // green / blue / orange = ask / inform / track.
+                Button(action: { actions.requestSummary() }) {
+                    HStack(spacing: WP.Space.xs) {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Summary")
+                            .font(WP.TextStyle.micro)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(Color.blue.opacity(0.18))
+                    )
+                    .overlay(
+                        Capsule().strokeBorder(Color.blue.opacity(0.45), lineWidth: 0.75)
+                    )
+                    .foregroundStyle(Color.blue)
+                }
+                .buttonStyle(.plain)
+                .help("Ask the AI for a recap of the meeting so far — covers what was discussed, decisions made, and open questions.")
+
+                // Action items: extract commitments. Orange = todo / pending.
+                Button(action: { actions.requestActionItems() }) {
+                    HStack(spacing: WP.Space.xs) {
+                        Image(systemName: "checklist")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Actions")
+                            .font(WP.TextStyle.micro)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(Color.orange.opacity(0.18))
+                    )
+                    .overlay(
+                        Capsule().strokeBorder(Color.orange.opacity(0.45), lineWidth: 0.75)
+                    )
+                    .foregroundStyle(Color.orange)
+                }
+                .buttonStyle(.plain)
+                .help("Ask the AI to pull action items / commitments from the meeting. If none are found, it'll say so explicitly.")
+
                 Spacer(minLength: 0)
 
                 // Unobtrusive contribute link in the composer row. Compact form
@@ -960,9 +1003,19 @@ private struct MessageBubble: View {
         message.role == .user && message.origin == .helpAI
     }
 
+    private var isSummaryPreamble: Bool {
+        message.role == .user && message.origin == .summary
+    }
+
+    private var isActionItemsPreamble: Bool {
+        message.role == .user && message.origin == .actionItems
+    }
+
     private var roleIcon: String {
         if isAutoDetectedQuestion { return "questionmark.bubble.fill" }
         if isHelpAIPreamble       { return "sparkles" }
+        if isSummaryPreamble      { return "doc.text" }
+        if isActionItemsPreamble  { return "checklist" }
         switch message.role {
         case .user: return "person.fill"
         case .assistant: return "sparkles"
@@ -973,6 +1026,8 @@ private struct MessageBubble: View {
     private var roleLabel: String {
         if isAutoDetectedQuestion { return "Auto-detected question" }
         if isHelpAIPreamble       { return "Help AI" }
+        if isSummaryPreamble      { return "Summary" }
+        if isActionItemsPreamble  { return "Action items" }
         switch message.role {
         case .user: return "You"
         case .assistant: return "Assistant"
@@ -983,6 +1038,8 @@ private struct MessageBubble: View {
     private var roleColor: Color {
         if isAutoDetectedQuestion { return .orange }
         if isHelpAIPreamble       { return .green }
+        if isSummaryPreamble      { return .blue }
+        if isActionItemsPreamble  { return .orange }
         switch message.role {
         case .user: return .purple
         case .assistant: return .blue
@@ -995,10 +1052,14 @@ private struct MessageBubble: View {
     /// would just be visual noise. We still show it on the assistant's reply so the
     /// user can correlate reply ↔ trigger.
     private var originBadge: String? {
-        if isAutoDetectedQuestion || isHelpAIPreamble { return nil }
+        if isAutoDetectedQuestion || isHelpAIPreamble || isSummaryPreamble || isActionItemsPreamble {
+            return nil
+        }
         switch message.origin {
         case .detectedQuestion: return "· detected question"
         case .helpAI: return "· help AI"
+        case .summary: return "· summary"
+        case .actionItems: return "· action items"
         case .userPrompt, .system: return nil
         }
     }

@@ -129,6 +129,11 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// transcript for an unanswered question. Acts like a typed prompt but the
         /// model is explicitly told to identify the question itself.
         case helpAI
+        /// User pressed "Summary" — AI produces a recap of the meeting so far.
+        case summary
+        /// User pressed "Action items" — AI extracts commitments / TODOs from
+        /// the conversation.
+        case actionItems
         /// User-visible system note (e.g. "AI paused").
         case system
     }
