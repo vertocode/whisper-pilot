@@ -161,24 +161,14 @@ extension SystemAudioCapture: SCStreamOutput {
             return nil
         }
 
-        // Apply 5× gain to match the level the ProcessAudioCapture path produces.
+        // Apply gain to match the level the ProcessAudioCapture path produces.
         // The macOS mixdown SCK delivers sits just above the speech recognizer's
         // internal speech-detection floor; word-by-word the level dips below that
         // floor and the recognizer commits each word as its own utterance, which
         // showed up as a transcript fragmented one-word-per-line. Boosting the
         // signal keeps inter-word level above the threshold so phrases stay
-        // grouped. Clamping prevents wraparound distortion on transients.
-        if let outputData = outputBuffer.floatChannelData {
-            let gain: Float = 5.0
-            let frames = Int(outputBuffer.frameLength)
-            let channels = Int(outputBuffer.format.channelCount)
-            for c in 0..<channels {
-                let ptr = outputData[c]
-                for i in 0..<frames {
-                    ptr[i] = max(-1.0, min(1.0, ptr[i] * gain))
-                }
-            }
-        }
+        // grouped.
+        Self.applyGainInPlace(outputBuffer, gain: Self.systemAudioGain)
 
         // Multi-stage RMS so we can tell whether the source is silent or our converter is.
         if framesEmitted < 5 || framesEmitted % 200 == 0 {
@@ -188,6 +178,30 @@ extension SystemAudioCapture: SCStreamOutput {
         }
 
         return outputBuffer
+    }
+
+    /// Gain factor applied to every SCK system-audio buffer. Tuned empirically to
+    /// match the level produced by the Process Tap path (`ProcessAudioCapture` uses
+    /// the same constant) — keeps inter-word audio above the recognizer's internal
+    /// speech-detection floor so phrases stay grouped instead of fragmenting into
+    /// one-word-per-line transcript output.
+    static let systemAudioGain: Float = 5.0
+
+    /// Multiplies every float sample in `buffer` by `gain` and clamps the result
+    /// to `[-1, 1]` to avoid wraparound distortion on transients. No-op for non
+    /// float buffers — our canonical format is always Float32 so this only runs
+    /// the fast path in practice. Internal-visible so the gain contract can be
+    /// pinned by the smoke-test suite.
+    static func applyGainInPlace(_ buffer: AVAudioPCMBuffer, gain: Float) {
+        guard let outputData = buffer.floatChannelData else { return }
+        let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        for c in 0..<channels {
+            let ptr = outputData[c]
+            for i in 0..<frames {
+                ptr[i] = max(-1.0, min(1.0, ptr[i] * gain))
+            }
+        }
     }
 
     /// RMS over whatever channel layout / sample format the buffer happens to use. We need

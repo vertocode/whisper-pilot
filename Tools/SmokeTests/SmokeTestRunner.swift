@@ -15,6 +15,7 @@ struct SmokeTestRunner {
         await runConversationContextSuite()
         await runPromptBuilderSuite()
         await runTriggerEngineSuite()
+        await runSystemAudioGainSuite()
         await runSpeechRecognitionIntegrationSuite()
 
         let snapshot = await stats.snapshot()
@@ -97,8 +98,16 @@ struct SmokeTestRunner {
         await suite("QuestionDetector") {
             let detector = QuestionDetector()
 
-            await expect(detector.score(micSegment("How would you design this system?")) == 0,
-                         "microphone channel must score 0")
+            // QuestionDetector is now channel-agnostic — the same text scores
+            // the same regardless of which side spoke it. Channel-specific
+            // gating lives in SettingsStore (autoDetectQuestionsFromMe /
+            // autoDetectQuestionsFromOther) and is enforced by AppCoordinator
+            // before/after the engine fires.
+            await expect(
+                detector.score(micSegment("How would you design this system?"))
+                    == detector.score(systemSegment("How would you design this system?")),
+                "same text scores identically on mic vs system channels"
+            )
 
             await expect(detector.score(systemSegment("hi?")) == 0,
                          "very short utterance must score 0")
@@ -201,6 +210,75 @@ struct SmokeTestRunner {
 
             let p4 = PromptBuilder.build(context: snapshotFor(topics: ["postgres", "scaling"]), history: [], question: "What about sharding?", style: .detailed)
             await expect(p4.context.contains("postgres") && p4.context.contains("scaling"), "topics listed when present")
+
+            // Summary prompt: directive must mention summarizing the meeting, must
+            // include the transcript context, and must not fabricate. Use one
+            // real-looking line so the context-block assertion has something to
+            // match against.
+            let summaryCtx = snapshotFor(lines: ["Other: We decided to migrate to Postgres next sprint."])
+            let summary = PromptBuilder.buildSummary(context: summaryCtx, history: [])
+            await expect(summary.systemInstruction.localizedCaseInsensitiveContains("summariz"),
+                         "summary system instruction says to summarize")
+            await expect(summary.context.contains("Postgres next sprint"),
+                         "summary carries the transcript context through")
+
+            // Action items prompt: must mention action items AND must instruct
+            // the model to use the "no items" sentence verbatim when empty —
+            // otherwise the user gets vague hedging on quiet meetings.
+            let actionsCtx = snapshotFor(lines: ["Me: I'll send the PR for review by Friday."])
+            let actions = PromptBuilder.buildActionItems(context: actionsCtx, history: [])
+            await expect(actions.systemInstruction.localizedCaseInsensitiveContains("action item"),
+                         "action-items system instruction names the task")
+            await expect(actions.systemInstruction.contains("I analyzed the entire transcript but found no pending action items."),
+                         "action-items prompt pins the exact empty-state sentence")
+            await expect(actions.context.contains("send the PR for review"),
+                         "action-items carries the transcript context through")
+        }
+    }
+
+    /// Pins the gain-and-clamp contract that `SystemAudioCapture` applies to every
+    /// ScreenCaptureKit buffer. If someone changes the constant, removes the clamp, or
+    /// breaks the multiply, this suite fails before a real meeting ever runs.
+    static func runSystemAudioGainSuite() async {
+        await suite("SystemAudioCapture gain") {
+            await expect(SystemAudioCapture.systemAudioGain == 5.0,
+                         "systemAudioGain constant is 5.0 (got \(SystemAudioCapture.systemAudioGain))")
+
+            // Float32 mono buffer matching the canonical format the SCK path produces.
+            let format = CanonicalAudioFormat.make()
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 5) else {
+                await expect(false, "couldn't allocate test PCM buffer")
+                return
+            }
+            buffer.frameLength = 5
+            guard let data = buffer.floatChannelData else {
+                await expect(false, "buffer has no floatChannelData (format isn't Float32?)")
+                return
+            }
+            // Mix of values: a quiet positive that 5× stays in range, a quiet negative,
+            // zero, a positive that 5× exceeds +1 (must clamp), and a negative that 5×
+            // exceeds -1 (must clamp).
+            let inputs: [Float] = [0.05, -0.1, 0.0, 0.5, -0.7]
+            let expected: [Float] = [0.25, -0.5, 0.0, 1.0, -1.0]
+            for i in 0..<5 { data.pointee[i] = inputs[i] }
+
+            SystemAudioCapture.applyGainInPlace(buffer, gain: SystemAudioCapture.systemAudioGain)
+
+            for i in 0..<5 {
+                let got = data.pointee[i]
+                let exp = expected[i]
+                await expect(abs(got - exp) < 1e-6,
+                             "sample[\(i)] input=\(inputs[i]) expected=\(exp) got=\(got)")
+            }
+
+            // Sanity: applying gain to an empty buffer is a no-op, not a crash.
+            guard let empty = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4) else {
+                await expect(false, "couldn't allocate empty buffer")
+                return
+            }
+            empty.frameLength = 0
+            SystemAudioCapture.applyGainInPlace(empty, gain: 5.0)
+            await expect(empty.frameLength == 0, "empty buffer remains empty after applyGainInPlace")
         }
     }
 
@@ -321,6 +399,29 @@ struct SmokeTestRunner {
                 await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1), duration: 1, silenceLeading: 0))
                 let event = await collectFirstEvent(from: engine, within: 0.4)
                 await expect(event == nil, "low-score segments don't fire")
+            }
+
+            // Per-channel state: a Me-side question + Me-side pause should fire
+            // and carry channel=.microphone, so the coordinator can re-check the
+            // "from Me" toggle before calling the AI.
+            do {
+                let engine = TriggerEngine()
+                await engine.consider(segment: micSegment("How would you scale this service?"))
+                await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-1.0), duration: 2.0, silenceLeading: 0))
+                let event = await collectFirstEvent(from: engine, within: 0.5)
+                await expect(event != nil, "fires on a mic-channel question")
+                await expect(event?.channel == .microphone, "event carries the mic channel")
+            }
+
+            // Channel isolation: a Me-side pause must not flush an Other-side
+            // pending candidate. Without per-channel state this would
+            // mistakenly fire as soon as either side paused.
+            do {
+                let engine = TriggerEngine()
+                await engine.consider(segment: systemSegment("How would you scale this?"))
+                await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-1.0), duration: 1.0, silenceLeading: 0))
+                let event = await collectFirstEvent(from: engine, within: 0.4)
+                await expect(event == nil, "Other-side candidate doesn't fire on a Me-side pause")
             }
         }
     }

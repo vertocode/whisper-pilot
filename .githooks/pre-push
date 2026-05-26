@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Pre-push gate. Runs the SmokeTests target before any push leaves this machine.
+# Fails loud and blocks the push if any assertion fails — exit non-zero from a
+# pre-push hook tells git to abort. Skip in genuine emergencies with
+# `git push --no-verify`; do not make that the default.
+set -euo pipefail
+
+# Colors only when stdout is a TTY so CI captures stay clean.
+if [[ -t 1 ]]; then
+  C_STEP=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_FAIL=$'\033[1;31m'; C_RESET=$'\033[0m'
+else
+  C_STEP=''; C_OK=''; C_FAIL=''; C_RESET=''
+fi
+
+printf "%s▸%s Running SmokeTests before push…\n" "$C_STEP" "$C_RESET"
+
+if ! swift run SmokeTests; then
+  printf "\n%s✘ SmokeTests failed — push aborted.%s\n" "$C_FAIL" "$C_RESET" >&2
+  printf "   Fix the failing assertions above, or bypass with 'git push --no-verify'.\n" >&2
+  exit 1
+fi
+
+printf "%s✓%s SmokeTests passed; proceeding with push.\n" "$C_OK" "$C_RESET"
