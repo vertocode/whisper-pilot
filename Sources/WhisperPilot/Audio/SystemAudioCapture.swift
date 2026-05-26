@@ -161,6 +161,25 @@ extension SystemAudioCapture: SCStreamOutput {
             return nil
         }
 
+        // Apply 5× gain to match the level the ProcessAudioCapture path produces.
+        // The macOS mixdown SCK delivers sits just above the speech recognizer's
+        // internal speech-detection floor; word-by-word the level dips below that
+        // floor and the recognizer commits each word as its own utterance, which
+        // showed up as a transcript fragmented one-word-per-line. Boosting the
+        // signal keeps inter-word level above the threshold so phrases stay
+        // grouped. Clamping prevents wraparound distortion on transients.
+        if let outputData = outputBuffer.floatChannelData {
+            let gain: Float = 5.0
+            let frames = Int(outputBuffer.frameLength)
+            let channels = Int(outputBuffer.format.channelCount)
+            for c in 0..<channels {
+                let ptr = outputData[c]
+                for i in 0..<frames {
+                    ptr[i] = max(-1.0, min(1.0, ptr[i] * gain))
+                }
+            }
+        }
+
         // Multi-stage RMS so we can tell whether the source is silent or our converter is.
         if framesEmitted < 5 || framesEmitted % 200 == 0 {
             let inRMS = Self.computeRMSAny(inputBuffer)
