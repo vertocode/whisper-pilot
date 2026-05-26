@@ -56,11 +56,15 @@ final class SettingsStore: ObservableObject {
         static let forceScreenCaptureKitForSystemAudio = "capture.forceScreenCaptureKitForSystemAudio"
         static let alwaysOnTop = "overlay.alwaysOnTop"
         static let clickThrough = "overlay.clickThrough"
+        static let hideFromScreenSharing = "overlay.hideFromScreenSharing"
+        static let toggleOverlayShortcut = "shortcuts.toggleOverlay"
         static let localeIdentifier = "transcription.locale"
         static let geminiAPIKey = "gemini.api_key"
         static let microphoneDeviceUID = "capture.microphoneDeviceUID"
         static let utteranceBoundary = "transcription.utteranceBoundary"
-        static let autoDetectQuestionsEnabled = "ai.autoDetectQuestionsEnabled"
+        static let autoDetectQuestionsEnabled = "ai.autoDetectQuestionsEnabled"      // legacy bool — migrated into the per-channel pair below
+        static let autoDetectQuestionsFromOther = "ai.autoDetectQuestionsFromOther"
+        static let autoDetectQuestionsFromMe    = "ai.autoDetectQuestionsFromMe"
         static let includeTranscriptInPrompt = "ai.includeTranscriptInPrompt"
         static let includeSystemAudioInPrompt = "ai.includeSystemAudioInPrompt"
         static let includeChatHistoryInPrompt = "ai.includeChatHistoryInPrompt"
@@ -100,6 +104,26 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(clickThrough, forKey: Keys.clickThrough) }
     }
 
+    /// When true, sets `NSWindow.sharingType = .none` on the overlay so screen-
+    /// recording APIs (WebRTC `getDisplayMedia`, ScreenCaptureKit, QuickTime, etc.)
+    /// don't see the window. Useful when sharing your screen in a meeting and you
+    /// don't want personal notes / AI suggestions visible to the other side.
+    @Published var hideFromScreenSharing: Bool {
+        didSet { defaults.set(hideFromScreenSharing, forKey: Keys.hideFromScreenSharing) }
+    }
+
+    /// Global keyboard shortcut for "toggle overlay visibility". Lives at the OS
+    /// level (Carbon `RegisterEventHotKey`), so it works regardless of which app
+    /// is frontmost and regardless of whether the overlay has click-through on.
+    /// Default `⌘⇧Z`.
+    @Published var toggleOverlayShortcut: ShortcutBinding {
+        didSet {
+            if let data = try? JSONEncoder().encode(toggleOverlayShortcut) {
+                defaults.set(data, forKey: Keys.toggleOverlayShortcut)
+            }
+        }
+    }
+
     @Published var localeIdentifier: String {
         didSet { defaults.set(localeIdentifier, forKey: Keys.localeIdentifier) }
     }
@@ -120,11 +144,24 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(utteranceBoundary.rawValue, forKey: Keys.utteranceBoundary) }
     }
 
-    /// When true, the question detector's hits fire AI calls automatically. When
-    /// false, detected questions are still highlighted in the transcript but no
-    /// completion is requested.
-    @Published var autoDetectQuestionsEnabled: Bool {
-        didSet { defaults.set(autoDetectQuestionsEnabled, forKey: Keys.autoDetectQuestionsEnabled) }
+    /// Auto-fire the AI when "Other" (system audio) asks a question. Default on —
+    /// matches the original copilot behavior people expect on first launch.
+    @Published var autoDetectQuestionsFromOther: Bool {
+        didSet { defaults.set(autoDetectQuestionsFromOther, forKey: Keys.autoDetectQuestionsFromOther) }
+    }
+
+    /// Auto-fire the AI when "Me" (microphone) asks a question. Default off —
+    /// the user typically asks the AI by typing, and firing on every spoken
+    /// question would double up when they're talking through a problem.
+    @Published var autoDetectQuestionsFromMe: Bool {
+        didSet { defaults.set(autoDetectQuestionsFromMe, forKey: Keys.autoDetectQuestionsFromMe) }
+    }
+
+    /// True when at least one auto-detect channel is enabled. Used by call sites
+    /// that just want to know "is auto-detect on at all" without caring about
+    /// which side.
+    var autoDetectQuestionsEnabled: Bool {
+        autoDetectQuestionsFromOther || autoDetectQuestionsFromMe
     }
 
     /// When false, the live transcript (and any resumed prior transcript) is
@@ -164,7 +201,10 @@ final class SettingsStore: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.geminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-2.5-flash"
-        self.responseStyle = ResponseStyle(rawValue: defaults.string(forKey: Keys.responseStyle) ?? "") ?? .concise
+        // Default to Auto for new installs — lets the model right-size each
+        // answer instead of forcing a fixed length. Existing users keep
+        // whatever style they previously selected.
+        self.responseStyle = ResponseStyle(rawValue: defaults.string(forKey: Keys.responseStyle) ?? "") ?? .auto
         // Default to ON so the common first-time-test case (solo user speaking into
         // their Mac's mic) produces transcripts immediately. With this off, a user
         // sitting in silence on a Mac with no system audio playing sees a spinner
@@ -177,13 +217,27 @@ final class SettingsStore: ObservableObject {
         self.forceScreenCaptureKitForSystemAudio = defaults.object(forKey: Keys.forceScreenCaptureKitForSystemAudio) as? Bool ?? false
         self.alwaysOnTop = defaults.object(forKey: Keys.alwaysOnTop) as? Bool ?? true
         self.clickThrough = defaults.object(forKey: Keys.clickThrough) as? Bool ?? false
+        self.hideFromScreenSharing = defaults.object(forKey: Keys.hideFromScreenSharing) as? Bool ?? false
+        if let data = defaults.data(forKey: Keys.toggleOverlayShortcut),
+           let stored = try? JSONDecoder().decode(ShortcutBinding.self, from: data) {
+            self.toggleOverlayShortcut = stored
+        } else {
+            self.toggleOverlayShortcut = .toggleOverlayDefault
+        }
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier
         self.microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
         self.utteranceBoundary = UtteranceBoundary(rawValue: defaults.string(forKey: Keys.utteranceBoundary) ?? "") ?? .auto
         // AI behavior toggles default to true so the assistant works the way users
         // expect on first launch. Existing settings persist; only fresh installs see
         // the defaults.
-        self.autoDetectQuestionsEnabled = defaults.object(forKey: Keys.autoDetectQuestionsEnabled) as? Bool ?? true
+        // Migration path: the original single boolean `autoDetectQuestionsEnabled`
+        // mapped to "auto-fire on Other only". If the user previously customized
+        // it, honor that intent. Otherwise default Other=on / Me=off.
+        let legacyEnabled = defaults.object(forKey: Keys.autoDetectQuestionsEnabled) as? Bool
+        self.autoDetectQuestionsFromOther = defaults.object(forKey: Keys.autoDetectQuestionsFromOther) as? Bool
+            ?? legacyEnabled
+            ?? true
+        self.autoDetectQuestionsFromMe = defaults.object(forKey: Keys.autoDetectQuestionsFromMe) as? Bool ?? false
         self.includeTranscriptInPrompt = defaults.object(forKey: Keys.includeTranscriptInPrompt) as? Bool ?? true
         self.includeSystemAudioInPrompt = defaults.object(forKey: Keys.includeSystemAudioInPrompt) as? Bool ?? true
         self.includeChatHistoryInPrompt = defaults.object(forKey: Keys.includeChatHistoryInPrompt) as? Bool ?? true

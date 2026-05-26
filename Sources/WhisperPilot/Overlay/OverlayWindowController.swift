@@ -93,6 +93,7 @@ final class OverlayWindowController: NSWindowController {
         window.setFrameAutosaveName("WhisperPilotOverlay")
         applyAlwaysOnTop(settings.alwaysOnTop)
         applyClickThrough(settings.clickThrough)
+        applyHideFromScreenSharing(settings.hideFromScreenSharing)
 
         settings.$alwaysOnTop
             .sink { [weak self] in self?.applyAlwaysOnTop($0) }
@@ -100,6 +101,10 @@ final class OverlayWindowController: NSWindowController {
 
         settings.$clickThrough
             .sink { [weak self] in self?.applyClickThrough($0) }
+            .store(in: &cancellables)
+
+        settings.$hideFromScreenSharing
+            .sink { [weak self] in self?.applyHideFromScreenSharing($0) }
             .store(in: &cancellables)
     }
 
@@ -145,5 +150,14 @@ final class OverlayWindowController: NSWindowController {
 
     private func applyClickThrough(_ on: Bool) {
         window?.ignoresMouseEvents = on
+    }
+
+    /// `.none` excludes the window from every screen-capture API on macOS
+    /// (WebRTC `getDisplayMedia`, ScreenCaptureKit, QuickTime screen recording,
+    /// macOS screenshots). `.readOnly` (the default) lets capture see it. The
+    /// window remains fully visible on the local display either way — this only
+    /// affects what other parties / recordings see.
+    private func applyHideFromScreenSharing(_ on: Bool) {
+        window?.sharingType = on ? .none : .readOnly
     }
 }

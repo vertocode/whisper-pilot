@@ -1287,7 +1287,13 @@ final class AppCoordinator {
                 // the time VAD reports speech-end, the latest text is already scored
                 // and ready to fire — no waiting for finalization, which is what made
                 // detected questions arrive 30s late.
-                if update.channel == .system {
+                // Forward both channels to the trigger engine if their per-channel
+                // toggle is on. Engine state is per-channel, so concurrent
+                // candidates on Other and Me can coexist without clobbering.
+                let autoDetectChannel = await MainActor.run { [weak self] in
+                    self?.shouldAutoDetectQuestion(on: update.channel) ?? false
+                }
+                if autoDetectChannel {
                     let liveSegment = TranscriptSegment(
                         id: update.id,
                         text: update.text,
@@ -1364,8 +1370,12 @@ final class AppCoordinator {
                     wpInfo("[Coordinator] trigger fired but AI is paused — skipping")
                     continue
                 }
-                if !self.settings.autoDetectQuestionsEnabled {
-                    wpInfo("[Coordinator] trigger fired but auto-detect questions is disabled — skipping")
+                // Defense-in-depth: re-check the per-channel toggle here in case
+                // the user disabled the relevant side after the engine queued
+                // this candidate. Without this, a setting change wouldn't take
+                // effect until the next cooldown window.
+                if !self.shouldAutoDetectQuestion(on: trigger.channel) {
+                    wpInfo("[Coordinator] trigger fired on \(trigger.channel) but auto-detect for that channel is disabled — skipping")
                     continue
                 }
                 guard let liveAI = self.aiProvider else {
@@ -1417,12 +1427,37 @@ final class AppCoordinator {
             }
         }
 
-        // Hand the most recent segment on the system channel to the trigger engine
-        // regardless of finalization state — `.auto` SFSpeech mode can delay
-        // finalization by tens of seconds, and we want the trigger to fire on the
-        // post-utterance VAD pause, not on the eventual finalize.
-        if let last = await transcriptBuffer.lastSegment(on: .system) {
+        // Hand the most recent segment on the VAD event's channel to the trigger
+        // engine regardless of finalization state — `.auto` SFSpeech mode can
+        // delay finalization by tens of seconds, and we want the trigger to
+        // fire on the post-utterance VAD pause, not on the eventual finalize.
+        // Gated on the per-channel auto-detect toggle so we don't waste cycles
+        // scoring segments on a channel the user has disabled.
+        let vadChannel = vadChannelFor(event)
+        if shouldAutoDetectQuestion(on: vadChannel),
+           let last = await transcriptBuffer.lastSegment(on: vadChannel) {
             await triggerEngine.consider(segment: last)
+        }
+    }
+
+    /// Channel selector used by `handleVADEvent` to forward the right utterance
+    /// to the trigger engine. Both VAD event variants carry a channel; this
+    /// just unwraps it.
+    private nonisolated func vadChannelFor(_ event: VoiceActivityEvent) -> AudioChannel {
+        switch event {
+        case .speechStarted(let channel, _): return channel
+        case .speechEnded(let channel, _, _, _): return channel
+        }
+    }
+
+    /// Centralized lookup so the trigger gating logic stays in one place. Used
+    /// at the source (before calling `engine.consider`) and at the sink (before
+    /// firing the AI), so a settings flip mid-conversation takes effect on the
+    /// next event in either direction.
+    private func shouldAutoDetectQuestion(on channel: AudioChannel) -> Bool {
+        switch channel {
+        case .system: return settings.autoDetectQuestionsFromOther
+        case .microphone: return settings.autoDetectQuestionsFromMe
         }
     }
 

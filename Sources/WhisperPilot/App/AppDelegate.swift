@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -10,6 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sessionsWindow: SessionsWindowController?
     private var sessionsViewModel: SessionsViewModel?
     private var settingsWindow: NSWindow?
+    /// Global shortcut for "toggle overlay visibility". Held here so it lives as
+    /// long as the app does; reassigned whenever the user picks a different
+    /// combo in Settings.
+    private var toggleOverlayHotKey: GlobalHotKey?
+    private var settingsCancellables: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -94,6 +100,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let overlay = OverlayWindowController(state: coordinator.overlayState, settings: coordinator.settings, actions: actions)
         self.overlay = overlay
         // Don't show overlay until a session is picked.
+
+        // Register the user-configurable global shortcut for show/hide. Re-bind
+        // whenever the setting changes so the user gets immediate feedback when
+        // they record a new combo.
+        registerToggleOverlayHotKey(coordinator.settings.toggleOverlayShortcut)
+        coordinator.settings.$toggleOverlayShortcut
+            .dropFirst()
+            .sink { [weak self] new in self?.registerToggleOverlayHotKey(new) }
+            .store(in: &settingsCancellables)
 
         let vm = SessionsViewModel()
         vm.onStartNew = { [weak self] meta in self?.openSession(meta, resumed: false) }
@@ -223,6 +238,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sessionsWindow?.window?.orderOut(nil)
             overlay?.showWindow(nil)
             overlay?.window?.orderFrontRegardless()
+        }
+    }
+
+    /// Drops any existing global hotkey and installs a new one for the given
+    /// binding. Called once at launch and again every time the user records a
+    /// different combo in Settings. If registration fails (e.g. another app has
+    /// claimed the same combo), the previous hotkey is gone and `toggleOverlayHotKey`
+    /// ends up nil — the user-visible symptom is that the new combo just doesn't
+    /// fire, which is the correct behavior in a name-collision.
+    private func registerToggleOverlayHotKey(_ binding: ShortcutBinding) {
+        toggleOverlayHotKey = nil
+        toggleOverlayHotKey = GlobalHotKey(
+            keyCode: binding.keyCode,
+            nsModifiers: binding.modifiers
+        ) { [weak self] in
+            self?.overlay?.toggleVisibility()
+        }
+        if toggleOverlayHotKey != nil {
+            wpInfo("AppDelegate: registered toggle-overlay hotkey \(binding.displayLabel)")
         }
     }
 }

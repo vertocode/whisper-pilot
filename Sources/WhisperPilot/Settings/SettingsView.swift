@@ -16,6 +16,7 @@ struct SettingsView: View {
                 providerTab.tabItem { Label("AI Provider", systemImage: "brain") }
                 captureTab.tabItem { Label("Capture", systemImage: "waveform") }
                 overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
+                shortcutsTab.tabItem { Label("Shortcuts", systemImage: "keyboard") }
             }
         }
         // Sized so all six tabs fit on a single row — narrower windows collapse the
@@ -95,8 +96,10 @@ struct SettingsView: View {
     private var aiBehaviorTab: some View {
         Form {
             Section("Automatic AI calls") {
-                Toggle("Auto-answer detected questions", isOn: $store.autoDetectQuestionsEnabled)
-                FormHint("When on, sentences in the transcript that look like questions automatically fire an AI call. Turn off to stop the model from chiming in on its own; you can still send manually or use the Help AI button.")
+                Toggle("Auto-answer questions from Other", isOn: $store.autoDetectQuestionsFromOther)
+                FormHint("When on, questions captured on the system-audio side (the other speaker in a meeting) automatically fire an AI call.")
+                Toggle("Auto-answer questions from Me", isOn: $store.autoDetectQuestionsFromMe)
+                FormHint("When on, questions captured on your microphone also fire an AI call. Off by default because the spoken version often duplicates what you'd type to the assistant directly.")
             }
 
             Section("Prompt context") {
@@ -228,6 +231,32 @@ struct SettingsView: View {
             Section {
                 Toggle("Click-through", isOn: $store.clickThrough)
                 FormHint("Click-through ignores mouse events on the overlay so it never intercepts clicks meant for your meeting window.")
+            }
+            Section {
+                Toggle("Hide from screen sharing", isOn: $store.hideFromScreenSharing)
+                FormHint("Excludes the overlay from screen-capture APIs (WebRTC, ScreenCaptureKit, QuickTime, macOS screenshots). The window stays visible on your local display, but other meeting participants and recordings won't see it.")
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Shortcuts
+
+    private var shortcutsTab: some View {
+        Form {
+            Section {
+                HStack {
+                    Text("Show/hide overlay")
+                    Spacer()
+                    KeyRecorderField(shortcut: $store.toggleOverlayShortcut)
+                        .frame(width: 140, height: 26)
+                    Button("Reset") {
+                        store.toggleOverlayShortcut = .toggleOverlayDefault
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                FormHint("Global shortcut — works from any app, including when the overlay is click-through. Click the field, then press the combo you want. Press Escape to cancel without changing. Default: ⌘⇧Z.")
             }
         }
         .formStyle(.grouped)

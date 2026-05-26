@@ -5,9 +5,10 @@ import Foundation
 /// of the app to A/B test, and a learned classifier can replace it behind the same surface.
 struct QuestionDetector: Sendable {
     func score(_ segment: TranscriptSegment) -> Double {
-        // Only the *other party* asks us questions. Ignore mic channel.
-        guard segment.channel == .system else { return 0 }
-
+        // Score channel-agnostically. The decision of *whether* to act on a
+        // detected question (on Other only, on Me only, both, or neither) now
+        // lives in SettingsStore via the per-channel auto-detect toggles. This
+        // detector just answers "does this text look like a question?".
         let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 6 else { return 0 }
         let lower = text.lowercased()

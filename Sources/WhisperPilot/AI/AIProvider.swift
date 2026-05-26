@@ -1,6 +1,7 @@
 import Foundation
 
 enum ResponseStyle: String, CaseIterable, Codable, Sendable {
+    case auto
     case concise
     case detailed
     case strategic
@@ -8,6 +9,7 @@ enum ResponseStyle: String, CaseIterable, Codable, Sendable {
 
     var displayName: String {
         switch self {
+        case .auto: return "Auto"
         case .concise: return "Concise"
         case .detailed: return "Detailed"
         case .strategic: return "Strategic"
@@ -15,12 +17,21 @@ enum ResponseStyle: String, CaseIterable, Codable, Sendable {
         }
     }
 
+    /// Doubles as the in-prompt directive (substituted into the system message
+    /// in `PromptBuilder`) and as the helper text under the Settings picker, so
+    /// every entry must read naturally to both an LLM and a user.
     var description: String {
         switch self {
-        case .concise: return "Short, conversational answer the user can deliver out loud."
-        case .detailed: return "Thorough explanation with reasoning and concrete details."
-        case .strategic: return "Trade-offs, risks, and considerations relevant to the question."
-        case .followUp: return "A handful of smart follow-up questions the user could ask next."
+        case .auto:
+            return "Decide the level of detail from the question. Default to a single short, direct answer the user can deliver out loud. Add a sentence or two of supporting detail only if the question genuinely benefits from it. Expand to a full thorough explanation only when the question clearly demands it (e.g. design walk-through, debugging steps, multi-part ask). Never pad. Keep it one coherent answer, not a layered structure."
+        case .concise:
+            return "Short, conversational answer the user can deliver out loud."
+        case .detailed:
+            return "Thorough explanation with reasoning and concrete details."
+        case .strategic:
+            return "Trade-offs, risks, and considerations relevant to the question."
+        case .followUp:
+            return "A handful of smart follow-up questions the user could ask next."
         }
     }
 }
