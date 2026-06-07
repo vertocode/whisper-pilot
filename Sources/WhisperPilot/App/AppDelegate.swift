@@ -15,6 +15,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// long as the app does; reassigned whenever the user picks a different
     /// combo in Settings.
     private var toggleOverlayHotKey: GlobalHotKey?
+    /// Global shortcut for "answer what's on screen" (⌘⇧A by default). Same
+    /// lifetime story as `toggleOverlayHotKey` — held for the app's lifetime,
+    /// re-bound when the user picks a new combo.
+    private var answerScreenHotKey: GlobalHotKey?
     private var settingsCancellables: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -102,6 +106,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             runChatAction: { [weak self] action in
                 self?.handleChatAction(action)
+            },
+            selectModel: { [weak self] modelID in
+                self?.coordinator.selectModel(modelID)
+            },
+            setLayoutMode: { [weak self] mode in
+                print("[WP] action.setLayoutMode fired (\(mode.rawValue))")
+                self?.coordinator.settings.applyOverlayLayoutMode(mode)
             }
         )
 
@@ -118,9 +129,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] new in self?.registerToggleOverlayHotKey(new) }
             .store(in: &settingsCancellables)
 
+        registerAnswerScreenHotKey(coordinator.settings.answerScreenShortcut)
+        coordinator.settings.$answerScreenShortcut
+            .dropFirst()
+            .sink { [weak self] new in self?.registerAnswerScreenHotKey(new) }
+            .store(in: &settingsCancellables)
+
         let vm = SessionsViewModel()
         vm.onStartNew = { [weak self] meta in self?.openSession(meta, resumed: false) }
         vm.onResume = { [weak self] meta in self?.openSession(meta, resumed: true) }
+        vm.onOpenSettings = { [weak self] in self?.showSettings() }
         sessionsViewModel = vm
 
         let sessions = SessionsWindowController(viewModel: vm, globalContext: coordinator.globalContext)
@@ -265,6 +283,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if toggleOverlayHotKey != nil {
             wpInfo("AppDelegate: registered toggle-overlay hotkey \(binding.displayLabel)")
+        }
+    }
+
+    /// Drops any existing "answer screen" hotkey and installs a new one. On fire,
+    /// it brings the overlay forward (so the answer is visible even if the overlay
+    /// was hidden or the user is in another app) and asks the coordinator to
+    /// capture the screen and answer whatever question is on it. Same
+    /// collision-handling semantics as `registerToggleOverlayHotKey`.
+    private func registerAnswerScreenHotKey(_ binding: ShortcutBinding) {
+        answerScreenHotKey = nil
+        answerScreenHotKey = GlobalHotKey(
+            keyCode: binding.keyCode,
+            nsModifiers: binding.modifiers
+        ) { [weak self] in
+            guard let self else { return }
+            print("[WP] answer-screen hotkey fired")
+            // Surface the overlay so the streamed answer is visible. Don't steal
+            // focus from the app the user is reading (no NSApp.activate) — the
+            // overlay floats above without taking key window.
+            self.overlay?.showWindow(nil)
+            self.overlay?.window?.orderFrontRegardless()
+            self.coordinator.answerScreen()
+        }
+        if answerScreenHotKey != nil {
+            wpInfo("AppDelegate: registered answer-screen hotkey \(binding.displayLabel)")
         }
     }
 }

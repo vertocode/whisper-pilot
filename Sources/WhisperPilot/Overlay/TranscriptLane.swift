@@ -13,12 +13,18 @@ struct TranscriptLane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
             HStack(spacing: WP.Space.sm) {
-                Image(systemName: "waveform")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Live transcript")
-                    .font(WP.TextStyle.sectionHeader)
-                    .foregroundStyle(.secondary)
+                // The title itself is a click target for collapse/expand —
+                // bigger and more discoverable than the pill alone.
+                HStack(spacing: WP.Space.sm) {
+                    Image(systemName: "waveform")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Live transcript")
+                        .font(WP.TextStyle.sectionHeader)
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { onToggleCollapse?() }
                 Spacer()
                 if !segments.isEmpty {
                     Text("\(segments.count) line\(segments.count == 1 ? "" : "s")")
@@ -27,7 +33,7 @@ struct TranscriptLane: View {
                         .monospacedDigit()
                 }
                 if let onToggleCollapse {
-                    CollapseChevron(isCollapsed: isCollapsed, action: onToggleCollapse)
+                    CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
                         .help(isCollapsed ? "Show transcript" : "Hide transcript")
                 }
             }
@@ -66,20 +72,28 @@ struct TranscriptLane: View {
     }
 }
 
-/// Shared collapse/expand chevron used by both lane headers. Lives here (rather
-/// than in OverlayView) so both `TranscriptLane` and `ChatLane` can reuse it
-/// without re-implementing the styling and tap target.
-struct CollapseChevron: View {
+/// Shared collapse/expand control used by both lane headers. A labeled
+/// Show/Hide pill instead of a bare chevron — the chevron read as a generic
+/// dropdown and users didn't connect it to "collapse this section". Lives here
+/// (rather than in OverlayView) so both `TranscriptLane` and `ChatLane` can
+/// reuse it without re-implementing the styling and tap target.
+struct CollapseToggle: View {
     let isCollapsed: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 18, height: 18)
-                .contentShape(Rectangle())
+            HStack(spacing: 3) {
+                Image(systemName: isCollapsed ? "eye" : "eye.slash")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(isCollapsed ? "Show" : "Hide")
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(.quinary))
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }
@@ -87,6 +101,10 @@ struct CollapseChevron: View {
 
 private struct TranscriptRow: View {
     let segment: TranscriptSegment
+    /// User-chosen overlay text color (nil = system default). Only applied to
+    /// finalized lines; in-progress (volatile) text stays muted secondary so the
+    /// user can tell committed text from a hypothesis being refined.
+    @Environment(\.overlayTextColor) private var overlayTextColor
 
     var body: some View {
         HStack(alignment: .top, spacing: WP.Space.sm) {
@@ -96,7 +114,7 @@ private struct TranscriptRow: View {
                 .frame(minWidth: 44, alignment: .leading)
             Text(segment.text)
                 .font(WP.TextStyle.body)
-                .foregroundStyle(segment.isFinal ? .primary : .secondary)
+                .foregroundStyle(segment.isFinal ? AnyShapeStyle(overlayTextColor ?? .primary) : AnyShapeStyle(.secondary))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
                 .padding(.top, 1)

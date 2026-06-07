@@ -41,6 +41,10 @@ struct BrandLogo: View {
 
 struct OverlayView: View {
     @ObservedObject var state: OverlayState
+    /// Observed so the in-session model picker reflects `activeModel` /
+    /// available-vendor changes (e.g. user adds a Claude key in Settings
+    /// while the overlay is open).
+    @ObservedObject var settings: SettingsStore
     let actions: OverlayActions
     @ObservedObject private var logBuffer = LogBuffer.shared
     @FocusState private var composerFocused: Bool
@@ -73,15 +77,29 @@ struct OverlayView: View {
             Divider().opacity(0.4)
             composer
         }
-        .frame(minWidth: 380, minHeight: 320)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous))
+        .frame(minWidth: 340, minHeight: 150)
+        // Only the translucent panel honors the opacity setting — content (text,
+        // buttons) stays fully opaque so a see-through overlay is still readable.
+        .background {
+            RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .opacity(settings.overlayBackgroundOpacity)
+        }
         .overlay(
             RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous)
                 .strokeBorder(.separator.opacity(0.6), lineWidth: 0.5)
         )
         .shadow(color: .black.opacity(0.18), radius: 18, y: 6)
         .padding(WP.Space.sm)
+        // Surface the user's chosen overlay text color + compact density to deep
+        // child views (message bubbles, transcript rows) without each taking a
+        // settings dependency.
+        .environment(\.overlayTextColor, settings.overlayTextColor)
+        .environment(\.overlayCompact, compact)
     }
+
+    /// Whether to render the overlay chrome at its denser, smaller spacing.
+    private var compact: Bool { settings.overlayCompactChrome }
 
     // MARK: - Header
 
@@ -108,7 +126,9 @@ struct OverlayView: View {
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                    if state.status.isActive {
+                    // Diagnostic counters are noise in compact layouts where every
+                    // vertical point counts — drop the subtitle line entirely.
+                    if state.status.isActive && !compact {
                         Text("\(state.audioFrameCount) audio · \(state.transcriptCount) transcripts")
                             .font(.system(size: 9))
                             .foregroundStyle(.tertiary)
@@ -174,6 +194,24 @@ struct OverlayView: View {
                 }
                 .keyboardShortcut(",", modifiers: [.command])
                 Divider()
+                Menu {
+                    ForEach(OverlayLayoutMode.allCases) { mode in
+                        Button {
+                            actions.setLayoutMode(mode)
+                        } label: {
+                            // Checkmark the active mode so the current layout is
+                            // obvious without opening Settings.
+                            if settings.overlayLayoutMode == mode {
+                                Label(mode.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(mode.displayName)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Layout: \(settings.overlayLayoutMode.displayName)", systemImage: settings.overlayLayoutMode.icon)
+                }
+                Divider()
                 Button(action: actions.hideOverlay) {
                     Label("Hide overlay", systemImage: "eye.slash")
                 }
@@ -201,7 +239,7 @@ struct OverlayView: View {
                   : "More")
         }
         .padding(.horizontal, WP.Space.md)
-        .padding(.vertical, 7)
+        .padding(.vertical, compact ? 3 : 7)
         .background(.regularMaterial)
     }
 
@@ -299,6 +337,18 @@ struct OverlayView: View {
     /// VStack get tricky to size predictably across collapse transitions.
     @ViewBuilder
     private var bodyPanes: some View {
+        if !settings.overlayShowTranscript {
+            // Transcript pane hidden by the layout setting — the AI conversation
+            // owns the whole body. Used by Interview / Compact modes.
+            chatPane
+                .frame(maxHeight: .infinity)
+        } else {
+            splitPanes
+        }
+    }
+
+    @ViewBuilder
+    private var splitPanes: some View {
         switch (chatCollapsed, transcriptCollapsed) {
         case (false, false):
             GeometryReader { geo in
@@ -369,10 +419,13 @@ struct OverlayView: View {
                 onDismissMessage: actions.dismissMessage,
                 onRunAction: actions.runChatAction,
                 sessionContext: $state.sessionContext,
+                activeModel: settings.activeModel,
+                availableVendors: settings.availableVendors,
+                onSelectModel: actions.selectModel,
                 isCollapsed: true,
                 onToggleCollapse: { chatCollapsed.toggle() }
             )
-            .padding(WP.Space.md)
+            .padding(compact ? WP.Space.sm : WP.Space.md)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -383,10 +436,13 @@ struct OverlayView: View {
                         onDismissMessage: actions.dismissMessage,
                         onRunAction: actions.runChatAction,
                         sessionContext: $state.sessionContext,
+                        activeModel: settings.activeModel,
+                        availableVendors: settings.availableVendors,
+                        onSelectModel: actions.selectModel,
                         isCollapsed: false,
                         onToggleCollapse: { chatCollapsed.toggle() }
                     )
-                    .padding(WP.Space.md)
+                    .padding(compact ? WP.Space.sm : WP.Space.md)
                 }
                 .onChange(of: aiMessages.last?.id) { _, _ in
                     guard let last = aiMessages.last?.id else { return }
@@ -414,7 +470,7 @@ struct OverlayView: View {
                 isCollapsed: true,
                 onToggleCollapse: { transcriptCollapsed.toggle() }
             )
-            .padding(WP.Space.md)
+            .padding(compact ? WP.Space.sm : WP.Space.md)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -429,7 +485,7 @@ struct OverlayView: View {
                                 .id(note.id)
                         }
                     }
-                    .padding(WP.Space.md)
+                    .padding(compact ? WP.Space.sm : WP.Space.md)
                 }
                 .onChange(of: state.transcript.last?.id) { _, _ in
                     guard let last = state.transcript.last?.id else { return }
@@ -463,6 +519,13 @@ struct OverlayView: View {
         if draggable {
             base
                 .contentShape(Rectangle())
+                // The overlay window has `isMovableByWindowBackground = true`,
+                // so without this AppKit starts a window move on the same
+                // mouse-down our DragGesture is tracking — the two fight and
+                // the whole window jitters along with the resize. The blocker
+                // is the NSView AppKit hit-tests here, and it opts out of
+                // background-drag for exactly this strip.
+                .background(WindowDragBlocker())
                 .onHover { hovering in
                     if hovering {
                         NSCursor.resizeUpDown.push()
@@ -486,6 +549,19 @@ struct OverlayView: View {
         } else {
             base
         }
+    }
+
+    /// Opts the view it backs out of `isMovableByWindowBackground`. AppKit asks
+    /// the hit-tested NSView for `mouseDownCanMoveWindow` before starting a
+    /// background window drag; SwiftUI views have no NSView of their own, so we
+    /// plant one that answers "no". Gestures keep working — the blocker doesn't
+    /// consume events, it only vetoes the window-move interpretation.
+    private struct WindowDragBlocker: NSViewRepresentable {
+        private final class BlockerView: NSView {
+            override var mouseDownCanMoveWindow: Bool { false }
+        }
+        func makeNSView(context: Context) -> NSView { BlockerView() }
+        func updateNSView(_ nsView: NSView, context: Context) {}
     }
 
     /// Keep each pane at least `minPaneHeight` tall. If the window is too short to
@@ -513,10 +589,10 @@ struct OverlayView: View {
     // MARK: - Composer
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: WP.Space.sm) {
+        VStack(alignment: .leading, spacing: compact ? WP.Space.xs : WP.Space.sm) {
             HStack(alignment: .bottom, spacing: WP.Space.sm) {
                 TextField("Ask the AI — uses live transcript and chat history as context", text: $state.composerText, axis: .vertical)
-                    .lineLimit(1...4)
+                    .lineLimit(1...(compact ? 2 : 4))
                     .textFieldStyle(.plain)
                     .font(WP.TextStyle.body)
                     .focused($composerFocused)
@@ -584,48 +660,54 @@ struct OverlayView: View {
                 .buttonStyle(.plain)
                 .help("Ask the AI to find any unanswered question in the recent transcript and answer it, using full context.")
 
-                // Summary: recap the whole meeting on demand. Blue so the row reads
-                // green / blue / orange = ask / inform / track.
-                Button(action: { actions.requestSummary() }) {
-                    HStack(spacing: WP.Space.xs) {
-                        Image(systemName: "doc.text")
-                            .font(.system(size: 10, weight: .semibold))
-                        Text("Summary")
-                            .font(WP.TextStyle.micro)
+                // Summary + Action items are the "extra" meeting actions. The layout
+                // setting can hide them (Interview / Compact modes) to keep the
+                // composer row minimal — Help AI and the screenshot/send controls
+                // always stay.
+                if settings.overlayShowExtraActions {
+                    // Summary: recap the whole meeting on demand. Blue so the row reads
+                    // green / blue / orange = ask / inform / track.
+                    Button(action: { actions.requestSummary() }) {
+                        HStack(spacing: WP.Space.xs) {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("Summary")
+                                .font(WP.TextStyle.micro)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule().fill(Color.blue.opacity(0.18))
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(Color.blue.opacity(0.45), lineWidth: 0.75)
+                        )
+                        .foregroundStyle(Color.blue)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        Capsule().fill(Color.blue.opacity(0.18))
-                    )
-                    .overlay(
-                        Capsule().strokeBorder(Color.blue.opacity(0.45), lineWidth: 0.75)
-                    )
-                    .foregroundStyle(Color.blue)
-                }
-                .buttonStyle(.plain)
-                .help("Ask the AI for a recap of the meeting so far — covers what was discussed, decisions made, and open questions.")
+                    .buttonStyle(.plain)
+                    .help("Ask the AI for a recap of the meeting so far — covers what was discussed, decisions made, and open questions.")
 
-                // Action items: extract commitments. Orange = todo / pending.
-                Button(action: { actions.requestActionItems() }) {
-                    HStack(spacing: WP.Space.xs) {
-                        Image(systemName: "checklist")
-                            .font(.system(size: 10, weight: .semibold))
-                        Text("Actions")
-                            .font(WP.TextStyle.micro)
+                    // Action items: extract commitments. Orange = todo / pending.
+                    Button(action: { actions.requestActionItems() }) {
+                        HStack(spacing: WP.Space.xs) {
+                            Image(systemName: "checklist")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("Actions")
+                                .font(WP.TextStyle.micro)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule().fill(Color.orange.opacity(0.18))
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(Color.orange.opacity(0.45), lineWidth: 0.75)
+                        )
+                        .foregroundStyle(Color.orange)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        Capsule().fill(Color.orange.opacity(0.18))
-                    )
-                    .overlay(
-                        Capsule().strokeBorder(Color.orange.opacity(0.45), lineWidth: 0.75)
-                    )
-                    .foregroundStyle(Color.orange)
+                    .buttonStyle(.plain)
+                    .help("Ask the AI to pull action items / commitments from the meeting. If none are found, it'll say so explicitly.")
                 }
-                .buttonStyle(.plain)
-                .help("Ask the AI to pull action items / commitments from the meeting. If none are found, it'll say so explicitly.")
 
                 Spacer(minLength: 0)
 
@@ -636,7 +718,7 @@ struct OverlayView: View {
             }
         }
         .padding(.horizontal, WP.Space.md)
-        .padding(.vertical, WP.Space.sm + 2)
+        .padding(.vertical, compact ? WP.Space.xs : WP.Space.sm + 2)
     }
 
     private var isComposerEmpty: Bool {
@@ -805,6 +887,13 @@ private struct ChatLane: View {
     /// files). Edits flow through `OverlayState.sessionContext`; the coordinator
     /// debounces saves to disk.
     @Binding var sessionContext: SessionContext
+    /// Currently-active model id. Drives the picker's selection.
+    let activeModel: String
+    /// Vendors whose key is configured right now. Used to disable picker rows
+    /// that the user can't actually use yet so they get an obvious "you need
+    /// to add a key" cue instead of a silent failure on the next prompt.
+    let availableVendors: Set<AIVendor>
+    let onSelectModel: (String) -> Void
     /// When true, only the header is rendered. Owner manages the state and
     /// passes a toggle closure so the lane can fire when its chevron is tapped.
     var isCollapsed: Bool = false
@@ -813,16 +902,28 @@ private struct ChatLane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
             HStack(spacing: WP.Space.sm) {
-                Image(systemName: "sparkles")
-                    .font(.caption)
-                    .foregroundStyle(.blue)
-                Text("AI")
-                    .font(WP.TextStyle.sectionHeader)
-                    .foregroundStyle(.secondary)
+                // The title itself is a click target for collapse/expand —
+                // bigger and more discoverable than the pill alone. Only the
+                // icon + label; the model picker next to it keeps its own tap.
+                HStack(spacing: WP.Space.sm) {
+                    Image(systemName: "sparkles")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                    Text("AI")
+                        .font(WP.TextStyle.sectionHeader)
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { onToggleCollapse?() }
+                ModelSelector(
+                    activeModel: activeModel,
+                    availableVendors: availableVendors,
+                    onSelect: onSelectModel
+                )
                 Spacer()
                 AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
                 if let onToggleCollapse {
-                    CollapseChevron(isCollapsed: isCollapsed, action: onToggleCollapse)
+                    CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
                         .help(isCollapsed ? "Show AI conversation" : "Hide AI conversation")
                 }
             }
@@ -880,6 +981,93 @@ private struct EmptyStatePill: View {
     }
 }
 
+/// Compact in-overlay model picker. Shows the active model's display name
+/// next to a chevron and opens a vendor-grouped menu when tapped. Disabled
+/// rows (vendor missing its API key) carry a "⚠ no <vendor> API key" suffix
+/// so the user can see the option but isn't surprised by a silent failure
+/// when picking it.
+///
+/// Lives in the overlay rather than only in Settings because the user picked
+/// "per-session" — switching mid-conversation should be a one-click action
+/// from the place they're already looking at.
+private struct ModelSelector: View {
+    let activeModel: String
+    let availableVendors: Set<AIVendor>
+    let onSelect: (String) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(AIVendor.allCases, id: \.self) { vendor in
+                let models = AIModelRegistry.models(for: vendor)
+                if !models.isEmpty {
+                    Section(vendor.displayName) {
+                        ForEach(models) { model in
+                            Button {
+                                onSelect(model.id)
+                            } label: {
+                                HStack {
+                                    Text(rowLabel(for: model))
+                                    if model.id == activeModel {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                            .disabled(!availableVendors.contains(vendor))
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(activeModelDisplayName)
+                    .font(.system(size: 11, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(chipColor.opacity(0.15))
+            )
+            .overlay(
+                Capsule().strokeBorder(chipColor.opacity(0.45), lineWidth: 0.5)
+            )
+            .foregroundStyle(chipColor)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Switch the AI model for this session. The choice is saved per session and restored on resume.")
+    }
+
+    private var activeModelDisplayName: String {
+        AIModelRegistry.model(for: activeModel)?.displayName ?? activeModel
+    }
+
+    /// Tint the chip with the active vendor's accent color so the user can
+    /// recognize "I'm on Claude right now" at a glance. Falls back to red
+    /// when the active model's vendor doesn't have a key configured — the
+    /// AI can't actually run in that state, so the chip's color is the most
+    /// visible cue to "click here and pick a different model, or add a key".
+    private var chipColor: Color {
+        guard let model = AIModelRegistry.model(for: activeModel) else {
+            return .secondary
+        }
+        if !availableVendors.contains(model.vendor) {
+            return .red
+        }
+        return model.vendor.accentColor
+    }
+
+    private func rowLabel(for model: AIModel) -> String {
+        if availableVendors.contains(model.vendor) {
+            if let tagline = model.tagline { return "\(model.displayName) — \(tagline)" }
+            return model.displayName
+        }
+        return "\(model.displayName) — ⚠ no \(model.vendor.displayName) API key"
+    }
+}
+
 private struct AIToggleButton: View {
     let isPaused: Bool
     let action: () -> Void
@@ -908,9 +1096,14 @@ private struct MessageBubble: View {
     /// the no-transcripts watchdog's "Enable ScreenCaptureKit & retry" button.
     /// Nil = the message has no actionable button (most cases).
     var onRunAction: ((ChatMessageAction) -> Void)? = nil
+    /// User-chosen overlay text color (nil = system default). Threaded via the
+    /// environment from `OverlayView`.
+    @Environment(\.overlayTextColor) private var overlayTextColor
+    /// Compact-chrome density flag, threaded from `OverlayView`.
+    @Environment(\.overlayCompact) private var overlayCompact
 
     var body: some View {
-        VStack(alignment: .leading, spacing: WP.Space.xs + 2) {
+        VStack(alignment: .leading, spacing: overlayCompact ? WP.Space.xs : WP.Space.xs + 2) {
             HStack(spacing: WP.Space.sm) {
                 Image(systemName: roleIcon)
                     .font(.system(size: 10, weight: .semibold))
@@ -941,12 +1134,30 @@ private struct MessageBubble: View {
                     .help("Dismiss")
                 }
             }
-            Text(renderedText)
-                .font(WP.TextStyle.body)
-                .foregroundStyle(message.role == .system ? .secondary : .primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .tint(.accentColor)
+            if message.role == .assistant, !message.text.isEmpty {
+                // Assistant replies render as block-level markdown so fenced code
+                // blocks, headings, and lists display correctly instead of leaking
+                // raw `#` / `-` / triple-backtick characters. User messages and
+                // system notes stay plain (see `renderedText`) so we never
+                // re-interpret what the user actually typed.
+                MarkdownMessageView(text: message.text)
+                    .foregroundStyle(overlayTextColor ?? .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Forces the content to use its full intrinsic vertical size.
+                    // Without this, long assistant replies (notably the Summary /
+                    // Action items outputs which can be paragraphs long) get
+                    // clipped inside the chat ScrollView when SwiftUI proposes a
+                    // constrained height.
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(renderedText)
+                    .font(WP.TextStyle.body)
+                    .foregroundStyle(message.role == .system ? AnyShapeStyle(.secondary) : AnyShapeStyle(overlayTextColor ?? .primary))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .tint(.accentColor)
+            }
             // Inline action button — currently only used by the watchdog to
             // offer "Enable ScreenCaptureKit & retry" when system audio is
             // captured but silent. Rendered below the message text so it's
@@ -962,7 +1173,7 @@ private struct MessageBubble: View {
                 .padding(.top, 2)
             }
         }
-        .padding(WP.Space.md - 2)
+        .padding(overlayCompact ? WP.Space.sm - 1 : WP.Space.md - 2)
         .background(
             RoundedRectangle(cornerRadius: WP.Radius.lg, style: .continuous)
                 .fill(bubbleBackground)
@@ -973,22 +1184,14 @@ private struct MessageBubble: View {
         )
     }
 
-    /// Renders the body text. Assistant messages parse as inline markdown — bold,
-    /// italic, links, inline code — so Gemini's typical `**word**` and backticks come
-    /// through styled rather than as raw characters. `.inlineOnlyPreservingWhitespace`
-    /// is deliberate: block-level constructs (headings, lists, code fences) don't render
-    /// reliably inside a single `Text`, and mid-stream partials would look broken if we
-    /// tried. User messages and system notes stay plain so we never re-interpret what
-    /// the user actually typed.
+    /// Fallback plain-text renderer for user messages and system notes (and the
+    /// empty-assistant placeholder). Non-empty assistant replies render through
+    /// `MarkdownMessageView` instead — see the body. User/system text stays plain
+    /// so we never re-interpret what the user actually typed.
     private var renderedText: AttributedString {
         let raw = message.text
         if raw.isEmpty { return AttributedString("…") }
-        guard message.role == .assistant else { return AttributedString(raw) }
-        let parsed = try? AttributedString(
-            markdown: raw,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )
-        return parsed ?? AttributedString(raw)
+        return AttributedString(raw)
     }
 
     /// User-role messages double as auto-trigger preambles when their origin is
@@ -1011,11 +1214,21 @@ private struct MessageBubble: View {
         message.role == .user && message.origin == .actionItems
     }
 
+    private var isAnswerScreenPreamble: Bool {
+        message.role == .user && message.origin == .answerScreen
+    }
+
+    private var isVoiceCommandPreamble: Bool {
+        message.role == .user && message.origin == .voiceCommand
+    }
+
     private var roleIcon: String {
         if isAutoDetectedQuestion { return "questionmark.bubble.fill" }
         if isHelpAIPreamble       { return "sparkles" }
         if isSummaryPreamble      { return "doc.text" }
         if isActionItemsPreamble  { return "checklist" }
+        if isAnswerScreenPreamble { return "text.viewfinder" }
+        if isVoiceCommandPreamble { return "mic.fill" }
         switch message.role {
         case .user: return "person.fill"
         case .assistant: return "sparkles"
@@ -1028,6 +1241,8 @@ private struct MessageBubble: View {
         if isHelpAIPreamble       { return "Help AI" }
         if isSummaryPreamble      { return "Summary" }
         if isActionItemsPreamble  { return "Action items" }
+        if isAnswerScreenPreamble { return "Answer screen" }
+        if isVoiceCommandPreamble { return "Voice command" }
         switch message.role {
         case .user: return "You"
         case .assistant: return "Assistant"
@@ -1040,6 +1255,8 @@ private struct MessageBubble: View {
         if isHelpAIPreamble       { return .green }
         if isSummaryPreamble      { return .blue }
         if isActionItemsPreamble  { return .orange }
+        if isAnswerScreenPreamble { return .indigo }
+        if isVoiceCommandPreamble { return .teal }
         switch message.role {
         case .user: return .purple
         case .assistant: return .blue
@@ -1052,7 +1269,7 @@ private struct MessageBubble: View {
     /// would just be visual noise. We still show it on the assistant's reply so the
     /// user can correlate reply ↔ trigger.
     private var originBadge: String? {
-        if isAutoDetectedQuestion || isHelpAIPreamble || isSummaryPreamble || isActionItemsPreamble {
+        if isAutoDetectedQuestion || isHelpAIPreamble || isSummaryPreamble || isActionItemsPreamble || isAnswerScreenPreamble || isVoiceCommandPreamble {
             return nil
         }
         switch message.origin {
@@ -1060,6 +1277,8 @@ private struct MessageBubble: View {
         case .helpAI: return "· help AI"
         case .summary: return "· summary"
         case .actionItems: return "· action items"
+        case .answerScreen: return "· answer screen"
+        case .voiceCommand: return "· voice command"
         case .userPrompt, .system: return nil
         }
     }

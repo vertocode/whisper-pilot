@@ -15,6 +15,10 @@ struct SmokeTestRunner {
         await runConversationContextSuite()
         await runPromptBuilderSuite()
         await runTriggerEngineSuite()
+        await runWakeWordEngineSuite()
+        await runVoiceCommandInterpreterSuite()
+        await runUpdateCheckerSuite()
+        await runStreamingAudioConverterSuite()
         await runSystemAudioGainSuite()
         await runSpeechRecognitionIntegrationSuite()
 
@@ -73,6 +77,23 @@ struct SmokeTestRunner {
 
     static func snapshotFor(lines: [String] = [], topics: [String] = []) -> ConversationSnapshot {
         ConversationSnapshot(recentLines: lines, topics: topics, entities: [])
+    }
+
+    /// Race the wake-word engine's event stream against a timeout.
+    static func collectFirstWakeEvent(from engine: WakeWordEngine, within seconds: TimeInterval) async -> WakeCommandEvent? {
+        await withTaskGroup(of: WakeCommandEvent?.self) { group in
+            group.addTask {
+                for await event in engine.events { return event }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
     }
 
     /// Race the engine's event stream against a timeout. Returns the first event or nil on timeout.
@@ -423,6 +444,160 @@ struct SmokeTestRunner {
                 let event = await collectFirstEvent(from: engine, within: 0.4)
                 await expect(event == nil, "Other-side candidate doesn't fire on a Me-side pause")
             }
+        }
+    }
+
+    static func runWakeWordEngineSuite() async {
+        await suite("WakeWordEngine") {
+            // extractCommand — the pure parsing core.
+            await expect(WakeWordEngine.extractCommand(from: "pilot open chrome", wakeWord: "pilot") == "open chrome",
+                         "command extracted after wake word")
+            await expect(WakeWordEngine.extractCommand(from: "Pilot, open Chrome.", wakeWord: "pilot") == "open Chrome",
+                         "case-insensitive match, punctuation stripped")
+            await expect(WakeWordEngine.extractCommand(from: "okay so pilot search swift docs", wakeWord: "pilot") == "search swift docs",
+                         "wake word mid-utterance still extracts trailing command")
+            await expect(WakeWordEngine.extractCommand(from: "open chrome", wakeWord: "pilot") == nil,
+                         "no wake word → nil")
+            await expect(WakeWordEngine.extractCommand(from: "pilot", wakeWord: "pilot") == nil,
+                         "wake word with no command → nil")
+            await expect(WakeWordEngine.extractCommand(from: "the copilot opened the file", wakeWord: "pilot") == nil,
+                         "whole-word match — 'copilot' doesn't contain wake word")
+            await expect(WakeWordEngine.extractCommand(from: "pilot open chrome", wakeWord: "  ") == nil,
+                         "blank wake word never matches")
+
+            // Fire flow — mirrors the TriggerEngine suite's pattern. speechEnded
+            // timestamps sit beyond the 1.5s pause gate so the fire is immediate.
+            do {
+                let engine = WakeWordEngine()
+                await engine.consider(segment: micSegment("pilot open chrome"), wakeWord: "pilot")
+                await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-2.0), duration: 2.0, silenceLeading: 0))
+                let event = await collectFirstWakeEvent(from: engine, within: 0.5)
+                await expect(event != nil, "fires on mic wake command followed by pause")
+                await expect(event?.command == "open chrome", "carries extracted command")
+            }
+
+            do {
+                let engine = WakeWordEngine()
+                await engine.consider(segment: micSegment("pilot open chrome"), wakeWord: "pilot")
+                let event = await collectFirstWakeEvent(from: engine, within: 0.4)
+                await expect(event == nil, "no fire without a mic speech-ended event")
+            }
+
+            // The pause gate is what stops the engine firing on the micro-pause
+            // between dictated words ("open … Safari" arriving as "open" first).
+            // A just-now speechEnded must not fire until the 1.5s gate elapses,
+            // and the scheduled re-check must then fire it with no further
+            // consider/absorb traffic. One collect (AsyncStream is single-
+            // consumer) + a timestamp assertion covers both.
+            do {
+                let engine = WakeWordEngine()
+                let endedAt = Date()
+                await engine.consider(segment: micSegment("pilot open"), wakeWord: "pilot")
+                await engine.absorb(.speechEnded(channel: .microphone, at: endedAt, duration: 1.0, silenceLeading: 0))
+                let event = await collectFirstWakeEvent(from: engine, within: 2.5)
+                await expect(event != nil, "scheduled re-check fires after the full pause with no further events")
+                if let event {
+                    await expect(event.firedAt.timeIntervalSince(endedAt) >= 1.4,
+                                 "did not fire during the mid-command micro-pause (fired after \(event.firedAt.timeIntervalSince(endedAt))s)")
+                }
+            }
+
+            do {
+                let engine = WakeWordEngine()
+                await engine.consider(segment: systemSegment("pilot open chrome"), wakeWord: "pilot")
+                await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-2.0), duration: 2.0, silenceLeading: 0))
+                let event = await collectFirstWakeEvent(from: engine, within: 0.4)
+                await expect(event == nil, "system-audio channel never triggers a command")
+            }
+
+            // Re-fire suppression: the same segment growing after the fire must
+            // not fire twice.
+            do {
+                let engine = WakeWordEngine()
+                var segment = micSegment("pilot open chrome")
+                await engine.consider(segment: segment, wakeWord: "pilot")
+                await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-2.0), duration: 2.0, silenceLeading: 0))
+                let first = await collectFirstWakeEvent(from: engine, within: 0.5)
+                segment.text = "pilot open chrome please"
+                await engine.consider(segment: segment, wakeWord: "pilot")
+                let second = await collectFirstWakeEvent(from: engine, within: 0.4)
+                await expect(first != nil && second == nil, "grown hypothesis of a fired segment doesn't re-fire")
+            }
+        }
+    }
+
+    /// Guards the streaming conversion contract: one converter instance fed many
+    /// sequential Process-Tap-sized buffers (10 ms, 48 kHz stereo → 16 kHz mono)
+    /// must keep producing output for every buffer. This is the regression the
+    /// old per-buffer `reset()` + `.endOfStream` pattern was working around (a
+    /// latched converter returns 0 frames from call 2 onward) — the `.noDataNow`
+    /// idiom must not reintroduce it, and must not leak samples to re-priming.
+    static func runStreamingAudioConverterSuite() async {
+        await suite("StreamingAudioConverter") {
+            guard let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false),
+                  let converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make()) else {
+                await expect(false, "could not build test formats/converter")
+                return
+            }
+            let bufferFrames: AVAudioFrameCount = 480 // 10 ms @ 48 kHz — Process Tap callback size
+            let bufferCount = 50
+            var totalOutputFrames = 0
+            var dryBuffersAfterFirst = 0
+            var phase = 0.0
+            for i in 0..<bufferCount {
+                guard let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: bufferFrames),
+                      let channels = input.floatChannelData.map({ [$0[0], $0[1]] }) else { continue }
+                input.frameLength = bufferFrames
+                for f in 0..<Int(bufferFrames) {
+                    let sample = Float(sin(phase))
+                    phase += 2.0 * Double.pi * 440.0 / 48000.0
+                    channels[0][f] = sample
+                    channels[1][f] = sample
+                }
+                if let out = StreamingAudioConverter.convert(input, using: converter, label: "smoke-test") {
+                    totalOutputFrames += Int(out.frameLength)
+                } else if i > 0 {
+                    dryBuffersAfterFirst += 1
+                }
+            }
+            let expected = bufferCount * Int(bufferFrames) / 3 // 48 kHz → 16 kHz
+            await expect(dryBuffersAfterFirst == 0,
+                         "converter produced output for every buffer after priming (latch regression guard, \(dryBuffersAfterFirst) dry)")
+            await expect(totalOutputFrames >= Int(Double(expected) * 0.95),
+                         "≥95% of expected samples survive 50 sequential conversions (got \(totalOutputFrames)/\(expected))")
+        }
+    }
+
+    static func runUpdateCheckerSuite() async {
+        await suite("UpdateChecker.isVersion") {
+            await expect(UpdateChecker.isVersion("0.1.13", newerThan: "0.1.12"), "patch bump is newer")
+            await expect(UpdateChecker.isVersion("0.2.0", newerThan: "0.1.12"), "minor bump beats higher patch")
+            await expect(UpdateChecker.isVersion("1.0.0", newerThan: "0.9.9"), "major bump is newer")
+            await expect(UpdateChecker.isVersion("0.1.10", newerThan: "0.1.9"), "numeric compare, not lexicographic")
+            await expect(!UpdateChecker.isVersion("0.1.12", newerThan: "0.1.12"), "equal versions are not newer")
+            await expect(!UpdateChecker.isVersion("0.1.11", newerThan: "0.1.12"), "older is not newer")
+            await expect(UpdateChecker.isVersion("0.1.12.1", newerThan: "0.1.12"), "extra component counts")
+            await expect(!UpdateChecker.isVersion("0.1.12", newerThan: "0.1.12.0"), "trailing zero is equal")
+            await expect(!UpdateChecker.isVersion("garbage", newerThan: "0.1.12"), "malformed tag never claims newer")
+        }
+    }
+
+    static func runVoiceCommandInterpreterSuite() async {
+        await suite("VoiceCommandInterpreter") {
+            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_app","app":"Google Chrome"}"#) == .openApp("Google Chrome"),
+                         "parses open_app")
+            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_url","url":"https://www.google.com/search?q=swift"}"#) == .openURL(URL(string: "https://www.google.com/search?q=swift")!),
+                         "parses open_url")
+            await expect(VoiceCommandInterpreter.parse(#"{"intent":"answer"}"#) == .answer,
+                         "parses answer")
+            await expect(VoiceCommandInterpreter.parse("```json\n{\"intent\":\"open_app\",\"app\":\"Safari\"}\n```") == .openApp("Safari"),
+                         "tolerates markdown fences")
+            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_url","url":"file:///etc/passwd"}"#) == nil,
+                         "rejects non-web URL schemes")
+            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_app","app":""}"#) == nil,
+                         "rejects empty app name")
+            await expect(VoiceCommandInterpreter.parse("sure, opening chrome!") == nil,
+                         "prose without JSON → nil (caller falls back to answer)")
         }
     }
 }

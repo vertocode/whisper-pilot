@@ -45,6 +45,14 @@ struct OverlayActions {
     /// button). The handler is responsible for both the side effect and any
     /// UI confirmation message.
     var runChatAction: (ChatMessageAction) -> Void
+    /// User picked a new model in the overlay's in-session model selector.
+    /// Coordinator updates `settings.activeModel` (triggering the provider
+    /// rebuild via `refreshDerivedState`) and persists the choice onto the
+    /// active session so resuming later restores it.
+    var selectModel: (String) -> Void
+    /// User picked a layout mode from the overlay's in-session menu. Applies the
+    /// preset (size/position/appearance) immediately via the settings store.
+    var setLayoutMode: (OverlayLayoutMode) -> Void
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers
@@ -56,6 +64,10 @@ final class OverlayWindowController: NSWindowController {
     private let state: OverlayState
     private let settings: SettingsStore
     private var cancellables: Set<AnyCancellable> = []
+    /// Set while we programmatically resize/move the window so the manual
+    /// resize/move observers don't misread our own `setFrame` as a user drag and
+    /// flip the layout mode to `.custom`.
+    private var isApplyingLayout = false
 
     init(state: OverlayState, settings: SettingsStore, actions: OverlayActions) {
         self.state = state
@@ -79,12 +91,13 @@ final class OverlayWindowController: NSWindowController {
         window.isOpaque = false
         window.hasShadow = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        // Matches the SwiftUI root's `.frame(minWidth: 380, minHeight: 320)` in
-        // OverlayView so the user can't drag the window smaller than the content's
-        // own minimum — otherwise the lanes clip and the divider becomes uncatchable.
-        window.minSize = NSSize(width: 380, height: 320)
+        // Matches the SwiftUI root's `.frame(minWidth: 340, minHeight: 150)` in
+        // OverlayView. Kept low so the short modes (Interview) can actually be
+        // short — just header + a line or two of AI answer + composer — instead of
+        // being floored at a half-screen height.
+        window.minSize = NSSize(width: 340, height: 150)
 
-        let host = NSHostingView(rootView: OverlayView(state: state, actions: actions))
+        let host = NSHostingView(rootView: OverlayView(state: state, settings: settings, actions: actions))
         host.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = host
 
@@ -101,6 +114,13 @@ final class OverlayWindowController: NSWindowController {
         applyClickThrough(settings.clickThrough)
         applyHideFromScreenSharing(settings.hideFromScreenSharing)
 
+        // A non-custom layout mode owns the window frame: re-apply it on launch so
+        // the user lands in their chosen preset every time. In `.custom` mode we
+        // leave the autosaved (user-dragged) frame untouched.
+        if settings.overlayLayoutMode != .custom {
+            applyLayout()
+        }
+
         settings.$alwaysOnTop
             .sink { [weak self] in self?.applyAlwaysOnTop($0) }
             .store(in: &cancellables)
@@ -112,6 +132,34 @@ final class OverlayWindowController: NSWindowController {
         settings.$hideFromScreenSharing
             .sink { [weak self] in self?.applyHideFromScreenSharing($0) }
             .store(in: &cancellables)
+
+        // Size/position settings apply live. Each publisher is `dropFirst`-ed
+        // individually so none of the three initial `@Published` emissions fires
+        // `applyLayout` on launch — that's handled above for preset modes only, so
+        // a custom user's autosaved frame survives. Only genuine changes propagate.
+        Publishers.Merge3(
+            settings.$overlayWidthFraction.dropFirst().map { _ in () },
+            settings.$overlayHeightFraction.dropFirst().map { _ in () },
+            settings.$overlayPosition.dropFirst().map { _ in () }
+        )
+        .sink { [weak self] in self?.applyLayout() }
+        .store(in: &cancellables)
+
+        // A user-driven resize or move means "I want it like this" — flip the mode
+        // to `.custom` so the window's frame autosave (not a preset) governs from
+        // here on. `didEndLiveResize` never fires for our programmatic `setFrame`;
+        // the move observer is guarded by `isApplyingLayout` for the same reason.
+        if let window = self.window {
+            NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification, object: window)
+                .sink { [weak self] _ in self?.markLayoutCustomized() }
+                .store(in: &cancellables)
+            NotificationCenter.default.publisher(for: NSWindow.didMoveNotification, object: window)
+                .sink { [weak self] _ in
+                    guard let self, !self.isApplyingLayout else { return }
+                    self.markLayoutCustomized()
+                }
+                .store(in: &cancellables)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unsupported") }
@@ -134,6 +182,40 @@ final class OverlayWindowController: NSWindowController {
             y: visible.maxY - size.height - 24
         )
         window.setFrameOrigin(origin)
+    }
+
+    /// Sizes and positions the window from the current layout settings: width/height
+    /// as fractions of the active screen's visible area, anchored to the configured
+    /// corner/edge. Clamped to the window's `minSize` so a tiny preset can't make the
+    /// content un-usable. Guarded by `isApplyingLayout` so our own `setFrame` isn't
+    /// mistaken for a user drag.
+    func applyLayout() {
+        guard let window else { return }
+        let screen = window.screen ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+        let rawWidth = visible.width * CGFloat(settings.overlayWidthFraction)
+        let rawHeight = visible.height * CGFloat(settings.overlayHeightFraction)
+        let size = NSSize(
+            width: min(visible.width, max(window.minSize.width, rawWidth)),
+            height: min(visible.height, max(window.minSize.height, rawHeight))
+        )
+        let origin = settings.overlayPosition.origin(in: visible, size: size, inset: 16)
+        isApplyingLayout = true
+        window.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
+        // Clear the guard on the next runloop tick rather than inline: AppKit may
+        // post `didMove`/`didResize` for our own `setFrame` slightly after the call
+        // returns, and clearing too early would let those be misread as a user drag
+        // and flip the mode to Custom.
+        DispatchQueue.main.async { [weak self] in self?.isApplyingLayout = false }
+    }
+
+    /// Records that the user took manual control of the window's size/position by
+    /// dragging it. Flips the layout mode to `.custom` so a preset doesn't snap the
+    /// window back on the next change or launch.
+    private func markLayoutCustomized() {
+        guard settings.overlayLayoutMode != .custom else { return }
+        wpInfo("Overlay: manual resize/move — switching layout mode to Custom")
+        settings.overlayLayoutMode = .custom
     }
 
     /// Default content size: half the screen's visible width and height (one quarter

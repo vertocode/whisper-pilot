@@ -13,6 +13,11 @@ final class SessionsViewModel: ObservableObject {
     /// into the live overlay.
     var onStartNew: ((SessionMeta) -> Void)?
     var onResume: ((SessionMeta) -> Void)?
+    /// Set by the AppDelegate. Invoked by the gear button in the Sessions header
+    /// so users can jump straight into Settings without going through the menu
+    /// bar — discoverability fix for first-time users who haven't found the
+    /// menu bar icon yet.
+    var onOpenSettings: (() -> Void)?
 
     func refresh() async {
         isLoading = true
@@ -41,6 +46,17 @@ final class SessionsViewModel: ObservableObject {
         await refresh()
     }
 
+    func rename(_ meta: SessionMeta, to newName: String) async {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != meta.displayName else { return }
+        do {
+            _ = try await SessionStore.shared.renameSession(meta.id, to: trimmed)
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func openInFinder(_ meta: SessionMeta) async {
         let url = await SessionStore.shared.sessionFolder(for: meta.id)
         NSWorkspace.shared.open(url)
@@ -56,7 +72,7 @@ final class SessionsWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "Whisper Pilot"
+        window.title = AppInfo.brandLabel
         window.titlebarAppearsTransparent = true
         // Force a fully opaque, solid window background. The SwiftUI `.windowBackground`
         // shape style and the `titlebarAppearsTransparent + fullSizeContentView` combo
@@ -80,6 +96,8 @@ struct SessionsView: View {
     @ObservedObject var globalContext: GlobalContextStore
     @State private var hoveredSessionID: SessionID?
     @State private var sessionPendingDeletion: SessionMeta?
+    @State private var sessionPendingRename: SessionMeta?
+    @State private var renameDraft: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -117,6 +135,31 @@ struct SessionsView: View {
         } message: { session in
             Text("This permanently removes the transcript, chat, and metadata folder for “\(session.displayName)” from disk. This action cannot be undone.")
         }
+        .alert(
+            "Rename session",
+            isPresented: renamePresentationBinding,
+            presenting: sessionPendingRename
+        ) { session in
+            TextField("Session name", text: $renameDraft)
+            Button("Rename") {
+                Task { await vm.rename(session, to: renameDraft) }
+                sessionPendingRename = nil
+            }
+            Button("Cancel", role: .cancel) {
+                sessionPendingRename = nil
+            }
+        } message: { _ in
+            Text("Only the display name changes — the transcript, chat, and files on disk stay where they are.")
+        }
+    }
+
+    private var renamePresentationBinding: Binding<Bool> {
+        Binding(
+            get: { sessionPendingRename != nil },
+            set: { isPresented in
+                if !isPresented { sessionPendingRename = nil }
+            }
+        )
     }
 
     private var deletePresentationBinding: Binding<Bool> {
@@ -132,6 +175,9 @@ struct SessionsView: View {
         HStack(spacing: WP.Space.md) {
             BrandLogo().frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 1) {
+                Text(AppInfo.brandLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.tertiary)
                 Text("Sessions")
                     .font(.system(size: 18, weight: .semibold))
                 Text("Each session keeps its own transcript and AI conversation on disk.")
@@ -139,6 +185,10 @@ struct SessionsView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            // Renders only when a newer GitHub release exists. Sessions is the
+            // window returning users see most, so the upgrade nudge lives here
+            // too, not just in Settings.
+            UpdateAvailableButton()
             // Expanded form: the Sessions window has plenty of horizontal
             // room in its header bar, and this is one of the surfaces a
             // returning user is most likely to be looking at — better
@@ -151,6 +201,20 @@ struct SessionsView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
+            // Settings shortcut. The menu bar icon also opens Settings, but
+            // first-time users often miss the LSUIElement icon entirely — this
+            // gives the Sessions window a direct entry point that matches the
+            // gear-icon convention every other macOS app uses.
+            Button {
+                vm.onOpenSettings?()
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .help("Open Settings (⌘,)")
+            .keyboardShortcut(",", modifiers: .command)
         }
         .padding(.horizontal, 24)
         .padding(.vertical, WP.Space.md + 2)
@@ -245,7 +309,11 @@ struct SessionsView: View {
                             session: session,
                             isHovered: hoveredSessionID == session.id,
                             vm: vm,
-                            onRequestDelete: { sessionPendingDeletion = session }
+                            onRequestDelete: { sessionPendingDeletion = session },
+                            onRequestRename: {
+                                renameDraft = session.displayName
+                                sessionPendingRename = session
+                            }
                         )
                         .onHover { hovering in
                             hoveredSessionID = hovering ? session.id : (hoveredSessionID == session.id ? nil : hoveredSessionID)
@@ -326,6 +394,7 @@ private struct SessionRow: View {
     let isHovered: Bool
     let vm: SessionsViewModel
     let onRequestDelete: () -> Void
+    let onRequestRename: () -> Void
 
     var body: some View {
         HStack(spacing: WP.Space.md) {
@@ -350,6 +419,21 @@ private struct SessionRow: View {
 
             Spacer()
 
+            if let modelBadge = modelBadgeContent {
+                Text(modelBadge.label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(modelBadge.color)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule().fill(modelBadge.color.opacity(0.12))
+                    )
+                    .overlay(
+                        Capsule().strokeBorder(modelBadge.color.opacity(0.4), lineWidth: 0.5)
+                    )
+                    .help(modelBadge.tooltip)
+            }
+
             Button {
                 vm.resume(session)
             } label: {
@@ -360,6 +444,9 @@ private struct SessionRow: View {
             .controlSize(.small)
 
             Menu {
+                Button(action: onRequestRename) {
+                    Label("Rename…", systemImage: "pencil")
+                }
                 Button {
                     Task { await vm.openInFinder(session) }
                 } label: {
@@ -391,6 +478,22 @@ private struct SessionRow: View {
                 .strokeBorder(.separator.opacity(isHovered ? 0.5 : 0.25), lineWidth: 0.5)
         )
         .animation(.easeOut(duration: 0.12), value: isHovered)
+    }
+
+    /// Vendor-colored badge content for the model this session uses. Nil when
+    /// the session was created before the per-session-model feature shipped
+    /// and hasn't been opened since — those rows just don't show a badge
+    /// rather than render a misleading "default" pill that lies about what
+    /// the session will actually use on resume (resume reads the *current*
+    /// global default at that moment, which may differ from launch-time).
+    private var modelBadgeContent: (label: String, color: Color, tooltip: String)? {
+        guard let id = session.selectedModel,
+              let model = AIModelRegistry.model(for: id) else { return nil }
+        return (
+            label: model.displayName,
+            color: model.vendor.accentColor,
+            tooltip: "This session uses \(model.displayName). Resume to continue with the same model."
+        )
     }
 
     private var detailLine: String {

@@ -101,25 +101,9 @@ final class MicrophoneCapture {
 
     private func handle(_ buffer: AVAudioPCMBuffer) {
         guard let converter else { return }
-        let outputFormat = CanonicalAudioFormat.make()
-        let outputCapacity = AVAudioFrameCount(Double(buffer.frameLength) * outputFormat.sampleRate / buffer.format.sampleRate) + 1024
-        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else { return }
-
-        // Reset before each conversion — without this the converter enters a terminal
-        // "stream ended" state after the first endOfStream and produces 0 frames forever.
-        converter.reset()
-        var error: NSError?
-        var consumed = false
-        converter.convert(to: output, error: &error) { _, status in
-            if consumed { status.pointee = .endOfStream; return nil }
-            consumed = true
-            status.pointee = .haveData
-            return buffer
-        }
-        if let error {
-            log.error("Mic conversion error: \(String(describing: error), privacy: .public)")
-            return
-        }
+        // Streaming conversion — no per-buffer reset, so the resampler's filter
+        // state carries across buffers. See `StreamingAudioConverter`.
+        guard let output = StreamingAudioConverter.convert(buffer, using: converter, label: "Microphone") else { return }
         framesEmitted += 1
         if framesEmitted < 5 || framesEmitted % 200 == 0 {
             let inRMS = Self.computeRMSAny(buffer)

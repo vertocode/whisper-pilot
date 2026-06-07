@@ -2,9 +2,12 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var store: SettingsStore
-    @State private var apiKeyDraft: String = ""
-    @State private var apiKeySaved: Bool = false
+    @State private var geminiAPIKeyDraft: String = ""
+    @State private var geminiAPIKeySaved: Bool = false
+    @State private var anthropicAPIKeyDraft: String = ""
+    @State private var anthropicAPIKeySaved: Bool = false
     @State private var inputDevices: [AudioInputDevice] = []
+    @State private var screens: [ScreenInfo] = []
 
     var body: some View {
         VStack(spacing: WP.Space.md) {
@@ -25,9 +28,12 @@ struct SettingsView: View {
         .frame(minWidth: 820, idealWidth: 880, minHeight: 480, idealHeight: 520)
         .padding(WP.Space.md)
         .onAppear {
-            apiKeyDraft = store.geminiAPIKey ?? ""
-            apiKeySaved = !apiKeyDraft.isEmpty
+            geminiAPIKeyDraft = store.geminiAPIKey ?? ""
+            geminiAPIKeySaved = !geminiAPIKeyDraft.isEmpty
+            anthropicAPIKeyDraft = store.anthropicAPIKey ?? ""
+            anthropicAPIKeySaved = !anthropicAPIKeyDraft.isEmpty
             inputDevices = MicrophoneCapture.listInputDevices()
+            screens = ScreenEnumerator.connectedScreens()
         }
     }
 
@@ -38,13 +44,17 @@ struct SettingsView: View {
             BrandLogo()
                 .frame(width: 40, height: 40)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Whisper Pilot")
+                Text(AppInfo.brandLabel)
                     .font(.system(size: 15, weight: .semibold))
                 Text("Ambient AI for live conversations")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            // Renders only when a newer GitHub release exists. Settings is
+            // where users go to poke at the app, so it's a natural surface
+            // for the upgrade nudge.
+            UpdateAvailableButton()
             // Shown across every Settings tab — one place a user already opens
             // when they're looking up where things live, so it's a natural
             // spot to put the optional "say thanks" affordance.
@@ -102,6 +112,13 @@ struct SettingsView: View {
                 FormHint("When on, questions captured on your microphone also fire an AI call. Off by default because the spoken version often duplicates what you'd type to the assistant directly.")
             }
 
+            Section("Voice commands") {
+                Toggle("Listen for wake word", isOn: $store.wakeWordEnabled)
+                FormHint("Say the wake word followed by a command while listening — e.g. \"pilot, open Chrome\" or \"pilot, write me a landing page\". Open-app / open-website commands run immediately; everything else is answered in the AI chat. Requires microphone capture.")
+                TextField("Wake word", text: $store.wakeWord)
+                FormHint("Matched case-insensitively as a whole word, and only against your microphone (\"Me\") — system audio can never trigger a command. A short, uncommon word avoids accidental fires.")
+            }
+
             Section("Prompt context") {
                 Toggle("Include live transcript", isOn: $store.includeTranscriptInPrompt)
                 FormHint("Sends the recent conversation lines (and any resumed prior transcript) to the model on every call. Cheapest setting to flip if your transcript is long but the AI doesn't need it for what you're asking.")
@@ -151,57 +168,136 @@ struct SettingsView: View {
 
     private var providerTab: some View {
         Form {
+            Section("Active model") {
+                modelPicker
+                if let warning = activeModelKeyWarning {
+                    HStack(alignment: .top, spacing: WP.Space.xs) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                        Text(warning)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                FormHint("Shows every model whose vendor has an API key configured below. Per-session model selection lives in the overlay — this picker controls the default for new sessions.")
+            }
+
             Section("Gemini") {
-                SecureField("API key", text: $apiKeyDraft)
-                    .textFieldStyle(.roundedBorder)
-                HStack(spacing: WP.Space.sm) {
-                    Button(apiKeySaved ? "Update key" : "Save key") {
-                        store.geminiAPIKey = apiKeyDraft
-                        apiKeySaved = !apiKeyDraft.isEmpty
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
-                    .disabled(apiKeyDraft.isEmpty)
+                apiKeySection(
+                    draft: $geminiAPIKeyDraft,
+                    saved: $geminiAPIKeySaved,
+                    vendorDocsURL: "https://aistudio.google.com/app/apikey",
+                    onSave: { store.geminiAPIKey = geminiAPIKeyDraft },
+                    onRemove: { store.geminiAPIKey = nil }
+                )
+                FormHint("`gemini-2.0-flash` was retired for new Google AI Studio keys. If the selected model returns a 404, Whisper Pilot auto-switches to a working one and retries.")
+            }
 
-                    if apiKeySaved {
-                        Button("Remove") {
-                            store.geminiAPIKey = nil
-                            apiKeyDraft = ""
-                            apiKeySaved = false
-                        }
-                    }
+            Section("Claude (Anthropic)") {
+                apiKeySection(
+                    draft: $anthropicAPIKeyDraft,
+                    saved: $anthropicAPIKeySaved,
+                    vendorDocsURL: "https://console.anthropic.com/settings/keys",
+                    onSave: { store.anthropicAPIKey = anthropicAPIKeyDraft },
+                    onRemove: { store.anthropicAPIKey = nil }
+                )
+                FormHint("Use a Claude API key from console.anthropic.com. The Claude models above only appear in the Active model picker when this key is set.")
+            }
 
-                    Spacer()
-
-                    Link(destination: URL(string: "https://aistudio.google.com/app/apikey")!) {
-                        HStack(spacing: 4) {
-                            Text("Get a key")
-                            Image(systemName: "arrow.up.right.square")
-                                .font(.system(size: 10))
-                        }
-                        .font(.system(size: 12))
-                    }
-                }
-
-                Picker("Model", selection: $store.geminiModel) {
-                    Text("gemini-2.5-flash").tag("gemini-2.5-flash")
-                    Text("gemini-2.0-flash-lite").tag("gemini-2.0-flash-lite")
-                    Text("gemini-2.5-pro").tag("gemini-2.5-pro")
-                    Text("gemini-2.0-flash (legacy)").tag("gemini-2.0-flash")
-                }
-                FormHint("If the selected model returns a 404, Whisper Pilot will auto-switch to a working one and retry. `gemini-2.0-flash` was retired for new Google AI Studio keys — pick `gemini-2.5-flash` unless you specifically need a different model.")
-
+            Section {
                 HStack(spacing: WP.Space.xs) {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(.green)
-                    Text("Stored in the macOS Keychain. Never written to disk in plaintext.")
+                    Text("API keys are stored in the macOS Keychain. Never written to disk in plaintext.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Unified model picker. Groups models by vendor and disables rows whose
+    /// vendor has no key configured — the user sees what's available without
+    /// having to remember which section the model lives in. Mutates
+    /// `store.activeModel` directly so the coordinator picks up the change
+    /// via its existing key-watching path.
+    @ViewBuilder
+    private var modelPicker: some View {
+        let vendors = store.availableVendors
+        Picker("Model", selection: $store.activeModel) {
+            ForEach(AIVendor.allCases, id: \.self) { vendor in
+                let isAvailable = vendors.contains(vendor)
+                ForEach(AIModelRegistry.models(for: vendor)) { model in
+                    Text(rowLabel(for: model, vendorAvailable: isAvailable))
+                        .tag(model.id)
+                }
+            }
+        }
+    }
+
+    /// Inline warning under the model picker when the active model's vendor
+    /// doesn't have a key set. Picker (unlike Menu) can't disable individual
+    /// rows, so this is the only place users see that the current selection
+    /// is non-functional until they add a key. Nil = the active model can run.
+    private var activeModelKeyWarning: String? {
+        guard let model = AIModelRegistry.model(for: store.activeModel) else { return nil }
+        if store.availableVendors.contains(model.vendor) { return nil }
+        return "The active model needs a \(model.vendor.displayName) API key — add one in the section below, or pick a different model."
+    }
+
+    private func rowLabel(for model: AIModel, vendorAvailable: Bool) -> String {
+        let suffix = vendorAvailable ? "" : "  ⚠ no \(model.vendor.displayName) API key"
+        if let tagline = model.tagline {
+            return "\(model.displayName) — \(tagline)\(suffix)"
+        }
+        return "\(model.displayName)\(suffix)"
+    }
+
+    /// Reusable save / update / remove row used by both vendor sections.
+    /// Kept inline (rather than a `View` struct) so the per-vendor `@Binding`s
+    /// to `apiKeyDraft` / `apiKeySaved` stay tied to this view's `@State`.
+    @ViewBuilder
+    private func apiKeySection(
+        draft: Binding<String>,
+        saved: Binding<Bool>,
+        vendorDocsURL: String,
+        onSave: @escaping () -> Void,
+        onRemove: @escaping () -> Void
+    ) -> some View {
+        SecureField("API key", text: draft)
+            .textFieldStyle(.roundedBorder)
+        HStack(spacing: WP.Space.sm) {
+            Button(saved.wrappedValue ? "Update key" : "Save key") {
+                onSave()
+                saved.wrappedValue = !draft.wrappedValue.isEmpty
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(draft.wrappedValue.isEmpty)
+
+            if saved.wrappedValue {
+                Button("Remove") {
+                    onRemove()
+                    draft.wrappedValue = ""
+                    saved.wrappedValue = false
+                }
+            }
+
+            Spacer()
+
+            Link(destination: URL(string: vendorDocsURL)!) {
+                HStack(spacing: 4) {
+                    Text("Get a key")
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.system(size: 10))
+                }
+                .font(.system(size: 12))
+            }
+        }
     }
 
     // MARK: - Capture
@@ -222,8 +318,78 @@ struct SettingsView: View {
 
     // MARK: - Overlay
 
+    /// Selecting a mode goes through `applyOverlayLayoutMode` so the individual
+    /// appearance settings get filled from the preset — a plain assignment would
+    /// just relabel the mode without changing anything.
+    private var overlayModeBinding: Binding<OverlayLayoutMode> {
+        Binding(
+            get: { store.overlayLayoutMode },
+            set: { store.applyOverlayLayoutMode($0) }
+        )
+    }
+
     private var overlayTab: some View {
         Form {
+            Section("Layout mode") {
+                Picker("Mode", selection: overlayModeBinding) {
+                    ForEach(OverlayLayoutMode.allCases) { mode in
+                        Label(mode.displayName, systemImage: mode.icon).tag(mode)
+                    }
+                }
+                FormHint(store.overlayLayoutMode.summary)
+            }
+
+            Section("Size & position") {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Width")
+                        Spacer()
+                        Text("\(Int((store.overlayWidthFraction * 100).rounded()))% of screen")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: $store.overlayWidthFraction, in: 0.25...1.0, step: 0.01)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Height")
+                        Spacer()
+                        Text("\(Int((store.overlayHeightFraction * 100).rounded()))% of screen")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: $store.overlayHeightFraction, in: 0.25...1.0, step: 0.01)
+                }
+                Picker("Anchor position", selection: $store.overlayPosition) {
+                    ForEach(OverlayPosition.allCases) { pos in
+                        Text(pos.displayName).tag(pos)
+                    }
+                }
+                FormHint("Size is a fraction of your screen's usable area; the window anchors to the chosen edge or corner. Dragging or resizing the overlay yourself switches the mode to Custom.")
+            }
+
+            Section("Appearance") {
+                Toggle("Show live transcript pane", isOn: $store.overlayShowTranscript)
+                Toggle("Show Summary & Action buttons", isOn: $store.overlayShowExtraActions)
+                Toggle("Compact chrome (denser, smaller)", isOn: $store.overlayCompactChrome)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Background opacity")
+                        Spacer()
+                        Text("\(Int((store.overlayBackgroundOpacity * 100).rounded()))%")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: $store.overlayBackgroundOpacity, in: 0.4...1.0, step: 0.01)
+                }
+                Picker("Text color", selection: $store.overlayTextColorHex) {
+                    ForEach(OverlayColor.palette, id: \.hex) { item in
+                        Text(item.name).tag(item.hex)
+                    }
+                }
+                FormHint("Lower opacity makes the panel more see-through; text and buttons stay fully opaque. Help AI and the screenshot/send controls always remain regardless of the buttons toggle.")
+            }
+
             Section {
                 Toggle("Always on top", isOn: $store.alwaysOnTop)
                 FormHint("Keeps the overlay floating above your meeting window so you can read suggestions without alt-tabbing.")
@@ -235,6 +401,22 @@ struct SettingsView: View {
             Section {
                 Toggle("Hide from screen sharing", isOn: $store.hideFromScreenSharing)
                 FormHint("Excludes the overlay from screen-capture APIs (WebRTC, ScreenCaptureKit, QuickTime, macOS screenshots). The window stays visible on your local display, but other meeting participants and recordings won't see it.")
+            }
+            Section("Screen capture") {
+                Picker("Monitor", selection: $store.screenCaptureDisplayID) {
+                    Text("Monitor with the pointer (follow)").tag(UInt32(0))
+                    ForEach(screens) { screen in
+                        Text(screen.name).tag(screen.id)
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("Refresh monitors") {
+                        screens = ScreenEnumerator.connectedScreens()
+                    }
+                    .controlSize(.small)
+                }
+                FormHint("Which monitor \"See my screen\" and the answer-screen shortcut (⌘⇧A) capture. \"Follow\" uses whichever monitor your pointer is on. Pick a specific monitor to always capture that one, even while you're looking at another. If a pinned monitor is disconnected, capture falls back to an available display.")
             }
         }
         .formStyle(.grouped)
@@ -257,6 +439,20 @@ struct SettingsView: View {
                     .controlSize(.small)
                 }
                 FormHint("Global shortcut — works from any app, including when the overlay is click-through. Click the field, then press the combo you want. Press Escape to cancel without changing. Default: ⌘⇧Z.")
+            }
+            Section {
+                HStack {
+                    Text("Answer what's on screen")
+                    Spacer()
+                    KeyRecorderField(shortcut: $store.answerScreenShortcut)
+                        .frame(width: 140, height: 26)
+                    Button("Reset") {
+                        store.answerScreenShortcut = .answerScreenDefault
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                FormHint("Captures your current screen and asks the AI to answer whatever question is visible — picks the right option for multiple-choice, or replies briefly for an open question. If there's no question, it tells you what it sees and offers to help. Requires Screen Recording permission. Default: ⌘⇧A.")
             }
         }
         .formStyle(.grouped)

@@ -180,7 +180,25 @@ if [[ $SKIP_PUBLISH -eq 0 ]]; then
   fi
 fi
 
-# --- Build -----------------------------------------------------------------
+# --- Bump in-repo version files --------------------------------------------
+# Keep Project.yml in sync with the version actually being released, so a
+# developer running the app from Xcode after a release sees the correct
+# "Whisper Pilot vX.Y.Z" label in the Settings + Sessions headers. The build
+# itself doesn't need this — we already pass MARKETING_VERSION to xcodebuild
+# below, which overrides the Info.plist for the produced .app — but devs
+# checking out the source after a release would otherwise see the old
+# version baked into the bundle when running unsigned local builds.
+PROJECT_YML_VERSION="$(awk '/CFBundleShortVersionString/ { gsub(/"/, "", $2); print $2; exit }' Project.yml || true)"
+if [[ "$PROJECT_YML_VERSION" != "$VERSION" ]]; then
+  step "Bumping Project.yml CFBundleShortVersionString → ${VERSION}"
+  # macOS sed needs the empty -i argument; the .bak file is removed right after.
+  sed -i.bak "s/CFBundleShortVersionString: \"[^\"]*\"/CFBundleShortVersionString: \"${VERSION}\"/" Project.yml
+  rm -f Project.yml.bak
+  PROJECT_YML_BUMPED=1
+else
+  PROJECT_YML_BUMPED=0
+fi
+
 step "Regenerating Xcode project"
 ./bin/regenerate
 
@@ -316,6 +334,25 @@ echo "${SHA256}  $(basename "${DMG_PATH}")" > "${DMG_PATH}.sha256"
 done_step "DMG ready: ${DMG_PATH}"
 echo "  SHA-256:  ${SHA256}"
 
+# --- Bump in-repo Cask -----------------------------------------------------
+# Mirrors the change the script makes to the *tap* repo's Casks/whisper-pilot.rb,
+# but applied to this repo's copy so the in-repo Cask stays as an accurate
+# canonical reference (rather than carrying a stale version + a
+# REPLACE_WITH_SHA256_FROM_BIN_RELEASE_OUTPUT placeholder forever).
+CASK_PATH="Casks/whisper-pilot.rb"
+CASK_BUMPED=0
+if [[ -f "$CASK_PATH" ]]; then
+  CASK_VERSION_BEFORE="$(awk '/^  version / { gsub(/"/, "", $2); print $2; exit }' "$CASK_PATH" || true)"
+  CASK_SHA_BEFORE="$(awk '/^  sha256 / { gsub(/"/, "", $2); print $2; exit }' "$CASK_PATH" || true)"
+  if [[ "$CASK_VERSION_BEFORE" != "$VERSION" ]] || [[ "$CASK_SHA_BEFORE" != "$SHA256" ]]; then
+    step "Bumping in-repo Cask (${CASK_PATH}) → version ${VERSION}, sha256 ${SHA256:0:12}…"
+    sed -i.bak "s/^  version .*/  version \"${VERSION}\"/" "$CASK_PATH"
+    sed -i.bak "s/^  sha256 .*/  sha256 \"${SHA256}\"/" "$CASK_PATH"
+    rm -f "${CASK_PATH}.bak"
+    CASK_BUMPED=1
+  fi
+fi
+
 if [[ $BUILD_ONLY -eq 1 ]]; then
   echo
   done_step "Build-only mode: skipping publish + tap update."
@@ -389,3 +426,18 @@ fi
 
 echo
 done_step "Release v${VERSION} complete."
+
+# --- Hint: uncommitted in-repo version bumps -------------------------------
+# The version-bump edits live in the working tree until the user commits them
+# themselves — a release script auto-pushing to main was deliberately ruled
+# out as too aggressive. Surface a clear nudge so the bumps don't just sit
+# uncommitted forever, drifting from the released tag.
+if [[ ${PROJECT_YML_BUMPED:-0} -eq 1 ]] || [[ ${CASK_BUMPED:-0} -eq 1 ]]; then
+  echo
+  CHANGED_FILES=()
+  [[ ${PROJECT_YML_BUMPED:-0} -eq 1 ]] && CHANGED_FILES+=("Project.yml")
+  [[ ${CASK_BUMPED:-0} -eq 1 ]] && CHANGED_FILES+=("Casks/whisper-pilot.rb")
+  warn "Uncommitted version bump in: ${CHANGED_FILES[*]}"
+  warn "Review the diff and commit when ready:"
+  warn "    git add ${CHANGED_FILES[*]} && git commit -m 'chore: bump to v${VERSION}'"
+fi

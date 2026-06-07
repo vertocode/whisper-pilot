@@ -90,9 +90,9 @@ enum AIFinishReason: Sendable, Equatable {
         case .maxTokens:
             return "response was cut off at the model's output-token limit"
         case .safety:
-            return "response was blocked by Gemini's safety filter"
+            return "response was blocked by the provider's safety filter"
         case .recitation:
-            return "response was stopped by Gemini's recitation / copyright filter"
+            return "response was stopped by the provider's recitation / copyright filter"
         case .other(let raw):
             if let raw, !raw.isEmpty {
                 return "stream ended unexpectedly (\(raw))"

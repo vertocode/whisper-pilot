@@ -61,6 +61,30 @@ enum PromptBuilder {
         )
     }
 
+    /// Triggered by a spoken wake-word command that the interpreter routed to
+    /// "answer" (not an open-app / open-url action). Same context as a typed
+    /// query, but the system prompt frames the input as spoken — speech
+    /// recognition artifacts ("right a landing page") should be resolved
+    /// charitably rather than answered literally.
+    static func buildVoiceCommand(context: ConversationSnapshot, history: [ChatTurn], command: String, style: ResponseStyle) -> Prompt {
+        let system = """
+        You are an ambient real-time copilot. The user spoke a command to you out loud \
+        after the wake word — the text below is a speech-recognition transcript, so fix \
+        obvious mis-transcriptions from context ("right a function" → "write a function") \
+        instead of taking them literally. Use the live transcript and prior chat as \
+        context. If the request needs key details you don't have, give your best answer \
+        and note the one or two questions that would improve it. Be direct.
+
+        Style: \(style.rawValue) — \(style.description)
+        """
+        return Prompt(
+            systemInstruction: system,
+            context: contextBlock(transcript: context, history: history),
+            question: command,
+            style: style
+        )
+    }
+
     /// Triggered by the "Help AI" button. The user thinks there's an unanswered question
     /// in the recent transcript that the auto-detector missed. We hand the model the
     /// same full context as a normal user query but instruct it to *find* the question
@@ -152,6 +176,52 @@ enum PromptBuilder {
             context: contextBlock(transcript: context, history: history),
             question: "List the pending action items from the meeting so far.",
             style: .detailed
+        )
+    }
+
+    /// Triggered by the "answer what's on screen" global shortcut (⌘⇧A). A
+    /// screenshot of the user's current display is attached to this prompt (set
+    /// by the coordinator). The model reads the screen and answers whatever
+    /// question is visible — multiple-choice or free text — concisely, the way a
+    /// person glancing over the user's shoulder would. The live transcript / chat
+    /// are still passed as background in case the on-screen question references
+    /// the meeting, but the screenshot is the primary source of truth.
+    static func buildAnswerScreen(context: ConversationSnapshot, history: [ChatTurn], style: ResponseStyle) -> Prompt {
+        let system = """
+        You are an ambient real-time copilot. Attached to this message is a screenshot of \
+        the user's current screen. Read it and respond based on what is visible. The user \
+        triggered you with a keyboard shortcut and cannot type a question — the screen IS \
+        the question.
+
+        Decide which case you're in and answer accordingly:
+
+        1. MULTIPLE-CHOICE QUESTION (options labeled A/B/C/D, 1/2/3/4, etc.):
+           Reply in exactly this shape: `Answer is "A" because <one short reason>.`
+           Use the option's own label (the letter or number shown on screen). Give a single \
+           brief clause of reasoning — no restating the whole question, no listing the other \
+           options.
+
+        2. OPEN / TEXT QUESTION (a question with no preset options):
+           Answer it directly the way a knowledgeable person would, in 1–3 sentences. Lead \
+           with the answer. Be brief but complete enough to actually be useful. No preamble, \
+           no "great question", no sign-off.
+
+        3. NO QUESTION ON SCREEN:
+           Briefly say what you can see, then offer to help. Use this shape: \
+           `No question detected, but I can see <a short description of what's on screen>. \
+           How can I help you with that?`
+
+        Never say "as an AI" or "I'd be happy to help". Never describe the screenshot in \
+        detail unless you're in case 3. If the screen text is too blurry or cropped to read \
+        the question, say so in one line and ask the user to bring the question fully into view.
+
+        Style: \(style.rawValue) — \(style.description)
+        """
+        return Prompt(
+            systemInstruction: system,
+            context: contextBlock(transcript: context, history: history),
+            question: "Read my screen and answer the question shown, following the rules above.",
+            style: style
         )
     }
 

@@ -139,25 +139,9 @@ extension SystemAudioCapture: SCStreamOutput {
             return nil
         }
 
-        let outputFormat = CanonicalAudioFormat.make()
-        let outputCapacity = AVAudioFrameCount(Double(frameCount) * outputFormat.sampleRate / inputFormat.sampleRate) + 1024
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else {
-            return nil
-        }
-
-        // Reset before each conversion — without this the converter enters a terminal
-        // "stream ended" state after the first endOfStream and produces 0 frames forever.
-        converter.reset()
-        var error: NSError?
-        var consumed = false
-        converter.convert(to: outputBuffer, error: &error) { _, status in
-            if consumed { status.pointee = .endOfStream; return nil }
-            consumed = true
-            status.pointee = .haveData
-            return inputBuffer
-        }
-        if let error {
-            log.error("Conversion error: \(String(describing: error), privacy: .public)")
+        // Streaming conversion — no per-buffer reset, so the resampler's filter
+        // state carries across buffers. See `StreamingAudioConverter`.
+        guard let outputBuffer = StreamingAudioConverter.convert(inputBuffer, using: converter, label: "SystemAudio") else {
             return nil
         }
 

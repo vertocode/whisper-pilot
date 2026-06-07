@@ -91,15 +91,23 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
     /// produces cleaner, less fragmented lines than legacy SFSpeech did.
     func notifyVADBoundary(channel: AudioChannel) {}
 
-    /// SpeechAnalyzer naturally emits `isFinal=true` once its volatile range
-    /// advances past a result. We don't have a clean way to ask it to commit
-    /// early without closing the entire input stream (which would tear down
-    /// the analyzer mid-session). Returning empty here is correct — the
-    /// recently-spoken text will reach the context async on the analyzer's
-    /// own cadence, which for the macOS 26 path is typically fast enough that
-    /// the pre-prompt flush isn't needed. The hook exists in the protocol so
-    /// the SFSpeech path (Mac mini / older macOS) can use it.
-    func collectPendingFinals() -> [TranscriptUpdate] { [] }
+    /// SpeechAnalyzer can hold a result volatile for a long stretch (it only
+    /// commits when its volatile range advances), and `context.absorb` plus the
+    /// transcript.md persistence path only ingest finals. Without this flush, a
+    /// short utterance spoken right before a prompt — a wake-word command in
+    /// particular — never lands in the AI context or transcript.md until the
+    /// analyzer happens to finalize, which may be teardown-time when nobody is
+    /// listening anymore. Mirrors `AppleSpeechTranscriber`'s synthetic-final
+    /// flush: emit the current volatile hypothesis as `isFinal=true` through
+    /// the normal stream (so every downstream consumer sees it) and return it
+    /// for synchronous absorption. A later natural final with the same segment
+    /// id harmlessly replaces it everywhere — all consumers key by id.
+    func collectPendingFinals() -> [TranscriptUpdate] {
+        mutex.lock()
+        let current = pipes
+        mutex.unlock()
+        return current.values.compactMap { $0.takePendingFinal() }
+    }
 
     deinit {
         continuation.finish()
@@ -131,13 +139,25 @@ private final class Pipe: @unchecked Sendable {
 
     private let mutex = NSLock()
     private var isFinished = false
-    /// Map from a result's `range.start` to a stable segment UUID. Each distinct
-    /// utterance the analyzer reports (i.e. each unique audio start time) becomes its
-    /// own transcript line; volatile partials for the same range update that line in
-    /// place. Without this — using a single rotating id — fast back-to-back utterances
-    /// would all share one id and `TranscriptBuffer.apply` would treat them as
-    /// revisions of one segment, so each new phrase visibly replaced the previous one.
-    private var segmentIdsByRangeStart: [CMTime: UUID] = [:]
+    /// Active segment id reused for emissions on this channel that arrive within
+    /// `coalesceWindowSeconds` of the previous one. The recognizer's progressive
+    /// transcription mode emits many results per second with refining hypotheses —
+    /// keying segment ids by `range.start` made each refinement its own transcript
+    /// line, so a single phrase ended up split across dozens of partial fragments
+    /// in the live UI, the AI context, and transcript.md. Reusing the same id
+    /// while the emission cadence is hot collapses those refinements into one
+    /// segment that updates in place across all three downstream consumers
+    /// (`TranscriptBuffer.apply` overwrites same-id segments, `ConversationContext`
+    /// dedupes by id, `queueTranscriptPersistence` replaces in-memory pending
+    /// without touching disk). The trade-off is that two genuinely distinct short
+    /// utterances spoken within ~1s of each other collapse into one row — but
+    /// real phrase boundaries from a human speaker virtually always carry a
+    /// breath / pause longer than that, so the trade is worth it for the
+    /// dramatic noise reduction on noisy audio paths (Process Tap without
+    /// ScreenCaptureKit in particular).
+    private var activeSegmentId: UUID?
+    private var lastEmissionAt: Date?
+    private static let coalesceWindowSeconds: TimeInterval = 1.2
     /// Start of the analyzer's current volatile (unfinalized) audio range. A result is
     /// considered final once its range ends at or before this point. Updated by the
     /// `volatileRangeChangedHandler` we install on the analyzer.
@@ -149,6 +169,13 @@ private final class Pipe: @unchecked Sendable {
     private var hasVolatileRange = false
     private var buffersFed: Int = 0
     private var resultsSeen: Int = 0
+    /// Latest hypothesis for the active segment, plus whether the analyzer has
+    /// already committed it. Backs `takePendingFinal` — the pre-prompt flush
+    /// that turns a still-volatile utterance into a synthetic final so the AI
+    /// context and transcript.md persistence (final-only consumers) ingest it.
+    private var pendingText: String = ""
+    private var pendingSegmentId: UUID?
+    private var pendingHasNaturalFinal = true
 
     static func make(
         channel: AudioChannel,
@@ -262,28 +289,10 @@ private final class Pipe: @unchecked Sendable {
         mutex.unlock()
 
         let converted: AVAudioPCMBuffer
-        if let converter, let target = analyzerFormat {
-            // Reset before each conversion — the converter latches into a terminal
-            // "endOfStream" state after the first endOfStream signal and produces 0
-            // frames forever afterwards. Same fix as `MicrophoneCapture.handle`.
-            converter.reset()
-            let outCapacity = AVAudioFrameCount(
-                Double(buffer.frameLength) * target.sampleRate / canonicalFormat.sampleRate
-            ) + 1024
-            guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCapacity) else { return }
-            var error: NSError?
-            var consumed = false
-            converter.convert(to: out, error: &error) { _, status in
-                if consumed { status.pointee = .endOfStream; return nil }
-                consumed = true
-                status.pointee = .haveData
-                return buffer
-            }
-            if let error {
-                wpError("SpeechAnalyzer.\(channel) convert error: \(error.localizedDescription)")
-                return
-            }
-            if out.frameLength == 0 { return }
+        if let converter {
+            // Streaming conversion — no per-buffer reset, so the resampler's
+            // filter state carries across buffers. See `StreamingAudioConverter`.
+            guard let out = StreamingAudioConverter.convert(buffer, using: converter, label: "SpeechAnalyzer.\(channel)") else { return }
             converted = out
         } else {
             converted = buffer
@@ -356,19 +365,23 @@ private final class Pipe: @unchecked Sendable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return }
 
-        let rangeStart = result.range.start
+        let now = Date()
         mutex.lock()
-        // Stable id per `range.start`: each distinct utterance the analyzer reports
-        // gets its own UUID, and repeated volatile emissions for the *same* range
-        // share an id so they update the same line in place. This is what stops a
-        // new fast-spoken phrase from clobbering the previous one in `TranscriptBuffer`.
+        // Time-window coalescing: while results on this channel keep arriving within
+        // `coalesceWindowSeconds` of the previous emission, they all share the same
+        // segment id and downstream consumers treat them as one updating segment.
+        // After a gap longer than the window, the next result mints a fresh id and
+        // becomes a new transcript line. See the field doc above for the rationale.
         let segmentId: UUID
-        if let existing = segmentIdsByRangeStart[rangeStart] {
-            segmentId = existing
+        if let active = activeSegmentId,
+           let last = lastEmissionAt,
+           now.timeIntervalSince(last) <= Self.coalesceWindowSeconds {
+            segmentId = active
         } else {
             segmentId = UUID()
-            segmentIdsByRangeStart[rangeStart] = segmentId
+            activeSegmentId = segmentId
         }
+        lastEmissionAt = now
         // A result is final once its range ends at or before the volatile region's
         // start — meaning the analyzer has committed that audio segment and won't
         // revise it. Before the volatile-range handler has fired even once, we
@@ -377,6 +390,11 @@ private final class Pipe: @unchecked Sendable {
         let isFinal = hasVolatileRange && CMTimeCompare(result.range.end, volatileStart) <= 0
         resultsSeen += 1
         let count = resultsSeen
+        // Track the active hypothesis for the pre-prompt synthetic-final flush.
+        // A natural final disarms it; the next volatile result re-arms it.
+        pendingText = text
+        pendingSegmentId = segmentId
+        pendingHasNaturalFinal = isFinal
         mutex.unlock()
 
         let update = TranscriptUpdate(
@@ -391,6 +409,32 @@ private final class Pipe: @unchecked Sendable {
         if count == 1 {
             wpInfo("SpeechAnalyzer.\(channel) FIRST result: \"\(text)\" final=\(isFinal)")
         }
+    }
+
+    /// Emit the current still-volatile hypothesis as a synthetic `isFinal=true`
+    /// update, both through the normal stream (display, persistence, context
+    /// consumers) and as a return value for synchronous pre-prompt absorption.
+    /// Idempotent: once flushed, subsequent calls return nil until a new
+    /// volatile result re-arms the pending state. Same contract as
+    /// `AppleSpeechTranscriber.ChannelPipe.takePendingFinal`.
+    fileprivate func takePendingFinal() -> TranscriptUpdate? {
+        mutex.lock()
+        let needs = !pendingHasNaturalFinal && !pendingText.isEmpty && pendingSegmentId != nil
+        let text = pendingText
+        let id = pendingSegmentId
+        pendingHasNaturalFinal = true
+        mutex.unlock()
+        guard needs, let id else { return nil }
+        let update = TranscriptUpdate(
+            id: id,
+            text: text,
+            isFinal: true,
+            channel: channel,
+            timestamp: Date()
+        )
+        sink.yield(update)
+        wpInfo("SpeechAnalyzer.\(channel) flushed synthetic FINAL: \"\(text)\"")
+        return update
     }
 }
 

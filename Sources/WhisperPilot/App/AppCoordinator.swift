@@ -48,6 +48,9 @@ final class AppCoordinator {
     /// the events AsyncStream is single-use and a new pipeline needs a fresh one
     /// so trigger events from the new session aren't lost to a dead iterator.
     private var triggerEngine = TriggerEngine()
+    /// Wake-word command detector ("pilot, open chrome"). Same per-session
+    /// recreation as `triggerEngine` — its AsyncStream is single-use.
+    private var wakeWordEngine = WakeWordEngine()
 
     private var transcriber: TranscriptionProvider?
     private var aiProvider: AIProvider?
@@ -129,11 +132,12 @@ final class AppCoordinator {
     private(set) var currentSession: SessionMeta?
 
     init() {
-        // Wire up the AI provider eagerly if a key already exists, so the composer works
-        // before/without ever clicking ▶ Play. AI prompts are independent of listening.
-        if let key = settings.geminiAPIKey, !key.isEmpty {
-            aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
-            aiProviderModel = settings.geminiModel
+        // Wire up the AI provider eagerly if the active model's vendor has a
+        // key, so the composer works before/without ever clicking ▶ Play. AI
+        // prompts are independent of listening.
+        if let provider = makeProviderForActiveModel() {
+            aiProvider = provider
+            aiProviderModel = settings.activeModel
         }
 
         settingsObserver = settings.objectWillChange.sink { [weak self] in
@@ -219,30 +223,32 @@ final class AppCoordinator {
     }
 
     private func refreshDerivedState() {
-        // Sync the live `aiProvider` reference with the current API key. Runs whether or
-        // not we're actively listening — composer prompts work independently.
-        let key = settings.geminiAPIKey ?? ""
-        if !key.isEmpty {
-            // Rebuild the provider when either the key changes (provider absent) or the
-            // user picks a different model in Settings. Without the model check, switching
-            // models in Settings had no effect until the next app launch.
-            if aiProvider == nil || aiProviderModel != settings.geminiModel {
-                aiProvider = GeminiProvider(apiKey: key, model: settings.geminiModel)
-                aiProviderModel = settings.geminiModel
+        // Sync the live `aiProvider` reference with the current active model
+        // and whichever key its vendor needs. Runs whether or not we're
+        // actively listening — composer prompts work independently.
+        let provider = makeProviderForActiveModel()
+        if let provider {
+            // Rebuild on either: provider absent (key just added), or active
+            // model changed (user picked a different one in Settings / the
+            // overlay). Without the model check, switching mid-session had
+            // no effect until the next app launch.
+            if aiProvider == nil || aiProviderModel != settings.activeModel {
+                aiProvider = provider
+                aiProviderModel = settings.activeModel
             }
             // A key was set while the transcription-only note is on screen — dismiss
-            // it now, otherwise it lingers as misleading "Add a Gemini API key" copy.
+            // it now, otherwise it lingers as misleading "Add an API key" copy.
             dismissTranscriptionOnlyNote()
         } else if aiProvider != nil {
             aiProvider = nil
             aiProviderModel = nil
-            overlayState.appendSystemNote("ℹ️ Gemini key removed. Transcription still running; AI features disabled.", category: .general)
+            overlayState.appendSystemNote("ℹ️ AI key for the selected model was removed. Transcription still running; AI features disabled until a key is added.", category: .general)
         }
 
         if !isRunning {
             switch overlayState.status {
             case .needsAPIKey:
-                if !key.isEmpty { overlayState.status = .idle }
+                if provider != nil { overlayState.status = .idle }
             case .needsPermission(.microphone):
                 if !settings.captureMicrophone || permissions.snapshot.microphone == .granted {
                     overlayState.status = .idle
@@ -268,6 +274,7 @@ final class AppCoordinator {
         // instances valid for any UI / debug code that reads them between sessions.
         audioMixer = AudioMixer()
         triggerEngine = TriggerEngine()
+        wakeWordEngine = WakeWordEngine()
         systemCapture = SystemAudioCapture()
         micCapture = MicrophoneCapture()
         // VAD holds per-channel `isSpeaking` state; if the previous session ended
@@ -693,6 +700,52 @@ final class AppCoordinator {
             overlayState.messages = messages
             await context.seedFromMarkdown(transcript: transcript, chat: chat)
         }
+
+        // Apply the session's stored model selection. On resume we honor the
+        // value saved when the session was last used; on a brand-new session
+        // we lock the current global default in so the session is reproducible
+        // across resumes even if the user changes the default later.
+        if let storedID = session.selectedModel,
+           AIModelRegistry.model(for: storedID) != nil {
+            if settings.activeModel != storedID {
+                settings.activeModel = storedID
+            }
+        } else {
+            // Persist the current global default onto the session so future
+            // resumes are stable. Doing this in `useSession` keeps the write
+            // co-located with all other session-hydration side effects.
+            await SessionStore.shared.setSelectedModel(settings.activeModel, for: session.id)
+            currentSession?.selectedModel = settings.activeModel
+        }
+    }
+
+    /// Called by the overlay's in-session model picker. Updates the global
+    /// active model (so the next provider rebuild uses it) and persists the
+    /// choice onto the current session so resuming later brings it back.
+    /// No-op when the model id isn't in the registry — defends against a
+    /// stale stored id surviving a future model-name change.
+    func selectModel(_ modelID: String) {
+        guard let model = AIModelRegistry.model(for: modelID) else { return }
+        let previous = settings.activeModel
+        let changed = previous != modelID
+        if changed {
+            settings.activeModel = modelID
+        }
+        if let id = currentSession?.id {
+            Task { await SessionStore.shared.setSelectedModel(modelID, for: id) }
+            currentSession?.selectedModel = modelID
+        }
+        // Brief confirmation so the user knows the click took effect — the
+        // chip color flip alone is easy to miss when the menu closes. Only
+        // post on actual change; re-picking the same model is a no-op and
+        // shouldn't clutter the AI lane.
+        guard changed else { return }
+        let previousName = AIModelRegistry.model(for: previous)?.displayName ?? previous
+        let nextName = model.displayName
+        overlayState.appendSystemNote(
+            "🔀 Switched AI model: \(previousName) → \(nextName).",
+            category: .ai
+        )
     }
 
     /// User typed something in the composer. Always honored even when AI is paused.
@@ -822,14 +875,83 @@ final class AppCoordinator {
         }
     }
 
-    /// Captures the primary display via ScreenCaptureKit, downsamples to ≤1280 px wide so
+    /// "Answer what's on screen" global shortcut (⌘⇧A by default). Captures the
+    /// current display, attaches it to a dedicated prompt, and asks the AI to
+    /// answer whatever question is visible — multiple-choice or free text — or to
+    /// say there's no question and offer to help. Honored even when AI is paused
+    /// and even when no listening session is running: it's an explicit, manual
+    /// invocation that's independent of the audio pipeline. Requires Screen
+    /// Recording permission (same as the composer's "See my screen").
+    func answerScreen() {
+        guard let ai = aiProvider else {
+            overlayState.appendSystemNote("⚠️ Add an API key in Settings to use the AI.", category: .ai)
+            return
+        }
+        overlayState.appendAutoTriggerPreamble(
+            origin: .answerScreen,
+            text: "Reading your screen…"
+        )
+        overlayState.status = .thinking
+        wpInfo("[Coordinator] Answer-screen requested")
+        let history = chatHistorySnapshot(excludingLast: false)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.absorbPendingTranscripts()
+            let snapshot = await self.context.snapshotWithPrior()
+            var prompt = PromptBuilder.buildAnswerScreen(
+                context: self.filteredSnapshot(snapshot),
+                history: self.filteredHistory(history),
+                style: self.settings.responseStyle
+            )
+            guard let imageData = await self.captureScreenJPEG() else {
+                self.overlayState.appendSystemNote("⚠️ Couldn't capture your screen. Grant Screen Recording permission in System Settings → Privacy & Security → Screen Recording, then try again.", category: .ai)
+                // Nothing to answer without the screen — drop back out of the
+                // thinking state so the pill doesn't hang.
+                if self.overlayState.status == .thinking {
+                    self.overlayState.status = self.isRunning ? .listening : .idle
+                }
+                return
+            }
+            prompt.imageJPEGBase64 = imageData.base64EncodedString()
+            wpInfo("Answer-screen screenshot captured (\(imageData.count) bytes)")
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .answerScreen)
+        }
+    }
+
+    /// Resolves which `CGDirectDisplayID` screen capture should target. A non-zero
+    /// `screenCaptureDisplayID` pins capture to that specific monitor regardless of
+    /// where the user is looking; `0` means "follow the monitor the pointer is on".
+    private func resolvedCaptureDisplayID() -> CGDirectDisplayID {
+        let configured = settings.screenCaptureDisplayID
+        if configured != 0 { return configured }
+        return ScreenEnumerator.currentPointerDisplayID()
+    }
+
+    /// Captures the configured display via ScreenCaptureKit, downsamples to ≤1280 px wide so
     /// we don't ship 4K frames to the model, and JPEG-encodes at quality 0.7. Returns nil
     /// if Screen Recording permission isn't granted or no display is shareable.
     private func captureScreenJPEG(maxWidth: Int = 1280, quality: CGFloat = 0.7) async -> Data? {
         do {
             let content = try await SCShareableContent.current
-            guard let display = content.displays.first else { return nil }
-            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            guard !content.displays.isEmpty else { return nil }
+            // On a multi-monitor setup, pick the display the user configured (a
+            // specific monitor) or, when set to follow, the one the pointer is on.
+            // If the configured monitor was disconnected, fall back to the first
+            // available display so capture still produces *something*.
+            let targetID = resolvedCaptureDisplayID()
+            let display = content.displays.first(where: { $0.displayID == targetID })
+                ?? content.displays.first!
+            if settings.screenCaptureDisplayID != 0, display.displayID != settings.screenCaptureDisplayID {
+                wpWarn("Screen capture: configured monitor (id=\(settings.screenCaptureDisplayID)) not connected — using display id=\(display.displayID) instead")
+            }
+            // Exclude Whisper Pilot's own windows (chiefly the floating overlay) from
+            // the capture. Otherwise the overlay — which we bring to front to show the
+            // answer when the ⌘⇧A shortcut fires — would occlude the very question the
+            // user wants read, and the composer's "See my screen" would ship a picture
+            // of our own UI sitting on top of the user's content.
+            let ownBundleID = Bundle.main.bundleIdentifier
+            let excluded = content.applications.filter { $0.bundleIdentifier == ownBundleID }
+            let filter = SCContentFilter(display: display, excludingApplications: excluded, exceptingWindows: [])
             let config = SCStreamConfiguration()
             config.width = display.width
             config.height = display.height
@@ -1259,6 +1381,7 @@ final class AppCoordinator {
         let buffer = transcriptBuffer
         let context = context
         let engine = triggerEngine
+        let wakeEngine = wakeWordEngine
 
         // Source the system audio from whichever capture path is currently active. Process
         // Tap is preferred (audio-only, set up above when on macOS 14.4+); SCK is the fallback.
@@ -1359,6 +1482,28 @@ final class AppCoordinator {
                     )
                     await engine.consider(segment: liveSegment)
                 }
+                // Wake-word commands ride the same partial-hypothesis firehose,
+                // but mic-only and gated on their own setting — independent of
+                // the auto-detect toggles, because "pilot, open chrome" is an
+                // explicit address to the assistant, not an overheard question.
+                if update.channel == .microphone {
+                    let wakeWord: String? = await MainActor.run { [weak self] in
+                        guard let self, self.settings.wakeWordEnabled else { return nil }
+                        let word = self.settings.wakeWord.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return word.isEmpty ? nil : word
+                    }
+                    if let wakeWord {
+                        let liveSegment = TranscriptSegment(
+                            id: update.id,
+                            text: update.text,
+                            isFinal: update.isFinal,
+                            channel: update.channel,
+                            startedAt: update.timestamp,
+                            updatedAt: update.timestamp
+                        )
+                        await wakeEngine.consider(segment: liveSegment, wakeWord: wakeWord)
+                    }
+                }
                 // The display always shows every transcript line; only AI context
                 // absorption is gated. With `includeSystemAudioInPrompt` off, the
                 // user still sees what "Other" said but the model doesn't, which
@@ -1457,10 +1602,90 @@ final class AppCoordinator {
                 await self.runCompletion(prompt: prompt, ai: liveAI, origin: .detectedQuestion)
             }
         })
+
+        consumerTasks.append(Task { [weak self] in
+            for await wake in wakeEngine.events {
+                guard let self else { return }
+                // Defense-in-depth: re-check the toggle at the sink, same as the
+                // detected-question path — a settings flip after the engine
+                // queued this command should still win.
+                guard self.settings.wakeWordEnabled else { continue }
+                await self.handleVoiceCommand(wake.command)
+            }
+        })
+    }
+
+    /// Routes a fired wake-word command: one short AI call classifies it into
+    /// open-app / open-url / answer. The two system actions execute immediately
+    /// (both safe and reversible); everything else streams a normal chat answer
+    /// built from the spoken text plus the usual conversation context.
+    private func handleVoiceCommand(_ command: String) async {
+        if overlayState.isAIPaused {
+            overlayState.appendSystemNote("🎙️ Voice command \"\(command)\" ignored — AI is paused.", category: .ai)
+            return
+        }
+        guard let ai = aiProvider else {
+            overlayState.appendSystemNote("🎙️ Voice command \"\(command)\" ignored — no AI API key configured.", category: .ai)
+            return
+        }
+        wpInfo("[Coordinator] 🎙️ voice command: \"\(command)\"")
+        overlayState.appendAutoTriggerPreamble(origin: .voiceCommand, text: command)
+        overlayState.status = .thinking
+        persistChatTurn(role: "User (voice command)", text: command)
+        // Flush the still-volatile command utterance to a synthetic final NOW,
+        // for every branch — it's what gets the spoken line into the AI context
+        // AND into transcript.md (both consume finals only). Without this, an
+        // "open app" command never appears in the session's transcript file.
+        await absorbPendingTranscripts()
+
+        // Interpretation failure (network, malformed reply) degrades to the
+        // answer path — the user spoke a request; "we couldn't classify it" is
+        // never a reason to drop it on the floor.
+        let intent = (try? await VoiceCommandInterpreter.interpret(command: command, using: ai)) ?? .answer
+
+        switch intent {
+        case .openApp(let name):
+            if await VoiceCommandExecutor.openApp(named: name) {
+                overlayState.appendSystemNote("✅ Opened \(name).", category: .ai)
+            } else {
+                overlayState.appendSystemNote("⚠️ Couldn't find an app named \"\(name)\".", category: .ai)
+            }
+            settleStatusAfterVoiceAction()
+        case .openURL(let url):
+            if VoiceCommandExecutor.openURL(url) {
+                overlayState.appendSystemNote("✅ Opened \(url.absoluteString).", category: .ai)
+            } else {
+                overlayState.appendSystemNote("⚠️ Couldn't open \(url.absoluteString).", category: .ai)
+            }
+            settleStatusAfterVoiceAction()
+        case .answer:
+            let snapshot = await context.snapshotWithPrior()
+            let prompt = PromptBuilder.buildVoiceCommand(
+                context: filteredSnapshot(snapshot),
+                history: filteredHistory(chatHistorySnapshot(excludingLast: false)),
+                command: command,
+                style: settings.responseStyle
+            )
+            await runCompletion(prompt: prompt, ai: ai, origin: .voiceCommand)
+        }
+    }
+
+    /// The open-app / open-url branches never enter `runCompletion`, so the
+    /// `.thinking` status set when the command fired has no stream lifecycle to
+    /// clear it — mirror `completionFinished`'s settle logic here.
+    private func settleStatusAfterVoiceAction() {
+        guard inFlightCompletions.isEmpty else { return }
+        switch overlayState.status {
+        case .streaming, .thinking, .error:
+            overlayState.status = isRunning ? .listening : .idle
+        default:
+            break
+        }
     }
 
     private func handleVADEvent(_ event: VoiceActivityEvent) async {
         await triggerEngine.absorb(event)
+        await wakeWordEngine.absorb(event)
 
         // Optional debounced utterance-boundary cycling. Default is `.auto` — no
         // time-based cutting at all; we let SFSpeech finalize segments on its own.
@@ -1492,6 +1717,16 @@ final class AppCoordinator {
         if shouldAutoDetectQuestion(on: vadChannel),
            let last = await transcriptBuffer.lastSegment(on: vadChannel) {
             await triggerEngine.consider(segment: last)
+        }
+
+        // Same post-pause re-consider for the wake-word engine, mic-only. The
+        // pause gate inside the engine is what actually fires the command, and
+        // this call is often the one that lands after the gate opens.
+        if vadChannel == .microphone, settings.wakeWordEnabled {
+            let word = settings.wakeWord.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !word.isEmpty, let last = await transcriptBuffer.lastSegment(on: .microphone) {
+                await wakeWordEngine.consider(segment: last, wakeWord: word)
+            }
         }
     }
 
@@ -1567,9 +1802,9 @@ final class AppCoordinator {
                    status == 404,
                    let (fromModel, newAI) = self.migrateToFallbackModel() {
                     self.overlayState.finishAssistant(id: messageId)
-                    let note = "ℹ️ Model \(fromModel) is unavailable on your API key. Auto-switched to \(self.settings.geminiModel) and retrying."
+                    let note = "ℹ️ Model \(fromModel) is unavailable on your API key. Auto-switched to \(self.settings.activeModel) and retrying."
                     self.overlayState.appendSystemNote(note, category: .ai)
-                    wpInfo("AI model fallback: \(fromModel) → \(self.settings.geminiModel)")
+                    wpInfo("AI model fallback: \(fromModel) → \(self.settings.activeModel)")
                     // Drop this task from the in-flight map BEFORE recursing — the
                     // recursive call registers its own new entry, and we don't want
                     // the outer cleanup-on-exit below to fire twice for one logical
@@ -1606,15 +1841,45 @@ final class AppCoordinator {
         }
     }
 
-    /// Picks the next model from `aiFallbackChain` that isn't the currently-failing one,
-    /// updates `settings.geminiModel` (so Settings UI reflects the migration and the
-    /// choice persists), and rebuilds `aiProvider`. Returns `(oldModel, newProvider)` or
-    /// `nil` if no API key is configured.
+    /// Build an `AIProvider` for whatever `settings.activeModel` resolves to,
+    /// using the right API key for the model's vendor. Returns `nil` if the
+    /// vendor's key isn't configured — callers treat that as "AI disabled".
+    ///
+    /// Centralized so every place that needs to spin up a provider (init,
+    /// `refreshDerivedState`, the fallback retry) goes through the same
+    /// vendor-aware path. Without this, adding Claude would mean N if/elses
+    /// scattered across the coordinator.
+    private func makeProviderForActiveModel() -> AIProvider? {
+        let modelID = settings.activeModel
+        guard let model = AIModelRegistry.model(for: modelID) else { return nil }
+        switch model.vendor {
+        case .gemini:
+            guard let key = settings.geminiAPIKey, !key.isEmpty else { return nil }
+            return GeminiProvider(apiKey: key, model: modelID)
+        case .anthropic:
+            guard let key = settings.anthropicAPIKey, !key.isEmpty else { return nil }
+            return AnthropicProvider(apiKey: key, model: modelID)
+        }
+    }
+
+    /// Picks the next Gemini model from `aiFallbackChain` that isn't the
+    /// currently-failing one, updates `settings.activeModel` (so the UI
+    /// reflects the migration and the choice persists), and rebuilds
+    /// `aiProvider`. Returns `(oldModel, newProvider)` or `nil` if no Gemini
+    /// API key is configured.
+    ///
+    /// Scoped to Gemini because Anthropic doesn't have the same
+    /// silently-retired-models problem — a 404 from Claude almost always
+    /// means a bad model id rather than a billing-tier difference, and
+    /// flipping Sonnet→Opus behind the user's back would silently change
+    /// the cost model.
     private func migrateToFallbackModel() -> (String, AIProvider)? {
         guard let key = settings.geminiAPIKey, !key.isEmpty else { return nil }
-        let current = settings.geminiModel
+        let current = settings.activeModel
+        // Only Gemini models participate in the fallback chain.
+        guard AIModelRegistry.model(for: current)?.vendor == .gemini else { return nil }
         guard let next = Self.aiFallbackChain.first(where: { $0 != current }) else { return nil }
-        settings.geminiModel = next
+        settings.activeModel = next
         let provider = GeminiProvider(apiKey: key, model: next)
         aiProvider = provider
         aiProviderModel = next

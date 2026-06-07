@@ -223,27 +223,12 @@ final class ProcessAudioCapture {
             memcpy(dstData, srcData, copyBytes)
         }
 
-        let outputFormat = CanonicalAudioFormat.make()
-        let outputCapacity = AVAudioFrameCount(Double(frameCount) * outputFormat.sampleRate / inputFormat.sampleRate) + 1024
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else { return }
-
-        // CRITICAL: reset the converter before each call. Without this, AVAudioConverter
-        // enters a "stream ended" state after the first `endOfStream` signal and produces
-        // 0 output frames for every subsequent convert(). Verified by synthetic test:
-        // without reset, calls 2..N return 0 frames. With reset, all calls work.
-        converter.reset()
-        var convertError: NSError?
-        var consumed = false
-        converter.convert(to: outputBuffer, error: &convertError) { _, status in
-            if consumed { status.pointee = .endOfStream; return nil }
-            consumed = true
-            status.pointee = .haveData
-            return inputBuffer
-        }
-        if let convertError {
-            wpError("ProcessAudio convert error: \(convertError.localizedDescription)")
-            return
-        }
+        // Streaming conversion — converter state is preserved across buffers so the
+        // 48 kHz → 16 kHz resampler stays continuous. The old per-buffer reset +
+        // endOfStream pattern glitched the audio at every ~10 ms buffer seam, which
+        // is what chopped and duplicated transcripts on the Process Tap path. See
+        // `StreamingAudioConverter` for the full story.
+        guard let outputBuffer = StreamingAudioConverter.convert(inputBuffer, using: converter, label: "ProcessAudio") else { return }
 
         // Apply 5× gain to system audio. The macOS audio mixdown that Process Tap
         // captures is typically much quieter than microphone input — usually below

@@ -20,6 +20,11 @@ struct SessionMeta: Identifiable, Sendable, Codable, Equatable {
     var displayName: String
     var createdAt: Date
     var lastUsedAt: Date
+    /// Per-session model selection (id from `AIModelRegistry`). Nil means
+    /// "use whatever the global default is at resume time". Set when the
+    /// user picks a model in the overlay during this session; reapplied on
+    /// resume so each session sticks to the model it was started with.
+    var selectedModel: String? = nil
     /// Live counts maintained on every list refresh — not persisted.
     var transcriptLineCount: Int = 0
     var chatTurnCount: Int = 0
@@ -27,7 +32,7 @@ struct SessionMeta: Identifiable, Sendable, Codable, Equatable {
     var id: SessionID { SessionID(folderName: folderName) }
 
     private enum CodingKeys: String, CodingKey {
-        case folderName, displayName, createdAt, lastUsedAt
+        case folderName, displayName, createdAt, lastUsedAt, selectedModel
     }
 }
 
@@ -128,6 +133,20 @@ actor SessionStore {
         let metaURL = folder.appendingPathComponent("metadata.json")
         guard let data = try? Data(contentsOf: metaURL),
               var meta = try? makeDecoder().decode(SessionMeta.self, from: data) else { return }
+        meta.lastUsedAt = Date()
+        try? writeMetadata(meta, to: folder)
+    }
+
+    /// Persist the user's per-session model choice. Called whenever the
+    /// overlay's model selector changes during a session, so resuming the
+    /// session restores the same model. Pass nil to clear the override
+    /// (resumes will then fall back to the global default).
+    func setSelectedModel(_ modelID: String?, for id: SessionID) {
+        let folder = sessionFolder(for: id)
+        let metaURL = folder.appendingPathComponent("metadata.json")
+        guard let data = try? Data(contentsOf: metaURL),
+              var meta = try? makeDecoder().decode(SessionMeta.self, from: data) else { return }
+        meta.selectedModel = modelID
         meta.lastUsedAt = Date()
         try? writeMetadata(meta, to: folder)
     }

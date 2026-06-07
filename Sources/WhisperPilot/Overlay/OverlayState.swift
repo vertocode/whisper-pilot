@@ -134,6 +134,13 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// User pressed "Action items" — AI extracts commitments / TODOs from
         /// the conversation.
         case actionItems
+        /// User pressed the "answer what's on screen" global shortcut (⌘⇧A by
+        /// default) — a screenshot of the current display is sent and the AI
+        /// answers whatever question is visible.
+        case answerScreen
+        /// User spoke the wake word + a command ("pilot, open chrome"). The
+        /// command either ran as a system action or was answered in chat.
+        case voiceCommand
         /// User-visible system note (e.g. "AI paused").
         case system
     }

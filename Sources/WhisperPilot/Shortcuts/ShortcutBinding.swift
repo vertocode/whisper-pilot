@@ -32,6 +32,14 @@ struct ShortcutBinding: Codable, Equatable, Sendable {
         modifiers: NSEvent.ModifierFlags.command.rawValue | NSEvent.ModifierFlags.shift.rawValue
     )
 
+    /// Default for "answer what's on screen": ⌘⇧A. Keycode 0x00 is A on every
+    /// Mac keyboard layout. Captures the current screen and asks the AI to answer
+    /// whatever question is visible (multiple-choice or free text).
+    static let answerScreenDefault = ShortcutBinding(
+        keyCode: 0x00,
+        modifiers: NSEvent.ModifierFlags.command.rawValue | NSEvent.ModifierFlags.shift.rawValue
+    )
+
     /// Maps a hardware key code to a printable label. Covers the common keys a
     /// user is likely to bind. Falls back to a numeric placeholder for the
     /// long tail (function keys past F12, JIS keys, etc.) so the UI still
