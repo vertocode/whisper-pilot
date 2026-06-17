@@ -15,6 +15,7 @@ struct TranscriptSegment: Sendable, Hashable, Identifiable {
 actor TranscriptBuffer {
     private var segments: [UUID: TranscriptSegment] = [:]
     private var order: [UUID] = []
+    private static let maxSegments = 150
 
     func apply(_ update: TranscriptUpdate) {
         let incomingTrimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -72,6 +73,11 @@ actor TranscriptBuffer {
             )
             segments[update.id] = segment
             order.append(update.id)
+            if order.count > Self.maxSegments {
+                let excess = order.count - Self.maxSegments
+                for id in order.prefix(excess) { segments.removeValue(forKey: id) }
+                order.removeFirst(excess)
+            }
         }
     }
 

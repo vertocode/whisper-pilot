@@ -17,14 +17,18 @@ import SwiftUI
 /// output still reads as code rather than flashing raw backticks.
 struct MarkdownMessageView: View {
     let text: String
+    @State private var parsedBlocks: [MarkdownBlock] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
-            ForEach(Array(MarkdownBlock.parse(text).enumerated()), id: \.offset) { _, block in
+            ForEach(Array(parsedBlocks.enumerated()), id: \.offset) { _, block in
                 blockView(block)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: text, initial: true) { _, newText in
+            parsedBlocks = MarkdownBlock.parse(newText)
+        }
     }
 
     @ViewBuilder

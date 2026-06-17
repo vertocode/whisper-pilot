@@ -1458,6 +1458,7 @@ final class AppCoordinator {
 
         consumerTasks.append(Task { [weak self] in
             var transcriptsSeen = 0
+            var lastTranscriptUIPublish: ContinuousClock.Instant = .now
             for await update in transcriber.transcripts {
                 await buffer.apply(update)
                 // Feed every system-channel partial straight to the trigger engine so
@@ -1519,8 +1520,12 @@ final class AppCoordinator {
                 if absorbIntoAIContext {
                     await context.absorb(update)
                 }
-                let snapshot = await buffer.snapshot()
-                self?.overlayState.transcript = snapshot
+                let now = ContinuousClock.now
+                if update.isFinal || now - lastTranscriptUIPublish >= .milliseconds(100) {
+                    let snapshot = await buffer.snapshot()
+                    self?.overlayState.transcript = snapshot
+                    lastTranscriptUIPublish = now
+                }
                 transcriptsSeen += 1
                 self?.overlayState.transcriptCount = transcriptsSeen
                 if transcriptsSeen == 1 {

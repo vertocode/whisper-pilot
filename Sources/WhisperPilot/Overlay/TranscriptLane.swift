@@ -6,39 +6,47 @@ struct TranscriptLane: View {
     /// expand). The body — segment list / "waiting for audio" placeholder — is
     /// omitted so the lane collapses to one tappable bar.
     var isCollapsed: Bool = false
+    /// When false, suppresses the header row so only segment content renders.
+    /// Used when the caller pins the header outside a ScrollView.
+    var showHeader: Bool = true
+    /// When false, suppresses segment content so only the header row renders.
+    /// Used to create a sticky header above a ScrollView.
+    var showContent: Bool = true
     /// Invoked when the user taps the chevron in the header. The owner toggles
     /// the bound state; this lane just renders accordingly.
     var onToggleCollapse: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
-            HStack(spacing: WP.Space.sm) {
-                // The title itself is a click target for collapse/expand —
-                // bigger and more discoverable than the pill alone.
+            if showHeader {
                 HStack(spacing: WP.Space.sm) {
-                    Image(systemName: "waveform")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Live transcript")
-                        .font(WP.TextStyle.sectionHeader)
-                        .foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-                .onTapGesture { onToggleCollapse?() }
-                Spacer()
-                if !segments.isEmpty {
-                    Text("\(segments.count) line\(segments.count == 1 ? "" : "s")")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
-                }
-                if let onToggleCollapse {
-                    CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
-                        .help(isCollapsed ? "Show transcript" : "Hide transcript")
+                    // The title itself is a click target for collapse/expand —
+                    // bigger and more discoverable than the pill alone.
+                    HStack(spacing: WP.Space.sm) {
+                        Image(systemName: "waveform")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("Live transcript")
+                            .font(WP.TextStyle.sectionHeader)
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { onToggleCollapse?() }
+                    Spacer()
+                    if !segments.isEmpty {
+                        Text("\(segments.count) line\(segments.count == 1 ? "" : "s")")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                            .monospacedDigit()
+                    }
+                    if let onToggleCollapse {
+                        CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
+                            .help(isCollapsed ? "Show transcript" : "Hide transcript")
+                    }
                 }
             }
 
-            if !isCollapsed {
+            if !isCollapsed && showContent {
                 if segments.isEmpty {
                     HStack(spacing: WP.Space.sm) {
                         Image(systemName: "waveform.path")
@@ -60,7 +68,7 @@ struct TranscriptLane: View {
                     // The parent ScrollView in OverlayView handles overflow. Explicit
                     // `.id()` lets the parent's ScrollViewReader auto-scroll to the
                     // most recent line as it arrives, regardless of channel.
-                    VStack(alignment: .leading, spacing: WP.Space.xs + 2) {
+                    LazyVStack(alignment: .leading, spacing: WP.Space.xs + 2) {
                         ForEach(segments) { segment in
                             TranscriptRow(segment: segment)
                                 .id(segment.id)

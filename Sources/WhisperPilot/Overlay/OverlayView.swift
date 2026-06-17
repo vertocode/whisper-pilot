@@ -427,32 +427,51 @@ struct OverlayView: View {
             )
             .padding(compact ? WP.Space.sm : WP.Space.md)
         } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    ChatLane(
-                        messages: aiMessages,
-                        isAIPaused: state.isAIPaused,
-                        onToggleAI: actions.toggleAIPaused,
-                        onDismissMessage: actions.dismissMessage,
-                        onRunAction: actions.runChatAction,
-                        sessionContext: $state.sessionContext,
-                        activeModel: settings.activeModel,
-                        availableVendors: settings.availableVendors,
-                        onSelectModel: actions.selectModel,
-                        isCollapsed: false,
-                        onToggleCollapse: { chatCollapsed.toggle() }
-                    )
-                    .padding(compact ? WP.Space.sm : WP.Space.md)
-                }
-                .onChange(of: aiMessages.last?.id) { _, _ in
-                    guard let last = aiMessages.last?.id else { return }
-                    withAnimation(.easeOut(duration: 0.15)) {
+            VStack(spacing: 0) {
+                ChatLane(
+                    messages: aiMessages,
+                    isAIPaused: state.isAIPaused,
+                    onToggleAI: actions.toggleAIPaused,
+                    onDismissMessage: actions.dismissMessage,
+                    onRunAction: actions.runChatAction,
+                    sessionContext: $state.sessionContext,
+                    activeModel: settings.activeModel,
+                    availableVendors: settings.availableVendors,
+                    onSelectModel: actions.selectModel,
+                    isCollapsed: false,
+                    showContent: false,
+                    onToggleCollapse: { chatCollapsed.toggle() }
+                )
+                .padding(compact ? WP.Space.sm : WP.Space.md)
+                .background(Color(NSColor.windowBackgroundColor))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        ChatLane(
+                            messages: aiMessages,
+                            isAIPaused: state.isAIPaused,
+                            onToggleAI: actions.toggleAIPaused,
+                            onDismissMessage: actions.dismissMessage,
+                            onRunAction: actions.runChatAction,
+                            sessionContext: $state.sessionContext,
+                            activeModel: settings.activeModel,
+                            availableVendors: settings.availableVendors,
+                            onSelectModel: actions.selectModel,
+                            isCollapsed: false,
+                            showHeader: false,
+                            onToggleCollapse: nil
+                        )
+                        .padding(compact ? WP.Space.sm : WP.Space.md)
+                    }
+                    .onChange(of: aiMessages.last?.id) { _, _ in
+                        guard let last = aiMessages.last?.id else { return }
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo(last, anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: aiMessages.last?.text) { _, _ in
+                        guard let last = aiMessages.last?.id else { return }
                         proxy.scrollTo(last, anchor: .bottom)
                     }
-                }
-                .onChange(of: aiMessages.last?.text) { _, _ in
-                    guard let last = aiMessages.last?.id else { return }
-                    proxy.scrollTo(last, anchor: .bottom)
                 }
             }
         }
@@ -472,30 +491,37 @@ struct OverlayView: View {
             )
             .padding(compact ? WP.Space.sm : WP.Space.md)
         } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: WP.Space.md) {
-                        TranscriptLane(
-                            segments: state.transcript,
-                            isCollapsed: false,
-                            onToggleCollapse: { transcriptCollapsed.toggle() }
-                        )
-                        ForEach(transcriptNotes) { note in
-                            MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) }, onRunAction: actions.runChatAction)
-                                .id(note.id)
+            VStack(spacing: 0) {
+                TranscriptLane(
+                    segments: state.transcript,
+                    isCollapsed: false,
+                    showContent: false,
+                    onToggleCollapse: { transcriptCollapsed.toggle() }
+                )
+                .padding(compact ? WP.Space.sm : WP.Space.md)
+                .background(Color(NSColor.windowBackgroundColor))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: WP.Space.md) {
+                            TranscriptLane(
+                                segments: state.transcript,
+                                isCollapsed: false,
+                                showHeader: false,
+                                onToggleCollapse: nil
+                            )
+                            ForEach(transcriptNotes) { note in
+                                MessageBubble(message: note, onDismiss: { actions.dismissMessage(note.id) }, onRunAction: actions.runChatAction)
+                                    .id(note.id)
+                            }
+                        }
+                        .padding(compact ? WP.Space.sm : WP.Space.md)
+                    }
+                    .onChange(of: state.transcript.last?.id) { _, _ in
+                        guard let last = state.transcript.last?.id else { return }
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo(last, anchor: .bottom)
                         }
                     }
-                    .padding(compact ? WP.Space.sm : WP.Space.md)
-                }
-                .onChange(of: state.transcript.last?.id) { _, _ in
-                    guard let last = state.transcript.last?.id else { return }
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(last, anchor: .bottom)
-                    }
-                }
-                .onChange(of: state.transcript.last?.text) { _, _ in
-                    guard let last = state.transcript.last?.id else { return }
-                    proxy.scrollTo(last, anchor: .bottom)
                 }
             }
         }
@@ -897,38 +923,44 @@ private struct ChatLane: View {
     /// When true, only the header is rendered. Owner manages the state and
     /// passes a toggle closure so the lane can fire when its chevron is tapped.
     var isCollapsed: Bool = false
+    /// When false, suppresses the header row so only message content renders.
+    var showHeader: Bool = true
+    /// When false, suppresses message content so only the header row renders.
+    var showContent: Bool = true
     var onToggleCollapse: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
-            HStack(spacing: WP.Space.sm) {
-                // The title itself is a click target for collapse/expand —
-                // bigger and more discoverable than the pill alone. Only the
-                // icon + label; the model picker next to it keeps its own tap.
+            if showHeader {
                 HStack(spacing: WP.Space.sm) {
-                    Image(systemName: "sparkles")
-                        .font(.caption)
-                        .foregroundStyle(.blue)
-                    Text("AI")
-                        .font(WP.TextStyle.sectionHeader)
-                        .foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-                .onTapGesture { onToggleCollapse?() }
-                ModelSelector(
-                    activeModel: activeModel,
-                    availableVendors: availableVendors,
-                    onSelect: onSelectModel
-                )
-                Spacer()
-                AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
-                if let onToggleCollapse {
-                    CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
-                        .help(isCollapsed ? "Show AI conversation" : "Hide AI conversation")
+                    // The title itself is a click target for collapse/expand —
+                    // bigger and more discoverable than the pill alone. Only the
+                    // icon + label; the model picker next to it keeps its own tap.
+                    HStack(spacing: WP.Space.sm) {
+                        Image(systemName: "sparkles")
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                        Text("AI")
+                            .font(WP.TextStyle.sectionHeader)
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { onToggleCollapse?() }
+                    ModelSelector(
+                        activeModel: activeModel,
+                        availableVendors: availableVendors,
+                        onSelect: onSelectModel
+                    )
+                    Spacer()
+                    AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
+                    if let onToggleCollapse {
+                        CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
+                            .help(isCollapsed ? "Show AI conversation" : "Hide AI conversation")
+                    }
                 }
             }
 
-            if !isCollapsed {
+            if !isCollapsed && showContent {
                 ContextDropdown(context: $sessionContext)
 
                 if messages.isEmpty {
@@ -937,13 +969,15 @@ private struct ChatLane: View {
                         text: emptyStateText
                     )
                 } else {
-                    ForEach(messages) { message in
-                        MessageBubble(
-                            message: message,
-                            onDismiss: { onDismissMessage(message.id) },
-                            onRunAction: onRunAction
-                        )
-                        .id(message.id)
+                    LazyVStack(alignment: .leading, spacing: WP.Space.sm) {
+                        ForEach(messages) { message in
+                            MessageBubble(
+                                message: message,
+                                onDismiss: { onDismissMessage(message.id) },
+                                onRunAction: onRunAction
+                            )
+                            .id(message.id)
+                        }
                     }
                 }
             }
