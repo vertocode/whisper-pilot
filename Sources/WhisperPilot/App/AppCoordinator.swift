@@ -48,9 +48,6 @@ final class AppCoordinator {
     /// the events AsyncStream is single-use and a new pipeline needs a fresh one
     /// so trigger events from the new session aren't lost to a dead iterator.
     private var triggerEngine = TriggerEngine()
-    /// Wake-word command detector ("pilot, open chrome"). Same per-session
-    /// recreation as `triggerEngine` — its AsyncStream is single-use.
-    private var wakeWordEngine = WakeWordEngine()
 
     private var transcriber: TranscriptionProvider?
     private var aiProvider: AIProvider?
@@ -88,6 +85,37 @@ final class AppCoordinator {
     /// "responses cut mid-sentence" bug. Each completion finishes independently;
     /// `stopListening` cancels the whole set.
     private var inFlightCompletions: [UUID: Task<Void, Never>] = [:]
+
+    /// Performance safety valve. The sampler reads this process's CPU / memory /
+    /// thermal state; the governor turns a stream of those readings into a
+    /// `.ok / .tier1Pause / .tier2Stop` decision. Both run only while listening —
+    /// `startResourceMonitor` polls at ~1.3 Hz and feeds each sample (with a
+    /// monotonic timestamp) into the governor.
+    /// Rebuilt at each session start from the user's Settings thresholds (see
+    /// `startResourceMonitor`), so threshold edits take effect on the next listen.
+    private var resourceGovernor = ResourceGovernor()
+    private var resourceSampler: ResourceSampling = ResourceSampler()
+    private var resourceMonitorTask: Task<Void, Never>?
+    /// True once Tier-1 has engaged for the current high-load episode. Tier-1
+    /// re-emits `.tier1Pause` on every sample while load stays high; this latch
+    /// makes the side effects (pause AI, cancel completions, post the alert) fire
+    /// once per episode and reset when load recovers.
+    private var tier1Engaged = false
+    /// ID of the Tier-1 "AI paused" inline alert, so it can be dismissed when load
+    /// recovers or the session stops.
+    private var tier1NoteID: UUID?
+    /// True once Tier-2 has fired for the current session. `.tier2Stop` re-emits on
+    /// every sample while the governor is in its terminal tier; this latch makes the
+    /// async hard-stop kick off exactly once.
+    private var tier2Engaged = false
+    /// True when the valve (not the user) paused AI auto-suggestions, so recovery may
+    /// auto-resume them. Cleared the moment the user toggles AI themselves during the
+    /// episode — we never override an explicit user choice.
+    private var tier1PausedAI = false
+    /// Set while the valve itself is flipping `isAIPaused`, so the paused observer can
+    /// distinguish valve-initiated changes from explicit user toggles.
+    private var valveTogglingAI = false
+
     /// IDs of currently-displayed watchdog warnings, so we can dismiss them when the
     /// underlying problem resolves itself (e.g. audio frames start flowing).
     private var noFramesWarningID: UUID?
@@ -110,6 +138,21 @@ final class AppCoordinator {
     private var pendingBoundaryTasks: [AudioChannel: Task<Void, Never>] = [:]
     private var settingsObserver: AnyCancellable?
     private var pausedObserver: AnyCancellable?
+    /// Per-channel mute flags mirrored off the main actor. The mixer-output
+    /// consumer is a detached task that checks mute state once per audio frame;
+    /// reading the `@Published` flags directly would force a `MainActor.run` hop
+    /// per frame. Instead these Combine sinks push every toggle change into a
+    /// lock-protected cache the consumer reads synchronously with no actor hop.
+    private let muteFlags = OSAllocatedUnfairLock(initialState: MuteFlags())
+    private var micMuteObserver: AnyCancellable?
+    private var systemMuteObserver: AnyCancellable?
+
+    /// Plain value mirror of the overlay's two mute toggles, read by the audio
+    /// pipeline consumer without touching the main actor.
+    private struct MuteFlags: Sendable {
+        var micMuted = false
+        var systemMuted = false
+    }
     /// Subscribes to `overlayState.$sessionContext` and schedules a debounced save.
     /// Manual debouncing rather than Combine's `.debounce` because the latter reads
     /// `currentSession?.id` at fire time, which lets a fast session switch route
@@ -146,8 +189,12 @@ final class AppCoordinator {
 
         pausedObserver = overlayState.$isAIPaused
             .removeDuplicates()
-            .sink { _ in
+            .sink { [weak self] _ in
                 // The toggle button itself is the visual indicator — no system note needed.
+                // A change the valve didn't make is an explicit user choice, so stop
+                // tracking it for auto-resume: recovery must never fight the user.
+                guard let self, !self.valveTogglingAI else { return }
+                self.tier1PausedAI = false
             }
 
         sessionContextSaver = overlayState.$sessionContext
@@ -155,6 +202,21 @@ final class AppCoordinator {
             .removeDuplicates()
             .sink { [weak self] (context: SessionContext) in
                 self?.scheduleContextSave(context)
+            }
+
+        // Mirror the mute toggles into the off-main-actor cache so the per-frame
+        // pipeline consumer never has to hop to the main actor to check them. The
+        // `@Published` projected publisher delivers the newly-set value, so the
+        // cache stays in sync the instant a toggle flips.
+        micMuteObserver = overlayState.$isMicrophoneMuted
+            .removeDuplicates()
+            .sink { [weak self] muted in
+                self?.muteFlags.withLock { $0.micMuted = muted }
+            }
+        systemMuteObserver = overlayState.$isSystemAudioMuted
+            .removeDuplicates()
+            .sink { [weak self] muted in
+                self?.muteFlags.withLock { $0.systemMuted = muted }
             }
     }
 
@@ -274,7 +336,6 @@ final class AppCoordinator {
         // instances valid for any UI / debug code that reads them between sessions.
         audioMixer = AudioMixer()
         triggerEngine = TriggerEngine()
-        wakeWordEngine = WakeWordEngine()
         systemCapture = SystemAudioCapture()
         micCapture = MicrophoneCapture()
         // VAD holds per-channel `isSpeaking` state; if the previous session ended
@@ -411,6 +472,13 @@ final class AppCoordinator {
             return
         }
 
+        // Apply the "always transcribe my mic" default for this session. When off, the
+        // mic channel starts muted (frames dropped before VAD/transcription) so the mic
+        // recognizer doesn't run by default; system audio still transcribes. The user can
+        // flip it on any time with the in-session mic toggle. Set before the pipeline so
+        // the mute mirror is in place before the first frame is processed.
+        overlayState.isMicrophoneMuted = !settings.alwaysTranscribeMic
+
         startPipeline(transcriber: transcriber, ai: aiProvider)
 
         isRunning = true
@@ -421,6 +489,175 @@ final class AppCoordinator {
         // warning so the user isn't left guessing.
         wpInfo("[Coordinator] ✓ Pipeline started, awaiting first audio frame")
         startNoFramesWatchdog()
+        startResourceMonitor()
+    }
+
+    // MARK: - Performance safety valve
+
+    /// Begins polling the resource sampler while listening. Runs at ~1.3 Hz and
+    /// only for the lifetime of the session — torn down in `stopListening`, so an
+    /// idle app never samples. Each reading is stamped with a monotonic elapsed
+    /// time (the governor needs a non-decreasing clock for its sustain windows)
+    /// and fed to the governor; the returned decision is mapped to an action.
+    private func startResourceMonitor() {
+        resourceMonitorTask?.cancel()
+        // Rebuild the governor from the current Settings thresholds so user edits
+        // (CPU% / memory cap) apply to this session. `.reset()` is implied by the
+        // fresh instance, but we keep it explicit for the per-episode latches below.
+        resourceGovernor = ResourceGovernor(config: settings.resourceGovernorConfig)
+        resourceGovernor.reset()
+        tier1Engaged = false
+        tier2Engaged = false
+        tier1PausedAI = false
+        resourceMonitorTask = Task { @MainActor [weak self] in
+            let start = ContinuousClock.now
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(750))
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                // Sampler and governor are accessed through `self` (MainActor) so
+                // the non-Sendable governor is never captured by this @Sendable task.
+                let sample = self.resourceSampler.sample()
+                // Publish for the live Diagnostics readout on every tick — independent
+                // of the valve, so the numbers update even when the valve is disabled.
+                self.overlayState.resourceSample = sample
+                // Valve disabled in Settings: sample for the readout only, never trip
+                // the governor (reverts to the old no-limit behavior).
+                guard self.settings.safetyValveEnabled else { continue }
+                let elapsed = start.duration(to: .now)
+                let seconds = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) * 1e-18
+                self.handleResourceDecision(self.resourceGovernor.evaluate(sample, at: seconds))
+            }
+        }
+    }
+
+    /// Stops the resource monitor and clears the valve's per-session state. Called
+    /// from `stopListening` so the next session starts with a clean governor.
+    private func stopResourceMonitor() {
+        resourceMonitorTask?.cancel()
+        resourceMonitorTask = nil
+        resourceGovernor.reset()
+        // Clear the live readout — the monitor only samples while listening, so an
+        // idle session shows "—" rather than a stale last reading.
+        overlayState.resourceSample = nil
+        if tier1Engaged {
+            dismissTier1Note()
+            tier1Engaged = false
+        }
+        // If the valve (not the user) paused AI, lift that pause on teardown so a
+        // resumed session never starts silently throttled by a stale valve decision.
+        if tier1PausedAI && overlayState.isAIPaused {
+            valveTogglingAI = true
+            overlayState.isAIPaused = false
+            valveTogglingAI = false
+        }
+        tier1PausedAI = false
+    }
+
+    private func handleResourceDecision(_ decision: ResourceDecision) {
+        switch decision {
+        case .ok:
+            // Load recovered after Tier-1: clear the latch and its alert so a later
+            // episode can re-engage, then resume auto-suggestions if the valve was
+            // the one that paused them — restoring auto-detection without a session
+            // restart. If the user toggled AI themselves during the episode,
+            // `tier1PausedAI` is already false, so we leave their choice alone.
+            if tier1Engaged {
+                dismissTier1Note()
+                tier1Engaged = false
+                if tier1PausedAI && overlayState.isAIPaused {
+                    valveTogglingAI = true
+                    overlayState.isAIPaused = false
+                    valveTogglingAI = false
+                    overlayState.appendSystemNote(
+                        "✅ System load back to normal — AI auto-suggestions resumed.",
+                        category: .ai
+                    )
+                }
+                tier1PausedAI = false
+            }
+        case .tier1Pause:
+            engageTier1()
+        case .tier2Stop:
+            engageTier2()
+        }
+    }
+
+    /// Tier-1 soft brake: pause AI auto-detection, cancel any in-flight AI
+    /// completions, and surface an inline alert with a one-tap mic-shed button.
+    /// Core transcription is deliberately untouched — only auxiliary AI work backs
+    /// off. Explicit user AI actions (composer, Help AI, Summary, Action Items)
+    /// keep working because they don't consult `isAIPaused`.
+    private func engageTier1() {
+        guard !tier1Engaged else { return }
+        tier1Engaged = true
+        wpWarn("[Coordinator] Tier-1 safety valve engaged — high sustained load; pausing AI auto-suggestions")
+        // Pause auto-detect / auto-send. The trigger-events consumer checks this.
+        // Only mark the pause as valve-owned (eligible for auto-resume on recovery)
+        // when we actually flip it — if the user had already paused AI, that's their
+        // choice and recovery must not silently resume it. `valveTogglingAI` brackets
+        // the assignment so the paused observer reads it as valve-initiated.
+        if !overlayState.isAIPaused {
+            valveTogglingAI = true
+            overlayState.isAIPaused = true
+            valveTogglingAI = false
+            tier1PausedAI = true
+        }
+        // Cancel streaming AI replies to free their CPU immediately. Transcription
+        // (a separate consumer task) keeps running.
+        for task in inFlightCompletions.values { task.cancel() }
+        inFlightCompletions.removeAll()
+        tier1NoteID = overlayState.appendSystemNote(
+            "⚠️ High system load — AI auto-suggestions paused to keep transcription smooth. Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
+            category: .ai,
+            actionLabel: "Disable my mic for this session",
+            actionKind: .shedMicrophoneForSession
+        )
+    }
+
+    private func dismissTier1Note() {
+        if let id = tier1NoteID {
+            overlayState.removeMessage(id: id)
+            tier1NoteID = nil
+        }
+    }
+
+    /// Tier-2 hard stop: sustained overload after Tier-1, or thermal pressure
+    /// (`.serious`/`.critical`). Posts a clear alert, then routes through the normal
+    /// `stopListening` teardown so capture, recognizers, and the monitor shut down
+    /// exactly as a manual Stop would — dropping CPU to near-idle. The transcript and
+    /// chat survive (stop preserves them), so the user can resume with ▶ when load
+    /// eases. Latched so the repeated `.tier2Stop` decisions only trigger one stop.
+    private func engageTier2() {
+        guard !tier2Engaged else { return }
+        tier2Engaged = true
+        wpWarn("[Coordinator] Tier-2 safety valve engaged — sustained overload or thermal pressure; stopping listening")
+        // Post the alert BEFORE teardown. `stopListening` preserves the transcript and
+        // chat messages (it only zeroes counters and drops startup notes), so this note
+        // remains visible after the stop to explain why listening ended.
+        overlayState.appendSystemNote(
+            "🛑 System under heavy load — listening stopped automatically to keep your Mac responsive. Your transcript and session are saved; press ▶ to resume when load eases.",
+            category: .ai
+        )
+        // stopListening is async; hop off this synchronous decision handler. It tears
+        // down the monitor (cancelling the polling task) as part of normal teardown.
+        Task { @MainActor [weak self] in
+            await self?.stopListening()
+        }
+    }
+
+    /// Mutes the microphone channel for the running session in response to the
+    /// Tier-1 alert's button. Reuses the existing per-channel mute (frames are
+    /// dropped before VAD/transcription, so the mic recognizer stops being fed)
+    /// rather than persisting a setting — the choice is scoped to this session and
+    /// reversible via the mic toggle.
+    func shedMicrophoneForSession() {
+        guard !overlayState.isMicrophoneMuted else { return }
+        overlayState.isMicrophoneMuted = true
+        overlayState.appendSystemNote(
+            "ℹ️ Microphone muted for this session to reduce load. Re-enable it any time with the mic toggle.",
+            category: .ai
+        )
     }
 
     /// Surfaces visible warnings when the audio or transcription pipeline is silent. Two
@@ -598,6 +835,9 @@ final class AppCoordinator {
         pendingBoundaryTasks.removeAll()
         for task in inFlightCompletions.values { task.cancel() }
         inFlightCompletions.removeAll()
+        // Stop the safety-valve monitor and clear its per-session state so an idle
+        // app never polls and the next session starts with a clean governor.
+        stopResourceMonitor()
         // Persist any in-flight context edit before tearing the session down so the
         // last few keystrokes of the user's notes don't disappear on stop.
         await flushPendingContextSave()
@@ -673,6 +913,12 @@ final class AppCoordinator {
         noTranscriptsWarningID = nil
         slowStartupNoteID = nil
         stuckStartupNoteID = nil
+        // The Tier-1 alert lives in the chat that `clearChat()` just wiped; drop
+        // the stale ID and latch so the valve can re-alert cleanly in the new session.
+        tier1NoteID = nil
+        tier1Engaged = false
+        tier2Engaged = false
+        tier1PausedAI = false
         overlayState.transcriptCount = 0
         overlayState.audioFrameCount = 0
         overlayState.systemAudioFrameCount = 0
@@ -1381,7 +1627,6 @@ final class AppCoordinator {
         let buffer = transcriptBuffer
         let context = context
         let engine = triggerEngine
-        let wakeEngine = wakeWordEngine
 
         // Source the system audio from whichever capture path is currently active. Process
         // Tap is preferred (audio-only, set up above when on macOS 14.4+); SCK is the fallback.
@@ -1392,15 +1637,35 @@ final class AppCoordinator {
             await mixer.run(systemFrames: systemStream, micFrames: micStream)
         })
 
+        // Snapshot the mute-flag cache once; the lock is Sendable so the detached
+        // consumer can read it per frame without hopping to the main actor.
+        let muteFlags = self.muteFlags
         consumerTasks.append(Task.detached { [weak self] in
+            // Counters accumulate locally and flush to `OverlayState` on a ~2 Hz
+            // throttle. Previously each frame spawned a `Task { @MainActor }` to
+            // bump per-channel counts and a `MainActor.run` to read mute state —
+            // a main-actor hop per audio frame, the dominant standing CPU cost of
+            // the live pipeline. Now we touch the main actor at most ~twice a
+            // second regardless of frame rate.
             var framesProcessed = 0
+            var systemFrames = 0
+            var micFrames = 0
+            var lastCounterPublish: ContinuousClock.Instant = .now
             for await frame in mixer.output {
                 framesProcessed += 1
+                switch frame.channel {
+                case .system: systemFrames += 1
+                case .microphone: micFrames += 1
+                }
                 if framesProcessed == 1 {
                     wpInfo("Pipeline: first audio frame received (channel=\(frame.channel))")
+                    let firstSys = systemFrames
+                    let firstMic = micFrames
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         self.overlayState.audioFrameCount = 1
+                        self.overlayState.systemAudioFrameCount = firstSys
+                        self.overlayState.microphoneFrameCount = firstMic
                         self.dismissNoFramesWarning()
                         // Dismiss the "this is taking a while" startup notes —
                         // the pipeline is clearly alive now.
@@ -1413,37 +1678,32 @@ final class AppCoordinator {
                             self.overlayState.status = .listening
                         }
                     }
-                }
-                if framesProcessed % 25 == 0 {
-                    let count = framesProcessed
-                    Task { @MainActor [weak self] in self?.overlayState.audioFrameCount = count }
-                }
-                // Bump the per-channel counter for every frame so the watchdog can
-                // tell which side is silent. Cheaper to do unconditionally than to
-                // sample — the @Published assignment coalesces if the value didn't
-                // change observably.
-                let frameChannel = frame.channel
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    switch frameChannel {
-                    case .system: self.overlayState.systemAudioFrameCount += 1
-                    case .microphone: self.overlayState.microphoneFrameCount += 1
+                    lastCounterPublish = .now
+                } else {
+                    // Flush the absolute counters at ~2 Hz so the watchdog still sees
+                    // which side is silent and the Diagnostics frame counts still move.
+                    let now = ContinuousClock.now
+                    if now - lastCounterPublish >= .milliseconds(500) {
+                        lastCounterPublish = now
+                        let total = framesProcessed
+                        let sys = systemFrames
+                        let mic = micFrames
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.overlayState.audioFrameCount = total
+                            self.overlayState.systemAudioFrameCount = sys
+                            self.overlayState.microphoneFrameCount = mic
+                        }
                     }
                 }
                 // Per-channel mute gate. When muted, the captured frame is dropped before
                 // VAD/transcription so the recognizer doesn't waste cycles on audio the
-                // user has explicitly silenced.
-                let isMuted: Bool
-                if let strongSelf = self {
-                    let channel = frame.channel
-                    isMuted = await MainActor.run { [strongSelf] in
-                        switch channel {
-                        case .microphone: return strongSelf.overlayState.isMicrophoneMuted
-                        case .system: return strongSelf.overlayState.isSystemAudioMuted
-                        }
+                // user has explicitly silenced. Reads the cached flags — no actor hop.
+                let isMuted = muteFlags.withLock { flags in
+                    switch frame.channel {
+                    case .microphone: return flags.micMuted
+                    case .system: return flags.systemMuted
                     }
-                } else {
-                    isMuted = false
                 }
                 if isMuted { continue }
                 let event = await vad.feed(frame)
@@ -1459,6 +1719,12 @@ final class AppCoordinator {
         consumerTasks.append(Task { [weak self] in
             var transcriptsSeen = 0
             var lastTranscriptUIPublish: ContinuousClock.Instant = .now
+            // Per-channel throttle for live question scoring. Feeding the trigger
+            // engine on every partial re-scores the same growing hypothesis dozens
+            // of times a second; debouncing to ~0.5 s of new speech (while still
+            // always scoring finalized segments) keeps detection latency under half
+            // a second without the per-partial CPU churn.
+            var lastQuestionConsider: [AudioChannel: ContinuousClock.Instant] = [:]
             for await update in transcriber.transcripts {
                 await buffer.apply(update)
                 // Feed every system-channel partial straight to the trigger engine so
@@ -1473,27 +1739,14 @@ final class AppCoordinator {
                     self?.shouldAutoDetectQuestion(on: update.channel) ?? false
                 }
                 if autoDetectChannel {
-                    let liveSegment = TranscriptSegment(
-                        id: update.id,
-                        text: update.text,
-                        isFinal: update.isFinal,
-                        channel: update.channel,
-                        startedAt: update.timestamp,
-                        updatedAt: update.timestamp
-                    )
-                    await engine.consider(segment: liveSegment)
-                }
-                // Wake-word commands ride the same partial-hypothesis firehose,
-                // but mic-only and gated on their own setting — independent of
-                // the auto-detect toggles, because "pilot, open chrome" is an
-                // explicit address to the assistant, not an overheard question.
-                if update.channel == .microphone {
-                    let wakeWord: String? = await MainActor.run { [weak self] in
-                        guard let self, self.settings.wakeWordEnabled else { return nil }
-                        let word = self.settings.wakeWord.trimmingCharacters(in: .whitespacesAndNewlines)
-                        return word.isEmpty ? nil : word
-                    }
-                    if let wakeWord {
+                    // Always score finalized segments; for partials, only every
+                    // ~0.5 s per channel so a fast-growing hypothesis doesn't
+                    // re-trigger scoring on every recognizer callback.
+                    let now = ContinuousClock.now
+                    let last = lastQuestionConsider[update.channel]
+                    let dueByTime = last.map { now - $0 >= .milliseconds(500) } ?? true
+                    if update.isFinal || dueByTime {
+                        lastQuestionConsider[update.channel] = now
                         let liveSegment = TranscriptSegment(
                             id: update.id,
                             text: update.text,
@@ -1502,7 +1755,7 @@ final class AppCoordinator {
                             startedAt: update.timestamp,
                             updatedAt: update.timestamp
                         )
-                        await wakeEngine.consider(segment: liveSegment, wakeWord: wakeWord)
+                        await engine.consider(segment: liveSegment)
                     }
                 }
                 // The display always shows every transcript line; only AI context
@@ -1520,8 +1773,10 @@ final class AppCoordinator {
                 if absorbIntoAIContext {
                     await context.absorb(update)
                 }
+                // Republish the live transcript at ~3–4 Hz (was 10 Hz). Finals still
+                // publish immediately so a completed line never waits on the timer.
                 let now = ContinuousClock.now
-                if update.isFinal || now - lastTranscriptUIPublish >= .milliseconds(100) {
+                if update.isFinal || now - lastTranscriptUIPublish >= .milliseconds(250) {
                     let snapshot = await buffer.snapshot()
                     self?.overlayState.transcript = snapshot
                     lastTranscriptUIPublish = now
@@ -1607,90 +1862,10 @@ final class AppCoordinator {
                 await self.runCompletion(prompt: prompt, ai: liveAI, origin: .detectedQuestion)
             }
         })
-
-        consumerTasks.append(Task { [weak self] in
-            for await wake in wakeEngine.events {
-                guard let self else { return }
-                // Defense-in-depth: re-check the toggle at the sink, same as the
-                // detected-question path — a settings flip after the engine
-                // queued this command should still win.
-                guard self.settings.wakeWordEnabled else { continue }
-                await self.handleVoiceCommand(wake.command)
-            }
-        })
-    }
-
-    /// Routes a fired wake-word command: one short AI call classifies it into
-    /// open-app / open-url / answer. The two system actions execute immediately
-    /// (both safe and reversible); everything else streams a normal chat answer
-    /// built from the spoken text plus the usual conversation context.
-    private func handleVoiceCommand(_ command: String) async {
-        if overlayState.isAIPaused {
-            overlayState.appendSystemNote("🎙️ Voice command \"\(command)\" ignored — AI is paused.", category: .ai)
-            return
-        }
-        guard let ai = aiProvider else {
-            overlayState.appendSystemNote("🎙️ Voice command \"\(command)\" ignored — no AI API key configured.", category: .ai)
-            return
-        }
-        wpInfo("[Coordinator] 🎙️ voice command: \"\(command)\"")
-        overlayState.appendAutoTriggerPreamble(origin: .voiceCommand, text: command)
-        overlayState.status = .thinking
-        persistChatTurn(role: "User (voice command)", text: command)
-        // Flush the still-volatile command utterance to a synthetic final NOW,
-        // for every branch — it's what gets the spoken line into the AI context
-        // AND into transcript.md (both consume finals only). Without this, an
-        // "open app" command never appears in the session's transcript file.
-        await absorbPendingTranscripts()
-
-        // Interpretation failure (network, malformed reply) degrades to the
-        // answer path — the user spoke a request; "we couldn't classify it" is
-        // never a reason to drop it on the floor.
-        let intent = (try? await VoiceCommandInterpreter.interpret(command: command, using: ai)) ?? .answer
-
-        switch intent {
-        case .openApp(let name):
-            if await VoiceCommandExecutor.openApp(named: name) {
-                overlayState.appendSystemNote("✅ Opened \(name).", category: .ai)
-            } else {
-                overlayState.appendSystemNote("⚠️ Couldn't find an app named \"\(name)\".", category: .ai)
-            }
-            settleStatusAfterVoiceAction()
-        case .openURL(let url):
-            if VoiceCommandExecutor.openURL(url) {
-                overlayState.appendSystemNote("✅ Opened \(url.absoluteString).", category: .ai)
-            } else {
-                overlayState.appendSystemNote("⚠️ Couldn't open \(url.absoluteString).", category: .ai)
-            }
-            settleStatusAfterVoiceAction()
-        case .answer:
-            let snapshot = await context.snapshotWithPrior()
-            let prompt = PromptBuilder.buildVoiceCommand(
-                context: filteredSnapshot(snapshot),
-                history: filteredHistory(chatHistorySnapshot(excludingLast: false)),
-                command: command,
-                style: settings.responseStyle
-            )
-            await runCompletion(prompt: prompt, ai: ai, origin: .voiceCommand)
-        }
-    }
-
-    /// The open-app / open-url branches never enter `runCompletion`, so the
-    /// `.thinking` status set when the command fired has no stream lifecycle to
-    /// clear it — mirror `completionFinished`'s settle logic here.
-    private func settleStatusAfterVoiceAction() {
-        guard inFlightCompletions.isEmpty else { return }
-        switch overlayState.status {
-        case .streaming, .thinking, .error:
-            overlayState.status = isRunning ? .listening : .idle
-        default:
-            break
-        }
     }
 
     private func handleVADEvent(_ event: VoiceActivityEvent) async {
         await triggerEngine.absorb(event)
-        await wakeWordEngine.absorb(event)
 
         // Optional debounced utterance-boundary cycling. Default is `.auto` — no
         // time-based cutting at all; we let SFSpeech finalize segments on its own.
@@ -1722,16 +1897,6 @@ final class AppCoordinator {
         if shouldAutoDetectQuestion(on: vadChannel),
            let last = await transcriptBuffer.lastSegment(on: vadChannel) {
             await triggerEngine.consider(segment: last)
-        }
-
-        // Same post-pause re-consider for the wake-word engine, mic-only. The
-        // pause gate inside the engine is what actually fires the command, and
-        // this call is often the one that lands after the gate opens.
-        if vadChannel == .microphone, settings.wakeWordEnabled {
-            let word = settings.wakeWord.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !word.isEmpty, let last = await transcriptBuffer.lastSegment(on: .microphone) {
-                await wakeWordEngine.consider(segment: last, wakeWord: word)
-            }
         }
     }
 

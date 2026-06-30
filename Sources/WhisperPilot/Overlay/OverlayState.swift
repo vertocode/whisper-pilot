@@ -116,6 +116,11 @@ enum ChatMessageAction: String, Sendable {
     /// Used by the no-transcripts watchdog when the symptom matches the
     /// "ProcessTap delivers silent frames" case.
     case enableForceSCKAndRestart
+    /// Mute the microphone channel for the running session, shedding the mic
+    /// recognizer's load. Posted by the Tier-1 safety valve when sustained load
+    /// trips the soft brake; the user taps it to drop the mic side entirely
+    /// (capture keeps running so the mic toggle re-enables it instantly).
+    case shedMicrophoneForSession
 }
 
 struct ChatMessage: Identifiable, Equatable, Sendable {
@@ -138,9 +143,6 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// default) — a screenshot of the current display is sent and the AI
         /// answers whatever question is visible.
         case answerScreen
-        /// User spoke the wake word + a command ("pilot, open chrome"). The
-        /// command either ran as a system action or was answered in chat.
-        case voiceCommand
         /// User-visible system note (e.g. "AI paused").
         case system
     }
@@ -208,6 +210,11 @@ final class OverlayState: ObservableObject {
     /// reaching VAD/transcription. Capture itself keeps running so the resume is instant.
     @Published var isMicrophoneMuted: Bool = false
     @Published var isSystemAudioMuted: Bool = false
+
+    /// Latest resource reading published by the safety-valve monitor (~1.3 Hz) for the
+    /// live Diagnostics readout. `nil` while not listening — the monitor only samples
+    /// during a session, so the readout shows "—" when idle.
+    @Published var resourceSample: ResourceSample? = nil
 
     /// User-supplied context for this session — free-form notes plus attached files.
     /// Edited via the Context dropdown in the AI lane and persisted to disk by the
