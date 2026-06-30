@@ -283,6 +283,9 @@ struct OverlayView: View {
             .padding(.horizontal, WP.Space.md)
             .padding(.top, WP.Space.sm)
 
+            resourceReadout
+                .padding(.horizontal, WP.Space.md)
+
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     let recent = logBuffer.entries.suffix(60)
@@ -304,6 +307,68 @@ struct OverlayView: View {
             .frame(maxHeight: 160)
         }
         .background(.quinary)
+    }
+
+    /// Live CPU / memory / thermal readout sourced from the safety-valve sampler
+    /// snapshot (`state.resourceSample`). Updates while listening; shows "—" when idle
+    /// because the monitor only samples during a session.
+    private var resourceReadout: some View {
+        HStack(spacing: WP.Space.md) {
+            if let sample = state.resourceSample {
+                resourceStat("cpu", "CPU", "\(Int(sample.cpuPercent.rounded()))%", iconTint: .secondary, valueTint: .primary)
+                resourceStat("memorychip", "Memory", "\(sample.memoryBytes / 1_000_000) MB", iconTint: .secondary, valueTint: .primary)
+                let thermalTint = Self.thermalColor(sample.thermalState)
+                resourceStat(
+                    "thermometer.medium",
+                    "Thermal",
+                    Self.thermalLabel(sample.thermalState),
+                    iconTint: thermalTint,
+                    valueTint: thermalTint
+                )
+            } else {
+                Text("Resource monitor inactive — start listening to see live CPU / memory / thermal.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func resourceStat(_ symbol: String, _ label: String, _ value: String, iconTint: Color, valueTint: Color) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.caption2)
+                .foregroundStyle(iconTint)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption2.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(valueTint)
+        }
+    }
+
+    private static func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal: return "Nominal"
+        case .fair: return "Fair"
+        case .serious: return "Serious"
+        case .critical: return "Critical"
+        @unknown default: return "Unknown"
+        }
+    }
+
+    private static func thermalColor(_ state: ProcessInfo.ThermalState) -> Color {
+        switch state {
+        case .nominal: return .secondary
+        case .fair: return .yellow
+        case .serious: return .orange
+        case .critical: return .red
+        @unknown default: return .secondary
+        }
     }
 
     // MARK: - Content
@@ -1252,17 +1317,12 @@ private struct MessageBubble: View {
         message.role == .user && message.origin == .answerScreen
     }
 
-    private var isVoiceCommandPreamble: Bool {
-        message.role == .user && message.origin == .voiceCommand
-    }
-
     private var roleIcon: String {
         if isAutoDetectedQuestion { return "questionmark.bubble.fill" }
         if isHelpAIPreamble       { return "sparkles" }
         if isSummaryPreamble      { return "doc.text" }
         if isActionItemsPreamble  { return "checklist" }
         if isAnswerScreenPreamble { return "text.viewfinder" }
-        if isVoiceCommandPreamble { return "mic.fill" }
         switch message.role {
         case .user: return "person.fill"
         case .assistant: return "sparkles"
@@ -1276,7 +1336,6 @@ private struct MessageBubble: View {
         if isSummaryPreamble      { return "Summary" }
         if isActionItemsPreamble  { return "Action items" }
         if isAnswerScreenPreamble { return "Answer screen" }
-        if isVoiceCommandPreamble { return "Voice command" }
         switch message.role {
         case .user: return "You"
         case .assistant: return "Assistant"
@@ -1290,7 +1349,6 @@ private struct MessageBubble: View {
         if isSummaryPreamble      { return .blue }
         if isActionItemsPreamble  { return .orange }
         if isAnswerScreenPreamble { return .indigo }
-        if isVoiceCommandPreamble { return .teal }
         switch message.role {
         case .user: return .purple
         case .assistant: return .blue
@@ -1303,7 +1361,7 @@ private struct MessageBubble: View {
     /// would just be visual noise. We still show it on the assistant's reply so the
     /// user can correlate reply ↔ trigger.
     private var originBadge: String? {
-        if isAutoDetectedQuestion || isHelpAIPreamble || isSummaryPreamble || isActionItemsPreamble || isAnswerScreenPreamble || isVoiceCommandPreamble {
+        if isAutoDetectedQuestion || isHelpAIPreamble || isSummaryPreamble || isActionItemsPreamble || isAnswerScreenPreamble {
             return nil
         }
         switch message.origin {
@@ -1312,7 +1370,6 @@ private struct MessageBubble: View {
         case .summary: return "· summary"
         case .actionItems: return "· action items"
         case .answerScreen: return "· answer screen"
-        case .voiceCommand: return "· voice command"
         case .userPrompt, .system: return nil
         }
     }

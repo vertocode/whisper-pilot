@@ -61,30 +61,6 @@ enum PromptBuilder {
         )
     }
 
-    /// Triggered by a spoken wake-word command that the interpreter routed to
-    /// "answer" (not an open-app / open-url action). Same context as a typed
-    /// query, but the system prompt frames the input as spoken — speech
-    /// recognition artifacts ("right a landing page") should be resolved
-    /// charitably rather than answered literally.
-    static func buildVoiceCommand(context: ConversationSnapshot, history: [ChatTurn], command: String, style: ResponseStyle) -> Prompt {
-        let system = """
-        You are an ambient real-time copilot. The user spoke a command to you out loud \
-        after the wake word — the text below is a speech-recognition transcript, so fix \
-        obvious mis-transcriptions from context ("right a function" → "write a function") \
-        instead of taking them literally. Use the live transcript and prior chat as \
-        context. If the request needs key details you don't have, give your best answer \
-        and note the one or two questions that would improve it. Be direct.
-
-        Style: \(style.rawValue) — \(style.description)
-        """
-        return Prompt(
-            systemInstruction: system,
-            context: contextBlock(transcript: context, history: history),
-            question: command,
-            style: style
-        )
-    }
-
     /// Triggered by the "Help AI" button. The user thinks there's an unanswered question
     /// in the recent transcript that the auto-detector missed. We hand the model the
     /// same full context as a normal user query but instruct it to *find* the question

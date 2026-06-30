@@ -86,8 +86,10 @@ final class SettingsStore: ObservableObject {
         static let includeTranscriptInPrompt = "ai.includeTranscriptInPrompt"
         static let includeSystemAudioInPrompt = "ai.includeSystemAudioInPrompt"
         static let includeChatHistoryInPrompt = "ai.includeChatHistoryInPrompt"
-        static let wakeWordEnabled = "voice.wakeWordEnabled"
-        static let wakeWord = "voice.wakeWord"
+        static let safetyValveEnabled = "performance.safetyValveEnabled"
+        static let safetyValveCPUPercent = "performance.safetyValveCPUPercent"
+        static let safetyValveMemoryMB = "performance.safetyValveMemoryMB"
+        static let alwaysTranscribeMic = "performance.alwaysTranscribeMic"
     }
 
     private let defaults: UserDefaults
@@ -353,16 +355,45 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(includeChatHistoryInPrompt, forKey: Keys.includeChatHistoryInPrompt) }
     }
 
-    /// Master switch for spoken wake-word commands ("pilot, open chrome").
-    /// Mic-channel only — system audio never triggers commands.
-    @Published var wakeWordEnabled: Bool {
-        didSet { defaults.set(wakeWordEnabled, forKey: Keys.wakeWordEnabled) }
+    // MARK: - Performance safety valve
+
+    /// Master switch for the resource safety valve. When off, the monitor still
+    /// samples for the live Diagnostics readout but never trips Tier-1/Tier-2 — the
+    /// app reverts to its old no-limit behavior. Default on.
+    @Published var safetyValveEnabled: Bool {
+        didSet { defaults.set(safetyValveEnabled, forKey: Keys.safetyValveEnabled) }
     }
 
-    /// The spoken keyword that arms a voice command. Matched case-insensitively
-    /// as a whole word against the live mic transcript.
-    @Published var wakeWord: String {
-        didSet { defaults.set(wakeWord, forKey: Keys.wakeWord) }
+    /// Own-process CPU percentage above which the Tier-1 sustain clock starts. Maps
+    /// to `ResourceGovernorConfig.cpuTier1Percent`. Can exceed 100 conceptually (one
+    /// pinned core ≈ 100), but the Settings slider keeps it in a single-core range.
+    @Published var safetyValveCPUPercent: Double {
+        didSet { defaults.set(safetyValveCPUPercent, forKey: Keys.safetyValveCPUPercent) }
+    }
+
+    /// Resident-memory cap in megabytes; crossing it engages Tier-1 immediately. Stored
+    /// in MB for a friendlier Settings control and converted to bytes for the governor.
+    @Published var safetyValveMemoryMB: Int {
+        didSet { defaults.set(safetyValveMemoryMB, forKey: Keys.safetyValveMemoryMB) }
+    }
+
+    /// Whether the microphone recognizer runs by default at session start. When off, a
+    /// new session begins with the mic channel muted (system audio still transcribes) so
+    /// users who rarely need their own voice transcribed avoid its cost without muting
+    /// each session by hand. The in-session mic toggle still re-enables it on demand.
+    @Published var alwaysTranscribeMic: Bool {
+        didSet { defaults.set(alwaysTranscribeMic, forKey: Keys.alwaysTranscribeMic) }
+    }
+
+    /// Builds the governor config from the user's tunable thresholds. Sustain and
+    /// escalation windows stay at their defaults — only the CPU% and memory caps are
+    /// user-facing. Read at the start of each session so threshold edits take effect on
+    /// the next listen.
+    var resourceGovernorConfig: ResourceGovernorConfig {
+        var config = ResourceGovernorConfig.default
+        config.cpuTier1Percent = safetyValveCPUPercent
+        config.memoryTier1Bytes = UInt64(max(0, safetyValveMemoryMB)) * 1_000_000
+        return config
     }
 
     var locale: Locale {
@@ -534,7 +565,12 @@ final class SettingsStore: ObservableObject {
         self.includeTranscriptInPrompt = defaults.object(forKey: Keys.includeTranscriptInPrompt) as? Bool ?? true
         self.includeSystemAudioInPrompt = defaults.object(forKey: Keys.includeSystemAudioInPrompt) as? Bool ?? true
         self.includeChatHistoryInPrompt = defaults.object(forKey: Keys.includeChatHistoryInPrompt) as? Bool ?? true
-        self.wakeWordEnabled = defaults.object(forKey: Keys.wakeWordEnabled) as? Bool ?? true
-        self.wakeWord = defaults.string(forKey: Keys.wakeWord) ?? "pilot"
+        // Safety valve defaults track the PRD's tier values: on, CPU 70%, memory 1.5 GB.
+        // `alwaysTranscribeMic` defaults on so existing behavior (mic transcribed by
+        // default) is unchanged for users who never touch the setting.
+        self.safetyValveEnabled = defaults.object(forKey: Keys.safetyValveEnabled) as? Bool ?? true
+        self.safetyValveCPUPercent = defaults.object(forKey: Keys.safetyValveCPUPercent) as? Double ?? 70
+        self.safetyValveMemoryMB = defaults.object(forKey: Keys.safetyValveMemoryMB) as? Int ?? 1500
+        self.alwaysTranscribeMic = defaults.object(forKey: Keys.alwaysTranscribeMic) as? Bool ?? true
     }
 }

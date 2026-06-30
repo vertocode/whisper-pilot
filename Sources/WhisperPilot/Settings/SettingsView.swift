@@ -94,6 +94,41 @@ struct SettingsView: View {
                 }
                 FormHint(store.utteranceBoundary.description)
             }
+
+            Section("Performance safety valve") {
+                Toggle("Enable safety valve", isOn: $store.safetyValveEnabled)
+                FormHint("Watches this app's own CPU, memory, and thermal state while listening and backs off before your Mac freezes: a soft pause of AI auto-suggestions first, then a full stop if load stays high. Turn off to revert to the old no-limit behavior. Live numbers appear in the overlay's Diagnostics panel.")
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("CPU threshold")
+                        Spacer()
+                        Text("\(Int(store.safetyValveCPUPercent.rounded()))%")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: $store.safetyValveCPUPercent, in: 40...95, step: 5)
+                }
+                .disabled(!store.safetyValveEnabled)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Memory threshold")
+                        Spacer()
+                        Text("\(store.safetyValveMemoryMB) MB")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(store.safetyValveMemoryMB) },
+                            set: { store.safetyValveMemoryMB = Int($0) }
+                        ),
+                        in: 500...4000,
+                        step: 100
+                    )
+                }
+                .disabled(!store.safetyValveEnabled)
+                FormHint("The soft pause (Tier-1) trips when this app's own CPU stays above the threshold for ~20s, or its memory crosses the cap. Thermal pressure and sustained overload escalate to a full stop. Tune these to your Mac; threshold changes apply the next time you start listening.")
+            }
         }
         .formStyle(.grouped)
     }
@@ -110,13 +145,6 @@ struct SettingsView: View {
                 FormHint("When on, questions captured on the system-audio side (the other speaker in a meeting) automatically fire an AI call.")
                 Toggle("Auto-answer questions from Me", isOn: $store.autoDetectQuestionsFromMe)
                 FormHint("When on, questions captured on your microphone also fire an AI call. Off by default because the spoken version often duplicates what you'd type to the assistant directly.")
-            }
-
-            Section("Voice commands") {
-                Toggle("Listen for wake word", isOn: $store.wakeWordEnabled)
-                FormHint("Say the wake word followed by a command while listening — e.g. \"pilot, open Chrome\" or \"pilot, write me a landing page\". Open-app / open-website commands run immediately; everything else is answered in the AI chat. Requires microphone capture.")
-                TextField("Wake word", text: $store.wakeWord)
-                FormHint("Matched case-insensitively as a whole word, and only against your microphone (\"Me\") — system audio can never trigger a command. A short, uncommon word avoids accidental fires.")
             }
 
             Section("Prompt context") {
@@ -307,6 +335,9 @@ struct SettingsView: View {
             Section {
                 Toggle("Capture microphone", isOn: $store.captureMicrophone)
                 FormHint("System audio (everything macOS plays — Teams, Meet, Slack, browser) is always captured. Microphone is optional and lets the assistant attribute who said what.")
+                Toggle("Always transcribe my mic", isOn: $store.alwaysTranscribeMic)
+                    .disabled(!store.captureMicrophone)
+                FormHint("When off, a new session starts with your mic muted — system audio (\"Other\") still transcribes, but your own voice is skipped until you unmute with the in-session mic toggle. Useful if you rarely need your own speech transcribed and want to avoid the mic recognizer's cost. Has no effect when microphone capture above is off.")
             }
             Section("System audio capture method") {
                 Toggle("Force ScreenCaptureKit (requires Screen Recording permission)", isOn: $store.forceScreenCaptureKitForSystemAudio)

@@ -15,11 +15,10 @@ struct SmokeTestRunner {
         await runConversationContextSuite()
         await runPromptBuilderSuite()
         await runTriggerEngineSuite()
-        await runWakeWordEngineSuite()
-        await runVoiceCommandInterpreterSuite()
         await runUpdateCheckerSuite()
         await runStreamingAudioConverterSuite()
         await runSystemAudioGainSuite()
+        await runResourceGovernorSuite()
         await runSpeechRecognitionIntegrationSuite()
 
         let snapshot = await stats.snapshot()
@@ -77,23 +76,6 @@ struct SmokeTestRunner {
 
     static func snapshotFor(lines: [String] = [], topics: [String] = []) -> ConversationSnapshot {
         ConversationSnapshot(recentLines: lines, topics: topics, entities: [])
-    }
-
-    /// Race the wake-word engine's event stream against a timeout.
-    static func collectFirstWakeEvent(from engine: WakeWordEngine, within seconds: TimeInterval) async -> WakeCommandEvent? {
-        await withTaskGroup(of: WakeCommandEvent?.self) { group in
-            group.addTask {
-                for await event in engine.events { return event }
-                return nil
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                return nil
-            }
-            let result = await group.next() ?? nil
-            group.cancelAll()
-            return result
-        }
     }
 
     /// Race the engine's event stream against a timeout. Returns the first event or nil on timeout.
@@ -396,6 +378,106 @@ struct SmokeTestRunner {
         }
     }
 
+    /// Drives the `ResourceGovernor` state machine with a controllable clock (we pass
+    /// the monotonic `now` ourselves) and synthetic samples. Pins the tier transitions:
+    /// CPU sustain, memory cap, thermal short-circuit, and the Tier-1 → Tier-2/recover
+    /// fork. No real CPU/memory/thermal readings are involved — the module is pure.
+    static func runResourceGovernorSuite() async {
+        await suite("ResourceGovernor") {
+            let config = ResourceGovernorConfig.default
+
+            func nominal(cpu: Double = 10, mem: UInt64 = 200_000_000,
+                         thermal: ProcessInfo.ThermalState = .nominal) -> ResourceSample {
+                ResourceSample(cpuPercent: cpu, memoryBytes: mem, thermalState: thermal)
+            }
+
+            // Below every threshold → .ok.
+            do {
+                let gov = ResourceGovernor(config: config)
+                await expect(gov.evaluate(nominal(), at: 0) == .ok,
+                             "below-threshold sample is .ok")
+                await expect(gov.evaluate(nominal(cpu: 65), at: 1) == .ok,
+                             "CPU under threshold stays .ok")
+            }
+
+            // CPU over threshold but not yet sustained → .ok; sustained → .tier1Pause.
+            do {
+                let gov = ResourceGovernor(config: config)
+                await expect(gov.evaluate(nominal(cpu: 85), at: 0) == .ok,
+                             "CPU over threshold but t=0 is not yet sustained → .ok")
+                await expect(gov.evaluate(nominal(cpu: 85), at: 10) == .ok,
+                             "still within the sustain window → .ok")
+                await expect(gov.evaluate(nominal(cpu: 85), at: config.cpuSustainSeconds) == .tier1Pause,
+                             "CPU sustained past the window → .tier1Pause")
+            }
+
+            // A dip below threshold resets the sustain clock — no accumulation.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(cpu: 85), at: 0)
+                await expect(gov.evaluate(nominal(cpu: 50), at: 10) == .ok,
+                             "CPU drops mid-window → clock resets")
+                await expect(gov.evaluate(nominal(cpu: 85), at: 25) == .ok,
+                             "re-crossing restarts the sustain window from scratch")
+                await expect(gov.evaluate(nominal(cpu: 85), at: 25 + config.cpuSustainSeconds) == .tier1Pause,
+                             "sustained again from the restart point → .tier1Pause")
+            }
+
+            // Memory over cap → .tier1Pause immediately (no sustain requirement).
+            do {
+                let gov = ResourceGovernor(config: config)
+                await expect(gov.evaluate(nominal(mem: config.memoryTier1Bytes + 1), at: 0) == .tier1Pause,
+                             "memory over cap engages Tier-1 immediately")
+            }
+
+            // Thermal .serious → .tier2Stop (and .critical likewise), from normal.
+            do {
+                let gov = ResourceGovernor(config: config)
+                await expect(gov.evaluate(nominal(thermal: .serious), at: 0) == .tier2Stop,
+                             "thermal .serious short-circuits to .tier2Stop")
+                let gov2 = ResourceGovernor(config: config)
+                await expect(gov2.evaluate(nominal(thermal: .critical), at: 0) == .tier2Stop,
+                             "thermal .critical short-circuits to .tier2Stop")
+            }
+
+            // Load still high 15s after Tier-1 → .tier2Stop.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(cpu: 85), at: 0)
+                let t1 = config.cpuSustainSeconds
+                await expect(gov.evaluate(nominal(cpu: 85), at: t1) == .tier1Pause,
+                             "enters Tier-1 once sustained")
+                await expect(gov.evaluate(nominal(cpu: 85), at: t1 + 5) == .tier1Pause,
+                             "still within escalation window → remains .tier1Pause")
+                await expect(gov.evaluate(nominal(cpu: 85), at: t1 + config.tier2EscalationSeconds) == .tier2Stop,
+                             "load high through the escalation window → .tier2Stop")
+            }
+
+            // Load recovering after Tier-1 → back to .ok.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(cpu: 85), at: 0)
+                let t1 = config.cpuSustainSeconds
+                await expect(gov.evaluate(nominal(cpu: 85), at: t1) == .tier1Pause,
+                             "enters Tier-1 once sustained")
+                await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5) == .ok,
+                             "load recovers below threshold → back to .ok")
+                await expect(gov.tier == .normal, "recovery returns the governor to .normal")
+            }
+
+            // Tier-2 is terminal until reset().
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(thermal: .serious), at: 0)
+                await expect(gov.evaluate(nominal(), at: 1) == .tier2Stop,
+                             "stays stopped after Tier-2 even on a clean sample")
+                gov.reset()
+                await expect(gov.evaluate(nominal(), at: 2) == .ok,
+                             "reset() clears Tier-2 back to .ok")
+            }
+        }
+    }
+
     static func runTriggerEngineSuite() async {
         await suite("TriggerEngine") {
             do {
@@ -443,85 +525,6 @@ struct SmokeTestRunner {
                 await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-1.0), duration: 1.0, silenceLeading: 0))
                 let event = await collectFirstEvent(from: engine, within: 0.4)
                 await expect(event == nil, "Other-side candidate doesn't fire on a Me-side pause")
-            }
-        }
-    }
-
-    static func runWakeWordEngineSuite() async {
-        await suite("WakeWordEngine") {
-            // extractCommand — the pure parsing core.
-            await expect(WakeWordEngine.extractCommand(from: "pilot open chrome", wakeWord: "pilot") == "open chrome",
-                         "command extracted after wake word")
-            await expect(WakeWordEngine.extractCommand(from: "Pilot, open Chrome.", wakeWord: "pilot") == "open Chrome",
-                         "case-insensitive match, punctuation stripped")
-            await expect(WakeWordEngine.extractCommand(from: "okay so pilot search swift docs", wakeWord: "pilot") == "search swift docs",
-                         "wake word mid-utterance still extracts trailing command")
-            await expect(WakeWordEngine.extractCommand(from: "open chrome", wakeWord: "pilot") == nil,
-                         "no wake word → nil")
-            await expect(WakeWordEngine.extractCommand(from: "pilot", wakeWord: "pilot") == nil,
-                         "wake word with no command → nil")
-            await expect(WakeWordEngine.extractCommand(from: "the copilot opened the file", wakeWord: "pilot") == nil,
-                         "whole-word match — 'copilot' doesn't contain wake word")
-            await expect(WakeWordEngine.extractCommand(from: "pilot open chrome", wakeWord: "  ") == nil,
-                         "blank wake word never matches")
-
-            // Fire flow — mirrors the TriggerEngine suite's pattern. speechEnded
-            // timestamps sit beyond the 1.5s pause gate so the fire is immediate.
-            do {
-                let engine = WakeWordEngine()
-                await engine.consider(segment: micSegment("pilot open chrome"), wakeWord: "pilot")
-                await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-2.0), duration: 2.0, silenceLeading: 0))
-                let event = await collectFirstWakeEvent(from: engine, within: 0.5)
-                await expect(event != nil, "fires on mic wake command followed by pause")
-                await expect(event?.command == "open chrome", "carries extracted command")
-            }
-
-            do {
-                let engine = WakeWordEngine()
-                await engine.consider(segment: micSegment("pilot open chrome"), wakeWord: "pilot")
-                let event = await collectFirstWakeEvent(from: engine, within: 0.4)
-                await expect(event == nil, "no fire without a mic speech-ended event")
-            }
-
-            // The pause gate is what stops the engine firing on the micro-pause
-            // between dictated words ("open … Safari" arriving as "open" first).
-            // A just-now speechEnded must not fire until the 1.5s gate elapses,
-            // and the scheduled re-check must then fire it with no further
-            // consider/absorb traffic. One collect (AsyncStream is single-
-            // consumer) + a timestamp assertion covers both.
-            do {
-                let engine = WakeWordEngine()
-                let endedAt = Date()
-                await engine.consider(segment: micSegment("pilot open"), wakeWord: "pilot")
-                await engine.absorb(.speechEnded(channel: .microphone, at: endedAt, duration: 1.0, silenceLeading: 0))
-                let event = await collectFirstWakeEvent(from: engine, within: 2.5)
-                await expect(event != nil, "scheduled re-check fires after the full pause with no further events")
-                if let event {
-                    await expect(event.firedAt.timeIntervalSince(endedAt) >= 1.4,
-                                 "did not fire during the mid-command micro-pause (fired after \(event.firedAt.timeIntervalSince(endedAt))s)")
-                }
-            }
-
-            do {
-                let engine = WakeWordEngine()
-                await engine.consider(segment: systemSegment("pilot open chrome"), wakeWord: "pilot")
-                await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-2.0), duration: 2.0, silenceLeading: 0))
-                let event = await collectFirstWakeEvent(from: engine, within: 0.4)
-                await expect(event == nil, "system-audio channel never triggers a command")
-            }
-
-            // Re-fire suppression: the same segment growing after the fire must
-            // not fire twice.
-            do {
-                let engine = WakeWordEngine()
-                var segment = micSegment("pilot open chrome")
-                await engine.consider(segment: segment, wakeWord: "pilot")
-                await engine.absorb(.speechEnded(channel: .microphone, at: Date().addingTimeInterval(-2.0), duration: 2.0, silenceLeading: 0))
-                let first = await collectFirstWakeEvent(from: engine, within: 0.5)
-                segment.text = "pilot open chrome please"
-                await engine.consider(segment: segment, wakeWord: "pilot")
-                let second = await collectFirstWakeEvent(from: engine, within: 0.4)
-                await expect(first != nil && second == nil, "grown hypothesis of a fired segment doesn't re-fire")
             }
         }
     }
@@ -582,22 +585,4 @@ struct SmokeTestRunner {
         }
     }
 
-    static func runVoiceCommandInterpreterSuite() async {
-        await suite("VoiceCommandInterpreter") {
-            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_app","app":"Google Chrome"}"#) == .openApp("Google Chrome"),
-                         "parses open_app")
-            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_url","url":"https://www.google.com/search?q=swift"}"#) == .openURL(URL(string: "https://www.google.com/search?q=swift")!),
-                         "parses open_url")
-            await expect(VoiceCommandInterpreter.parse(#"{"intent":"answer"}"#) == .answer,
-                         "parses answer")
-            await expect(VoiceCommandInterpreter.parse("```json\n{\"intent\":\"open_app\",\"app\":\"Safari\"}\n```") == .openApp("Safari"),
-                         "tolerates markdown fences")
-            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_url","url":"file:///etc/passwd"}"#) == nil,
-                         "rejects non-web URL schemes")
-            await expect(VoiceCommandInterpreter.parse(#"{"intent":"open_app","app":""}"#) == nil,
-                         "rejects empty app name")
-            await expect(VoiceCommandInterpreter.parse("sure, opening chrome!") == nil,
-                         "prose without JSON → nil (caller falls back to answer)")
-        }
-    }
 }

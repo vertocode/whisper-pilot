@@ -182,6 +182,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }
             }
+        case .shedMicrophoneForSession:
+            // Session-scoped: mute the mic channel so the recognizer stops being
+            // fed. No setting is persisted — the user can re-enable via the mic
+            // toggle, and the next session starts unmuted.
+            coordinator.shedMicrophoneForSession()
         }
     }
 
