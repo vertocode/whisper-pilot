@@ -28,7 +28,8 @@ Every setting below is reachable from the overlay's `…` menu → **Settings**.
 | **Response style** | `concise` | One of `concise` / `detailed` / `strategic` / `follow-up`. Tunes the system prompt. |
 | **Locale** | system locale | `SFSpeechRecognizer` is locale-bound — match the language being spoken. |
 | **Auto-send to AI** | `Off` | `Off` / `30 s` / `1 min` / `2 min` / `5 min`. When on, the assistant proactively summarizes recent transcript on every tick. Skipped if no new transcripts since the last send. |
-| **Transcript line break** | `Auto` | Controls when a transcript line is finalized into its own row. `Auto` trusts the speech recognizer; `Quick`/`Normal`/`Relaxed`/`Patient`/`Minute` force line breaks after fixed pause durations. |
+
+Transcript line-breaking is no longer configurable: lines split automatically at natural utterance boundaries (a ~1.5 s pause), the same cadence Meet/Teams captions use.
 
 ### Devices tab
 

@@ -18,6 +18,10 @@ struct SmokeTestRunner {
         await runUpdateCheckerSuite()
         await runStreamingAudioConverterSuite()
         await runSystemAudioGainSuite()
+        await runTranscriptBufferSuite()
+        await runReplayOverlapTrimmerSuite()
+        await runTranscriptDedupSuite()
+        await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
         await runSpeechRecognitionIntegrationSuite()
 
@@ -194,6 +198,16 @@ struct SmokeTestRunner {
             await context4.reset()
             let snap4 = await context4.snapshot()
             await expect(snap4.recentLines.isEmpty && snap4.topics.isEmpty, "reset clears state")
+
+            // Containment-duplicate finals under different ids (synthetic
+            // pre-flush + the recognizer's own final) merge into one line —
+            // mirrors TranscriptBuffer so the AI sees what the user sees.
+            let context5 = ConversationContext()
+            await context5.absorb(.init(id: UUID(), text: "we ship on friday", isFinal: true, channel: .microphone, timestamp: Date()))
+            await context5.absorb(.init(id: UUID(), text: "We ship on Friday.", isFinal: true, channel: .microphone, timestamp: Date()))
+            let snap5 = await context5.snapshot()
+            await expect(snap5.recentLines.count == 1, "duplicate finals merged into one context line (got \(snap5.recentLines.count))")
+            await expect(snap5.recentLines.first == "Me: We ship on Friday.", "merged line keeps the more complete text (got \(snap5.recentLines.first ?? "nil"))")
         }
     }
 
@@ -239,9 +253,10 @@ struct SmokeTestRunner {
         }
     }
 
-    /// Pins the gain-and-clamp contract that `SystemAudioCapture` applies to every
-    /// ScreenCaptureKit buffer. If someone changes the constant, removes the clamp, or
-    /// breaks the multiply, this suite fails before a real meeting ever runs.
+    /// Pins the gain-and-soft-limit contract that `SystemAudioCapture` applies to every
+    /// system-audio buffer (both the SCK and Process Tap paths). If someone changes the
+    /// constant, removes the limiter, or breaks the multiply, this suite fails before a
+    /// real meeting ever runs.
     static func runSystemAudioGainSuite() async {
         await suite("SystemAudioCapture gain") {
             await expect(SystemAudioCapture.systemAudioGain == 5.0,
@@ -249,30 +264,47 @@ struct SmokeTestRunner {
 
             // Float32 mono buffer matching the canonical format the SCK path produces.
             let format = CanonicalAudioFormat.make()
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 5) else {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 6) else {
                 await expect(false, "couldn't allocate test PCM buffer")
                 return
             }
-            buffer.frameLength = 5
+            buffer.frameLength = 6
             guard let data = buffer.floatChannelData else {
                 await expect(false, "buffer has no floatChannelData (format isn't Float32?)")
                 return
             }
-            // Mix of values: a quiet positive that 5× stays in range, a quiet negative,
-            // zero, a positive that 5× exceeds +1 (must clamp), and a negative that 5×
-            // exceeds -1 (must clamp).
-            let inputs: [Float] = [0.05, -0.1, 0.0, 0.5, -0.7]
-            let expected: [Float] = [0.25, -0.5, 0.0, 1.0, -1.0]
-            for i in 0..<5 { data.pointee[i] = inputs[i] }
+            // Mix of values: quiet samples that 5× stay below the knee (must pass
+            // through linearly), zero, one just past the knee (must compress
+            // smoothly, NOT hard-clip), and loud positives/negatives whose 5×
+            // magnitude drives the tanh segment essentially to ±1 — but never past.
+            let inputs: [Float] = [0.05, -0.1, 0.0, 0.18, 0.5, -0.7]
+            let expected: [Float] = [
+                0.25,
+                -0.5,
+                0.0,
+                SystemAudioCapture.softLimit(0.9),
+                SystemAudioCapture.softLimit(2.5),
+                SystemAudioCapture.softLimit(-3.5),
+            ]
+            for i in 0..<6 { data.pointee[i] = inputs[i] }
 
             SystemAudioCapture.applyGainInPlace(buffer, gain: SystemAudioCapture.systemAudioGain)
 
-            for i in 0..<5 {
+            for i in 0..<6 {
                 let got = data.pointee[i]
                 let exp = expected[i]
                 await expect(abs(got - exp) < 1e-6,
                              "sample[\(i)] input=\(inputs[i]) expected=\(exp) got=\(got)")
             }
+
+            // Soft-limit shape: linear below the knee, monotonic, bounded by ±1,
+            // and strictly below the hard-clip value just past the knee (i.e. it
+            // actually is soft).
+            await expect(SystemAudioCapture.softLimit(0.8) == 0.8, "knee sample passes through untouched")
+            await expect(SystemAudioCapture.softLimit(0.9) < 0.9, "post-knee sample is compressed below linear")
+            await expect(SystemAudioCapture.softLimit(0.9) > 0.8, "post-knee sample stays above the knee")
+            await expect(SystemAudioCapture.softLimit(100.0) <= 1.0, "extreme sample never exceeds +1")
+            await expect(SystemAudioCapture.softLimit(-100.0) >= -1.0, "extreme sample never exceeds -1")
 
             // Sanity: applying gain to an empty buffer is a no-op, not a crash.
             guard let empty = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4) else {
@@ -282,6 +314,366 @@ struct SmokeTestRunner {
             empty.frameLength = 0
             SystemAudioCapture.applyGainInPlace(empty, gain: 5.0)
             await expect(empty.frameLength == 0, "empty buffer remains empty after applyGainInPlace")
+        }
+    }
+
+    /// Pins the live-caption display invariants of `TranscriptBuffer`: append-only
+    /// finals, one volatile row per channel, volatile consumed by the next final on
+    /// its channel regardless of ids, and containment-merging of near-duplicate
+    /// consecutive finals. These invariants are what prevent the "one phrase shows
+    /// as many lines" / "gray+white duplicate rows" transcript bugs.
+    static func runTranscriptBufferSuite() async {
+        await suite("TranscriptBuffer") {
+            func update(_ text: String, final: Bool, channel: AudioChannel = .system,
+                        id: UUID = UUID(), at: Date = Date()) -> TranscriptUpdate {
+                TranscriptUpdate(id: id, text: text, isFinal: final, channel: channel, timestamp: at)
+            }
+
+            // 1. Volatile refinements replace in place — never extra rows.
+            do {
+                let buffer = TranscriptBuffer()
+                let id = UUID()
+                await buffer.apply(update("hello", final: false, id: id))
+                await buffer.apply(update("hello world", final: false, id: id))
+                await buffer.apply(update("hello world how are", final: false, id: UUID()))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 1, "volatile refinements collapse to 1 row (got \(snap.count))")
+                await expect(snap.first?.text == "hello world how are", "volatile shows latest hypothesis")
+                await expect(snap.first?.isFinal == false, "row is still volatile")
+            }
+
+            // 2. A final consumes the channel's volatile row even under a different id.
+            do {
+                let buffer = TranscriptBuffer()
+                await buffer.apply(update("hello world", final: false, id: UUID()))
+                await buffer.apply(update("Hello, world.", final: true, id: UUID()))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 1, "final consumed the volatile row (got \(snap.count) rows)")
+                await expect(snap.first?.isFinal == true, "row got committed")
+                await expect(snap.first?.text == "Hello, world.", "final text wins")
+            }
+
+            // 3. Synthetic final then natural final (different ids, same words modulo
+            //    punctuation) merge into one committed row.
+            do {
+                let buffer = TranscriptBuffer()
+                await buffer.apply(update("we ship on friday", final: true, id: UUID()))
+                await buffer.apply(update("We ship on Friday.", final: true, id: UUID()))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 1, "containment-duplicate finals merged (got \(snap.count))")
+            }
+
+            // 4. A growing final under the SAME id updates in place.
+            do {
+                let buffer = TranscriptBuffer()
+                let id = UUID()
+                await buffer.apply(update("first half", final: true, id: id))
+                await buffer.apply(update("first half and second half", final: true, id: id))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 1, "same-id finals stay one row (got \(snap.count))")
+                await expect(snap.first?.text == "first half and second half", "same-id final grew in place")
+            }
+
+            // 5. Distinct utterances become distinct rows; channels stay independent.
+            do {
+                let buffer = TranscriptBuffer()
+                await buffer.apply(update("question from the other side", final: true, channel: .system))
+                await buffer.apply(update("my own answer", final: true, channel: .microphone))
+                await buffer.apply(update("totally new topic", final: true, channel: .system))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 3, "3 distinct finals → 3 rows (got \(snap.count))")
+            }
+
+            // 6. A genuine repeat outside the merge window is preserved as its own row.
+            do {
+                let buffer = TranscriptBuffer()
+                let earlier = Date(timeIntervalSinceNow: -60)
+                await buffer.apply(update("yeah", final: true, at: earlier))
+                await buffer.apply(update("yeah", final: true))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 2, "repeat said a minute later keeps its own row (got \(snap.count))")
+            }
+
+            // 7. An empty final never erases a live hypothesis — it commits it.
+            do {
+                let buffer = TranscriptBuffer()
+                await buffer.apply(update("don't lose me", final: false))
+                await buffer.apply(update("   ", final: true))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 1, "empty final kept the hypothesis (got \(snap.count) rows)")
+                await expect(snap.first?.isFinal == true, "hypothesis was promoted to final")
+                await expect(snap.first?.text == "don't lose me", "promoted text is intact")
+            }
+
+            // 8. Late volatile for an already-committed segment id is ignored.
+            do {
+                let buffer = TranscriptBuffer()
+                let id = UUID()
+                await buffer.apply(update("committed", final: true, id: id))
+                await buffer.apply(update("committed", final: false, id: id))
+                let snap = await buffer.snapshot()
+                await expect(snap.count == 1 && snap.first?.isFinal == true,
+                             "stale volatile can't resurrect a committed row")
+            }
+
+            // 9. lastSegment(on:) prefers the live hypothesis; lastFinalized() ignores it.
+            do {
+                let buffer = TranscriptBuffer()
+                await buffer.apply(update("done line", final: true, channel: .system))
+                await buffer.apply(update("in progress", final: false, channel: .system))
+                let last = await buffer.lastSegment(on: .system)
+                let lastFinal = await buffer.lastFinalized()
+                await expect(last?.text == "in progress", "lastSegment returns the volatile tail")
+                await expect(lastFinal?.text == "done line", "lastFinalized returns the committed line")
+            }
+        }
+    }
+
+    /// Pins `ReplayOverlapTrimmer` — the word-level dedup applied at SFSpeech task
+    /// seams, where the ~1.2 s audio replay makes the new task re-hear (and
+    /// re-transcribe) the tail of the previous utterance.
+    static func runReplayOverlapTrimmerSuite() async {
+        await suite("ReplayOverlapTrimmer") {
+            let tail = ReplayOverlapTrimmer.tailWords(of: "and that is a worthwhile trade.")
+
+            await expect(ReplayOverlapTrimmer.trim("worthwhile trade. So the next step", againstTail: tail)
+                         == "So the next step",
+                         "replayed 2-word tail is trimmed off the new hypothesis")
+            await expect(ReplayOverlapTrimmer.trim("Worthwhile TRADE so the next step", againstTail: tail)
+                         == "so the next step",
+                         "trim matches case/punctuation-insensitively, keeps original remainder")
+            await expect(ReplayOverlapTrimmer.trim("worthwhile trade.", againstTail: tail).isEmpty,
+                         "hypothesis that is pure overlap trims to empty (emission gets skipped)")
+            await expect(ReplayOverlapTrimmer.trim("Completely new sentence here", againstTail: tail)
+                         == "Completely new sentence here",
+                         "no overlap → untouched")
+            await expect(ReplayOverlapTrimmer.trim("anything at all", againstTail: [])
+                         == "anything at all",
+                         "empty tail → untouched")
+
+            // Longest match wins: tail "…is a worthwhile trade", hypothesis
+            // starting with 4 overlapping words drops all 4, not just 2.
+            await expect(ReplayOverlapTrimmer.trim("is a worthwhile trade. Moving on", againstTail: tail)
+                         == "Moving on",
+                         "longest overlapping run is trimmed")
+
+            // Only a *prefix* of the hypothesis may be trimmed — the same words
+            // appearing later in the sentence must survive.
+            await expect(ReplayOverlapTrimmer.trim("He said a worthwhile trade was made", againstTail: tail)
+                         == "He said a worthwhile trade was made",
+                         "mid-sentence repetition of the tail is not a replay overlap")
+
+            await expect(ReplayOverlapTrimmer.tailWords(of: "one two three four five six seven eight nine ten").count == ReplayOverlapTrimmer.maxWords,
+                         "tail is capped at maxWords")
+        }
+    }
+
+    /// Pins the shared containment-merge rule used by TranscriptBuffer,
+    /// ConversationContext, and transcript.md persistence.
+    static func runTranscriptDedupSuite() async {
+        await suite("TranscriptDedup") {
+            await expect(TranscriptDedup.merged(previous: "we ship on friday", incoming: "We ship on Friday.")
+                         == "We ship on Friday.",
+                         "equal content keeps the newer (better-punctuated) text")
+            await expect(TranscriptDedup.merged(previous: "Okay", incoming: "okay so the plan is ready")
+                         == "okay so the plan is ready",
+                         "growing utterance merges to the longer text")
+            await expect(TranscriptDedup.merged(previous: "The full sentence was said here.", incoming: "sentence was said")
+                         == "The full sentence was said here.",
+                         "shrunken re-emission keeps the fuller previous text")
+            await expect(TranscriptDedup.merged(previous: "we ship", incoming: "they said we shipped it") == nil,
+                         "word-level matching — 'ship' must not merge into 'shipped'")
+            await expect(TranscriptDedup.merged(previous: "totally different", incoming: "another thing entirely") == nil,
+                         "distinct utterances never merge")
+        }
+    }
+
+    /// Robustness simulations: drive `TranscriptBuffer` with the exact emission
+    /// patterns the two engines produce over LONG passages, and assert the three
+    /// user-facing guarantees: no words lost, no words duplicated, and no
+    /// utterance fragmented across multiple lines.
+    static func runTranscriptRobustnessSuite() async {
+        await suite("Transcript robustness (long-text simulations)") {
+            let paragraph = [
+                "Good morning everyone and thanks for joining the quarterly planning call on such short notice.",
+                "The main topic today is the migration of our billing pipeline to the new event driven architecture.",
+                "We estimated the work at six weeks but the proof of concept surfaced two integration risks worth discussing.",
+                "First the legacy invoice service still writes directly to the shared database which breaks our isolation model.",
+                "Second the notification system assumes synchronous confirmation and the new queue only guarantees eventual delivery.",
+                "If we cannot solve the second issue by Thursday we should descope notifications from the first milestone.",
+                "I would rather ship a smaller slice on time than slip the entire quarter for a nice to have.",
+                "Let's assign owners for both risks before we leave the call and reconvene on Monday morning.",
+            ]
+            let base = Date()
+            func normalizedWords(_ s: String) -> [String] {
+                s.split(whereSeparator: \.isWhitespace).map { ReplayOverlapTrimmer.normalizeWord($0) }.filter { !$0.isEmpty }
+            }
+
+            // ── Simulation 1: legacy SFSpeech engine over a long monologue.
+            // Per utterance: hypotheses grow a few words at a time; each new
+            // recognition task re-hears the last 3 words of the previous
+            // utterance (the audio replay buffer) which the trimmer must remove;
+            // a synthetic final fires at the VAD boundary; the recognizer's own
+            // late final for the SAME segment id lands afterwards, while the
+            // next utterance's partials are already flowing.
+            do {
+                let buffer = TranscriptBuffer()
+                var tail: [String] = []
+                var previousRawWords: [String] = []
+                var t = base
+                var lateFinal: (id: UUID, text: String)?
+
+                for sentence in paragraph {
+                    let id = UUID()
+                    let words = sentence.split(separator: " ").map(String.init)
+                    let heard = previousRawWords.suffix(3) + words   // replayed tail + real speech
+
+                    var lastEmitted = ""
+                    var step = 2
+                    while true {
+                        let raw = heard.prefix(step).joined(separator: " ")
+                        let trimmed = ReplayOverlapTrimmer.trim(raw, againstTail: tail)
+                        t.addTimeInterval(0.2)
+                        if !trimmed.isEmpty {
+                            await buffer.apply(TranscriptUpdate(id: id, text: trimmed, isFinal: false, channel: .system, timestamp: t))
+                            lastEmitted = trimmed
+                        }
+                        if step >= heard.count { break }
+                        step = min(step + 2, heard.count)
+                    }
+
+                    // The previous utterance's LATE natural final arrives now —
+                    // mid-flow of the current one, same id as its synthetic final.
+                    if let late = lateFinal {
+                        t.addTimeInterval(0.05)
+                        await buffer.apply(TranscriptUpdate(id: late.id, text: late.text, isFinal: true, channel: .system, timestamp: t))
+                        lateFinal = nil
+                    }
+
+                    // VAD boundary → synthetic final for this utterance.
+                    t.addTimeInterval(0.6)
+                    await buffer.apply(TranscriptUpdate(id: id, text: lastEmitted, isFinal: true, channel: .system, timestamp: t))
+
+                    tail = ReplayOverlapTrimmer.tailWords(of: lastEmitted)
+                    previousRawWords = words
+                    lateFinal = (id: id, text: lastEmitted)
+                }
+                if let late = lateFinal {
+                    t.addTimeInterval(0.1)
+                    await buffer.apply(TranscriptUpdate(id: late.id, text: late.text, isFinal: true, channel: .system, timestamp: t))
+                }
+
+                let rows = await buffer.snapshot()
+                await expect(rows.count == paragraph.count,
+                             "SFSpeech sim: \(paragraph.count) utterances → \(paragraph.count) lines (got \(rows.count))")
+                await expect(rows.allSatisfy { $0.isFinal },
+                             "SFSpeech sim: every line committed, no gray leftovers")
+                let got = rows.map { normalizedWords($0.text) }.flatMap { $0 }
+                let want = paragraph.map { normalizedWords($0) }.flatMap { $0 }
+                await expect(got == want,
+                             "SFSpeech sim: transcript preserves every word exactly once, in order (got \(got.count) words, want \(want.count))")
+                for (row, sentence) in zip(rows, paragraph) {
+                    await expect(normalizedWords(row.text) == normalizedWords(sentence),
+                                 "SFSpeech sim: line matches its utterance (got \"\(row.text)\")")
+                }
+            }
+
+            // ── Simulation 2: SpeechAnalyzer engine (macOS 26 path) over the
+            // same passage. Volatile results replace each other under one
+            // segment id per audio range; one final commits the range; a
+            // mid-range pre-prompt flush emits an early final under the same id
+            // and the utterance keeps growing afterwards.
+            do {
+                let buffer = TranscriptBuffer()
+                var t = base
+                for (index, sentence) in paragraph.enumerated() {
+                    let id = UUID()
+                    let words = sentence.split(separator: " ").map(String.init)
+                    var step = 3
+                    var flushed = false
+                    while true {
+                        let text = words.prefix(step).joined(separator: " ")
+                        t.addTimeInterval(0.15)
+                        await buffer.apply(TranscriptUpdate(id: id, text: text, isFinal: false, channel: .system, timestamp: t))
+                        // On every third utterance, simulate the user prompting
+                        // the AI mid-sentence: the flush commits the current
+                        // hypothesis early, then speech continues.
+                        if index % 3 == 0, !flushed, step >= words.count / 2 {
+                            t.addTimeInterval(0.05)
+                            await buffer.apply(TranscriptUpdate(id: id, text: text, isFinal: true, channel: .system, timestamp: t))
+                            flushed = true
+                        }
+                        if step >= words.count { break }
+                        step = min(step + 3, words.count)
+                    }
+                    t.addTimeInterval(0.4)
+                    await buffer.apply(TranscriptUpdate(id: id, text: sentence, isFinal: true, channel: .system, timestamp: t))
+                }
+
+                let rows = await buffer.snapshot()
+                await expect(rows.count == paragraph.count,
+                             "SpeechAnalyzer sim: \(paragraph.count) ranges → \(paragraph.count) lines (got \(rows.count))")
+                await expect(rows.allSatisfy { $0.isFinal },
+                             "SpeechAnalyzer sim: every line committed")
+                for (row, sentence) in zip(rows, paragraph) {
+                    await expect(row.text == sentence,
+                                 "SpeechAnalyzer sim: mid-utterance flush didn't truncate or split the line (got \"\(row.text)\")")
+                }
+            }
+
+            // ── Simulation 3: rapid two-channel conversation. Partials from Me
+            // and Other interleave; each channel keeps exactly one live row and
+            // committed lines land in speaking order without cross-contamination.
+            do {
+                let buffer = TranscriptBuffer()
+                var t = base
+                let meId = UUID(), otherId = UUID()
+                await buffer.apply(TranscriptUpdate(id: otherId, text: "Could you walk", isFinal: false, channel: .system, timestamp: t))
+                t.addTimeInterval(0.1)
+                await buffer.apply(TranscriptUpdate(id: meId, text: "Sure, one", isFinal: false, channel: .microphone, timestamp: t))
+                t.addTimeInterval(0.1)
+                await buffer.apply(TranscriptUpdate(id: otherId, text: "Could you walk us through the rollout plan?", isFinal: false, channel: .system, timestamp: t))
+                t.addTimeInterval(0.1)
+                await buffer.apply(TranscriptUpdate(id: meId, text: "Sure, one moment please.", isFinal: false, channel: .microphone, timestamp: t))
+
+                let live = await buffer.snapshot()
+                await expect(live.count == 2, "two channels → exactly two live rows (got \(live.count))")
+                await expect(live.contains { $0.channel == .system && $0.text == "Could you walk us through the rollout plan?" },
+                             "system row shows its own latest hypothesis")
+                await expect(live.contains { $0.channel == .microphone && $0.text == "Sure, one moment please." },
+                             "mic row shows its own latest hypothesis")
+
+                t.addTimeInterval(0.2)
+                await buffer.apply(TranscriptUpdate(id: otherId, text: "Could you walk us through the rollout plan?", isFinal: true, channel: .system, timestamp: t))
+                t.addTimeInterval(0.2)
+                await buffer.apply(TranscriptUpdate(id: meId, text: "Sure, one moment please.", isFinal: true, channel: .microphone, timestamp: t))
+
+                let done = await buffer.snapshot()
+                await expect(done.count == 2 && done.allSatisfy { $0.isFinal },
+                             "both utterances committed to exactly two lines")
+                await expect(done.first?.channel == .system && done.last?.channel == .microphone,
+                             "committed lines keep speaking order")
+            }
+
+            // ── Simulation 4: short utterances in quick succession stay
+            // separate lines (distinct text), while a double-emitted duplicate
+            // collapses.
+            do {
+                let buffer = TranscriptBuffer()
+                var t = base
+                for phrase in ["Yes.", "Okay, let's do it.", "Sounds good.", "Ship it."] {
+                    let id = UUID()
+                    t.addTimeInterval(0.3)
+                    await buffer.apply(TranscriptUpdate(id: id, text: phrase, isFinal: false, channel: .microphone, timestamp: t))
+                    t.addTimeInterval(0.3)
+                    await buffer.apply(TranscriptUpdate(id: id, text: phrase, isFinal: true, channel: .microphone, timestamp: t))
+                }
+                let rows = await buffer.snapshot()
+                await expect(rows.count == 4,
+                             "four distinct quick phrases → four lines (got \(rows.count))")
+                await expect(rows.map(\.text) == ["Yes.", "Okay, let's do it.", "Sounds good.", "Ship it."],
+                             "phrases in order, none merged or fragmented")
+            }
         }
     }
 

@@ -55,7 +55,7 @@ If you prefer the Terminal: `xattr -dr com.apple.quarantine /Applications/Whispe
 
 1. Launch — the Sessions window opens. Click **Start new** to enter the overlay.
 2. Open Settings from the overlay's `…` menu → **AI Provider** tab → paste your [Gemini API key](https://aistudio.google.com/app/apikey). Stored in Keychain.
-3. Click **▶** in the overlay. macOS will prompt for **Microphone** permission (so your own voice can be transcribed) and, on Macs where the Core Audio Process Tap fails or you've enabled "Force ScreenCaptureKit" in Settings → Capture, **Screen Recording** as well (used only for the system-audio capture path — no video is recorded). Grant whichever it asks for.
+3. Click **▶** in the overlay. macOS will prompt for **Microphone** permission (so your own voice can be transcribed) and, on Macs where the Core Audio Process Tap can't capture system audio, **Screen Recording** as well (used only for the system-audio capture path — no video is recorded). Grant whichever it asks for.
 
 ### Permissions reset every release — why?
 
@@ -63,7 +63,7 @@ macOS's privacy system (TCC) binds permission grants like Microphone and Screen 
 
 There's no script-level workaround: macOS deliberately doesn't let installers or `sudo` grant TCC permissions on the user's behalf. The fix is to sign the app with a stable Apple Developer ID, after which TCC keeps the grant across rebuilds. `bin/release` already supports this when `WP_DEVELOPER_ID` is set in the environment — adopting it just requires an [Apple Developer Program](https://developer.apple.com/programs/) membership ($99/year).
 
-If you only have a Mac mini that can't see system audio, also see **Settings → Capture → Force ScreenCaptureKit** — that switches the system-audio capture path to the one that triggers macOS's Screen Recording prompt, which is necessary on some output-device configurations where the default Core Audio Process Tap silently delivers no frames.
+If your Mac can't see system audio (typical on some Mac mini / USB / Bluetooth output configurations where the default Core Audio Process Tap silently delivers no frames), Whisper Pilot now detects it during the session and switches to the ScreenCaptureKit capture path automatically — silently when Screen Recording permission is already granted, or via a one-click prompt in the transcript pane otherwise. The choice is remembered for future sessions.
 
 ### Where to find logs after a crash
 

@@ -171,11 +171,20 @@ extension SystemAudioCapture: SCStreamOutput {
     /// one-word-per-line transcript output.
     static let systemAudioGain: Float = 5.0
 
-    /// Multiplies every float sample in `buffer` by `gain` and clamps the result
-    /// to `[-1, 1]` to avoid wraparound distortion on transients. No-op for non
-    /// float buffers — our canonical format is always Float32 so this only runs
-    /// the fast path in practice. Internal-visible so the gain contract can be
-    /// pinned by the smoke-test suite.
+    /// Onset of the soft-limiter knee: samples whose post-gain magnitude stays at
+    /// or below this pass through linearly; above it they're compressed smoothly
+    /// toward ±1 instead of being clipped flat.
+    static let softLimitKnee: Float = 0.8
+
+    /// Multiplies every float sample in `buffer` by `gain` and soft-limits the
+    /// result into `[-1, 1]`. The previous hard clamp flattened every loud
+    /// transient into a square wave — audible distortion that degraded speech
+    /// recognition on loud system audio ("garbled words"). A soft knee keeps
+    /// quiet-to-moderate samples bit-identical (full intelligibility) and bends
+    /// only the loud tail asymptotically toward ±1. No-op for non-float buffers —
+    /// our canonical format is always Float32 so this only runs the fast path in
+    /// practice. Internal-visible so the gain contract can be pinned by the
+    /// smoke-test suite.
     static func applyGainInPlace(_ buffer: AVAudioPCMBuffer, gain: Float) {
         guard let outputData = buffer.floatChannelData else { return }
         let frames = Int(buffer.frameLength)
@@ -183,9 +192,20 @@ extension SystemAudioCapture: SCStreamOutput {
         for c in 0..<channels {
             let ptr = outputData[c]
             for i in 0..<frames {
-                ptr[i] = max(-1.0, min(1.0, ptr[i] * gain))
+                ptr[i] = softLimit(ptr[i] * gain)
             }
         }
+    }
+
+    /// Linear below `softLimitKnee`, then a tanh segment that approaches ±1
+    /// asymptotically. Continuous and monotonic across the knee.
+    static func softLimit(_ sample: Float) -> Float {
+        let knee = softLimitKnee
+        let magnitude = abs(sample)
+        guard magnitude > knee else { return sample }
+        let headroom = 1.0 - knee
+        let compressed = knee + headroom * tanhf((magnitude - knee) / headroom)
+        return sample < 0 ? -compressed : compressed
     }
 
     /// RMS over whatever channel layout / sample format the buffer happens to use. We need

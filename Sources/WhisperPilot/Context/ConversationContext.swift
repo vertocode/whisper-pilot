@@ -44,6 +44,16 @@ actor ConversationContext {
         if let idx = lines.firstIndex(where: { $0.id == update.id }) {
             lines[idx].text = update.text
             lines[idx].at = update.timestamp
+        } else if let lastIdx = lines.lastIndex(where: { $0.channel == update.channel }),
+                  update.timestamp.timeIntervalSince(lines[lastIdx].at) <= TranscriptDedup.mergeWindowSeconds,
+                  let mergedText = TranscriptDedup.merged(previous: lines[lastIdx].text, incoming: update.text) {
+            // Same containment-merge as `TranscriptBuffer.applyFinal`: the
+            // recognizer finalized one utterance twice under different ids
+            // (synthetic pre-flush + natural final, or replay overlap). Keep the
+            // model's view aligned with the on-screen transcript — without this
+            // the prompt shows the utterance twice.
+            lines[lastIdx].text = mergedText
+            lines[lastIdx].at = update.timestamp
         } else {
             lines.append(Line(id: update.id, channel: update.channel, text: update.text, at: update.timestamp))
         }

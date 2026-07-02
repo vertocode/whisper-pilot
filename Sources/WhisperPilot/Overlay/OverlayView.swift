@@ -586,7 +586,11 @@ struct OverlayView: View {
                         }
                         .padding(compact ? WP.Space.sm : WP.Space.md)
                     }
-                    .onChange(of: state.transcript.last?.id) { _, _ in
+                    // Keyed on the whole segment (not just its id) so the pane
+                    // also follows a growing in-progress hypothesis: a long
+                    // sentence wraps to more lines under the same id, and
+                    // id-only tracking would leave its tail below the fold.
+                    .onChange(of: state.transcript.last) { _, _ in
                         guard let last = state.transcript.last?.id else { return }
                         withAnimation(.easeOut(duration: 0.15)) {
                             proxy.scrollTo(last, anchor: .bottom)

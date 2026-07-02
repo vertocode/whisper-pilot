@@ -9,141 +9,229 @@ struct TranscriptSegment: Sendable, Hashable, Identifiable {
     var updatedAt: Date
 }
 
-/// Rolling buffer keyed by segment ID. Partial hypotheses overwrite their slot until finalized.
-/// `snapshot()` returns the current ordered list for UI rendering; `lastFinalized()` is what the
-/// trigger engine inspects.
+/// Shared containment-merge logic for consecutive finalized transcript lines.
+/// The recognizers can legitimately finalize one utterance twice under two
+/// different segment ids (a synthetic pre-flush followed by the recognizer's
+/// own final, or replay overlap at a task seam). Every consumer of finals —
+/// the display buffer, the AI context, and transcript.md persistence — must
+/// collapse those pairs the same way, or the on-screen transcript, the
+/// model's view, and the saved file drift apart.
+enum TranscriptDedup {
+    /// How close (by wall clock) two finals must be for containment-based
+    /// merging to apply. Outside this window an identical line is far more
+    /// likely a genuine repeat ("yeah… [a minute passes] …yeah").
+    static let mergeWindowSeconds: TimeInterval = 10
+
+    /// Case- and punctuation-insensitive comparison key, so "Hello, world."
+    /// and "hello world" count as the same utterance.
+    static func normalized(_ text: String) -> String {
+        text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.union(.whitespaces).inverted)
+            .joined()
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
+    /// If `previous` and `incoming` are containment-duplicates (one's
+    /// normalized *word sequence* contains the other's as a contiguous run),
+    /// returns the text to keep — whichever is more complete. Returns nil when
+    /// they're distinct utterances. Word-level matching, not substring: "we
+    /// ship" must NOT merge into "they said we shipped it".
+    static func merged(previous: String, incoming: String) -> String? {
+        let p = normalized(previous).split(separator: " ")
+        let i = normalized(incoming).split(separator: " ")
+        guard !p.isEmpty, !i.isEmpty else { return nil }
+        // Equal content: keep the newer emission — the recognizer's own final
+        // pass carries better punctuation/casing than the synthetic pre-flush.
+        if p == i { return incoming }
+        if containsContiguousRun(haystack: p, needle: i) { return previous }
+        if containsContiguousRun(haystack: i, needle: p) { return incoming }
+        return nil
+    }
+
+    private static func containsContiguousRun(haystack: [Substring], needle: [Substring]) -> Bool {
+        guard needle.count <= haystack.count else { return false }
+        for start in 0...(haystack.count - needle.count)
+        where Array(haystack[start..<(start + needle.count)]) == needle {
+            return true
+        }
+        return false
+    }
+}
+
+/// Live-caption display model, following the pattern production captioners
+/// (Google Meet, YouTube, Teams) converge on:
+///
+/// - **Finalized segments are append-only and immutable.** Once a line is
+///   committed it never gets rewritten by a later hypothesis — the only
+///   in-place mutation allowed is a repeated final for the *same* segment id
+///   (the pre-prompt synthetic-final flush legitimately re-emits a growing
+///   final for one utterance).
+/// - **At most one volatile (in-progress) segment per channel.** Every
+///   volatile update replaces that channel's slot wholesale; the recognizer's
+///   whole-hypothesis partials are never accumulated into extra rows. This is
+///   what structurally prevents "one phrase shows up as many lines".
+/// - **A final on a channel consumes that channel's volatile slot**, whatever
+///   ids either carries. Recognizers (both SFSpeech and SpeechAnalyzer) can
+///   emit the final under a different id than the partials that preceded it;
+///   keying the volatile slot by channel instead of id is what collapses the
+///   gray-row/white-row duplicate pair.
+/// - **Consecutive finals on a channel are merged when one's normalized text
+///   contains the other's** (within a short window). That absorbs the
+///   synthetic-final → natural-final double emission and replay-overlap
+///   near-duplicates without ever suppressing a genuine repeat said minutes
+///   apart.
 actor TranscriptBuffer {
-    private var segments: [UUID: TranscriptSegment] = [:]
-    private var order: [UUID] = []
-    private static let maxSegments = 150
+    private var finals: [TranscriptSegment] = []
+    private var finalIndexByID: [UUID: Int] = [:]
+    private var volatileByChannel: [AudioChannel: TranscriptSegment] = [:]
+
+    private static let maxFinals = 150
 
     func apply(_ update: TranscriptUpdate) {
-        let incomingTrimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if var existing = segments[update.id] {
-            let existingTrimmed = existing.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Never wipe out an existing transcript with an empty update — defensive
-            // backstop in case the upstream filter doesn't catch one. The recognizer
-            // can settle on a final empty marker after a real partial; we want to
-            // keep the real text.
-            if !existingTrimmed.isEmpty && incomingTrimmed.isEmpty {
-                if update.isFinal { existing.isFinal = true }
-                existing.updatedAt = update.timestamp
-                segments[update.id] = existing
-            } else {
-                existing.text = update.text
-                existing.isFinal = update.isFinal
-                existing.updatedAt = update.timestamp
-                segments[update.id] = existing
-            }
+        let trimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if update.isFinal {
+            applyFinal(update, trimmed: trimmed)
         } else {
-            // Don't create a new segment for an empty update — that's just an empty
-            // row with a speaker label and no content.
-            guard !incomingTrimmed.isEmpty else { return }
+            applyVolatile(update, trimmed: trimmed)
+        }
+    }
 
-            // SpeechAnalyzer sometimes emits the final result for an utterance with
-            // a slightly different `CMTime` `range.start` than the volatile results
-            // that preceded it — the analyzer refines its speech-boundary detection
-            // as it sees more audio. The transcriber's range-keyed segment-id map
-            // then mints a fresh UUID, and the user ends up looking at two rows
-            // with identical text: a gray (volatile) one and a white (final) one.
-            //
-            // Catch this here: if a new update lands and a recent volatile segment
-            // on the same channel already shows the same trimmed text, treat them
-            // as one utterance. The volatile gets upgraded if the new update is
-            // final; the new emission is dropped either way. Only volatile
-            // existing segments are eligible so that a real repeated utterance
-            // ("yeah… yeah") still produces two transcript rows.
-            if let dupId = recentVolatileDuplicate(
-                text: incomingTrimmed,
-                channel: update.channel,
-                near: update.timestamp
-            ) {
-                mergeDuplicate(into: dupId, with: update)
-                return
-            }
+    private func applyVolatile(_ update: TranscriptUpdate, trimmed: String) {
+        // Empty hypotheses never earn a row.
+        guard !trimmed.isEmpty else { return }
 
-            let segment = TranscriptSegment(
+        // A volatile whose segment was already committed is the same utterance
+        // still in progress: the pre-prompt synthetic-final flush commits the
+        // hypothesis mid-speech, and the recognizer keeps refining under the
+        // same id. Grow the committed line in place (it keeps its white,
+        // finalized styling) rather than resurrecting a gray duplicate below it
+        // — or worse, dropping the rest of the sentence from the display.
+        if let idx = finalIndexByID[update.id] {
+            finals[idx].text = update.text
+            finals[idx].updatedAt = update.timestamp
+            return
+        }
+
+        if let existing = volatileByChannel[update.channel] {
+            volatileByChannel[update.channel] = TranscriptSegment(
                 id: update.id,
                 text: update.text,
-                isFinal: update.isFinal,
+                isFinal: false,
+                channel: update.channel,
+                startedAt: existing.startedAt,
+                updatedAt: update.timestamp
+            )
+        } else {
+            volatileByChannel[update.channel] = TranscriptSegment(
+                id: update.id,
+                text: update.text,
+                isFinal: false,
                 channel: update.channel,
                 startedAt: update.timestamp,
                 updatedAt: update.timestamp
             )
-            segments[update.id] = segment
-            order.append(update.id)
-            if order.count > Self.maxSegments {
-                let excess = order.count - Self.maxSegments
-                for id in order.prefix(excess) { segments.removeValue(forKey: id) }
-                order.removeFirst(excess)
-            }
         }
     }
 
-    /// Finds an existing *volatile* segment on the same channel whose trimmed
-    /// text exactly matches `text` and whose latest update is within
-    /// `duplicateWindowSeconds` of `timestamp`. Returns the segment id or nil.
-    /// We scan only the tail of `order` because older segments aren't candidates
-    /// for the volatile→final transition we're trying to collapse.
-    private func recentVolatileDuplicate(
-        text: String,
-        channel: AudioChannel,
-        near timestamp: Date
-    ) -> UUID? {
-        for id in order.suffix(8) {
-            guard let seg = segments[id], seg.channel == channel else { continue }
-            // Skip already-finalized segments. A finalized line with matching text
-            // is more likely a genuine repeat than a duplicate emission, so we
-            // preserve it as its own row.
-            guard !seg.isFinal else { continue }
-            let segTrimmed = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if segTrimmed == text,
-               timestamp.timeIntervalSince(seg.updatedAt) <= Self.duplicateWindowSeconds {
-                return id
+    private func applyFinal(_ update: TranscriptUpdate, trimmed: String) {
+        // Repeated final for an already-committed segment: refresh its text in
+        // place (the synthetic-final flush re-emits one utterance as it grows).
+        if let idx = finalIndexByID[update.id] {
+            if !trimmed.isEmpty {
+                finals[idx].text = update.text
             }
+            finals[idx].updatedAt = update.timestamp
+            if volatileByChannel[update.channel]?.id == update.id {
+                volatileByChannel[update.channel] = nil
+            }
+            return
         }
-        return nil
+
+        // The final supersedes whatever hypothesis was showing on this channel.
+        let consumedVolatile = volatileByChannel.removeValue(forKey: update.channel)
+
+        guard !trimmed.isEmpty else {
+            // Recognizers emit empty finals on session boundaries. Never let one
+            // erase real text: if a hypothesis was on screen, commit it instead.
+            if let vol = consumedVolatile,
+               !vol.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                appendFinal(TranscriptSegment(
+                    id: vol.id,
+                    text: vol.text,
+                    isFinal: true,
+                    channel: vol.channel,
+                    startedAt: vol.startedAt,
+                    updatedAt: update.timestamp
+                ))
+            }
+            return
+        }
+
+        // Containment merge against the previous final on this channel. Catches
+        // the synthetic-final → natural-final pair (same utterance, different
+        // ids) and replay-overlap near-duplicates at task boundaries.
+        if let lastIdx = lastFinalIndex(on: update.channel),
+           update.timestamp.timeIntervalSince(finals[lastIdx].updatedAt) <= TranscriptDedup.mergeWindowSeconds,
+           let mergedText = TranscriptDedup.merged(previous: finals[lastIdx].text, incoming: update.text) {
+            finals[lastIdx].text = mergedText
+            finals[lastIdx].updatedAt = update.timestamp
+            finalIndexByID[update.id] = lastIdx
+            return
+        }
+
+        appendFinal(TranscriptSegment(
+            id: update.id,
+            text: update.text,
+            isFinal: true,
+            channel: update.channel,
+            // Anchor the committed line where its hypothesis started so the row
+            // doesn't jump when the volatile flips to final.
+            startedAt: consumedVolatile?.startedAt ?? update.timestamp,
+            updatedAt: update.timestamp
+        ))
     }
 
-    /// Collapses the incoming update onto the existing volatile segment we
-    /// matched in `recentVolatileDuplicate`. If the incoming is final, promote
-    /// the existing to final so the gray row turns white. If the incoming is
-    /// also volatile, just refresh the timestamp — the existing already has
-    /// the same text, and we don't want a second gray row.
-    private func mergeDuplicate(into existingId: UUID, with update: TranscriptUpdate) {
-        guard var existing = segments[existingId] else { return }
-        if update.isFinal { existing.isFinal = true }
-        existing.updatedAt = update.timestamp
-        segments[existingId] = existing
+    private func appendFinal(_ segment: TranscriptSegment) {
+        finals.append(segment)
+        finalIndexByID[segment.id] = finals.count - 1
+        if finals.count > Self.maxFinals {
+            let excess = finals.count - Self.maxFinals
+            finals.removeFirst(excess)
+            finalIndexByID = Dictionary(
+                uniqueKeysWithValues: finals.enumerated().map { ($0.element.id, $0.offset) }
+            )
+        }
     }
 
-    private static let duplicateWindowSeconds: TimeInterval = 6
+    private func lastFinalIndex(on channel: AudioChannel) -> Int? {
+        finals.lastIndex(where: { $0.channel == channel })
+    }
 
+    /// Ordered list for UI rendering: committed lines first (chronological),
+    /// then the in-progress hypothesis rows (at most one per channel).
     func snapshot() -> [TranscriptSegment] {
-        order.compactMap { segments[$0] }
+        finals + volatileByChannel.values.sorted { $0.startedAt < $1.startedAt }
     }
 
     func lastFinalized() -> TranscriptSegment? {
-        for id in order.reversed() {
-            if let s = segments[id], s.isFinal { return s }
-        }
-        return nil
+        finals.last
     }
 
-    /// Most recent segment on the given channel regardless of finalization state.
-    /// Used by the trigger engine so we can react to a question the *moment* the
-    /// speaker pauses, instead of waiting for SFSpeech to finalize — which with
-    /// `utteranceBoundary = .auto` can take 30+ seconds.
+    /// Most recent segment on the given channel regardless of finalization
+    /// state. The trigger engine uses this to react to a question the moment
+    /// the speaker pauses, before the recognizer finalizes.
     func lastSegment(on channel: AudioChannel) -> TranscriptSegment? {
-        for id in order.reversed() {
-            if let s = segments[id], s.channel == channel { return s }
+        if let vol = volatileByChannel[channel] { return vol }
+        for segment in finals.reversed() where segment.channel == channel {
+            return segment
         }
         return nil
     }
 
     func clear() {
-        segments.removeAll()
-        order.removeAll()
+        finals.removeAll()
+        finalIndexByID.removeAll()
+        volatileByChannel.removeAll()
     }
 }

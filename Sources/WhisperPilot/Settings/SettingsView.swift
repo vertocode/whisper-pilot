@@ -86,15 +86,6 @@ struct SettingsView: View {
                 FormHint("Used by the speech recognizer. Match the language of the audio you're transcribing.")
             }
 
-            Section {
-                Picker("Transcript line break", selection: $store.utteranceBoundary) {
-                    ForEach(UtteranceBoundary.allCases, id: \.self) { boundary in
-                        Text(boundary.displayName).tag(boundary)
-                    }
-                }
-                FormHint(store.utteranceBoundary.description)
-            }
-
             Section("Performance safety valve") {
                 Toggle("Enable safety valve", isOn: $store.safetyValveEnabled)
                 FormHint("Watches this app's own CPU, memory, and thermal state while listening and backs off before your Mac freezes: a soft pause of AI auto-suggestions first, then a full stop if load stays high. Turn off to revert to the old no-limit behavior. Live numbers appear in the overlay's Diagnostics panel.")
@@ -338,10 +329,6 @@ struct SettingsView: View {
                 Toggle("Always transcribe my mic", isOn: $store.alwaysTranscribeMic)
                     .disabled(!store.captureMicrophone)
                 FormHint("When off, a new session starts with your mic muted — system audio (\"Other\") still transcribes, but your own voice is skipped until you unmute with the in-session mic toggle. Useful if you rarely need your own speech transcribed and want to avoid the mic recognizer's cost. Has no effect when microphone capture above is off.")
-            }
-            Section("System audio capture method") {
-                Toggle("Force ScreenCaptureKit (requires Screen Recording permission)", isOn: $store.forceScreenCaptureKitForSystemAudio)
-                FormHint("By default Whisper Pilot uses Core Audio Process Taps (macOS 14.4+) which capture system audio without asking for Screen Recording permission. On some Macs the Process Tap reports success but silently delivers no frames — if you see “Mic is delivering audio but no system audio frames” in the transcript pane, flip this on. macOS will then ask for Screen Recording permission on the next Play, and system audio capture should start working.")
             }
         }
         .formStyle(.grouped)

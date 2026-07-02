@@ -230,24 +230,13 @@ final class ProcessAudioCapture {
         // `StreamingAudioConverter` for the full story.
         guard let outputBuffer = StreamingAudioConverter.convert(inputBuffer, using: converter, label: "ProcessAudio") else { return }
 
-        // Apply 5× gain to system audio. The macOS audio mixdown that Process Tap
+        // Apply gain to system audio. The macOS audio mixdown that Process Tap
         // captures is typically much quieter than microphone input — usually below
         // SFSpeech's internal speech-detection threshold (verified: live RMS ≈ 0.0067
         // vs typical mic speech RMS ≈ 0.05). Boosting the signal so the recognizer
-        // actually treats it as speech.
-        if let outputData = outputBuffer.floatChannelData {
-            let gain: Float = 5.0
-            let frames = Int(outputBuffer.frameLength)
-            let channels = Int(outputBuffer.format.channelCount)
-            for c in 0..<channels {
-                let ptr = outputData[c]
-                for i in 0..<frames {
-                    let amplified = ptr[i] * gain
-                    // Clamp to [-1, 1] to avoid wraparound distortion on transients.
-                    ptr[i] = max(-1.0, min(1.0, amplified))
-                }
-            }
-        }
+        // actually treats it as speech. Shared soft-limiting gain helper — a hard
+        // clamp here used to square-wave loud transients and garble recognition.
+        SystemAudioCapture.applyGainInPlace(outputBuffer, gain: SystemAudioCapture.systemAudioGain)
 
         framesEmitted += 1
         if framesEmitted < 5 || framesEmitted % 200 == 0 {

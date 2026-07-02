@@ -117,9 +117,9 @@ private final class ChannelPipe {
     private var isFinished: Bool = false
     private let mutex = NSLock()
     /// Last non-empty partial text seen for the current `segmentId`. SFSpeech
-    /// will only emit `isFinal=true` if we call `endAudio()` on its request, and
-    /// our default `utteranceBoundary = .auto` setting deliberately never does
-    /// that. Without a synthetic final the partials never reach
+    /// will only emit `isFinal=true` if we call `endAudio()` on its request,
+    /// which normally happens only at VAD utterance boundaries. Between
+    /// boundaries, without a synthetic final the partials never reach
     /// `ConversationContext.absorb` (which gates on `isFinal`), the AI never
     /// sees what the user said, and `transcript.md` stays empty. We remember
     /// the last partial and re-emit it as `isFinal=true` whenever the segment
@@ -138,6 +138,17 @@ private final class ChannelPipe {
     private var replayBuffers: [AVAudioPCMBuffer] = []
     private var replaySecondsBuffered: Double = 0
     private static let replayMaxSeconds: Double = 1.2
+    /// Normalized tail words of the most recent finalized text on this channel,
+    /// and when it was finalized. The replay buffer above deliberately re-feeds
+    /// the last ~1.2 s of audio into every fresh request so no words are lost at
+    /// task boundaries — the cost is that the new task's hypothesis often begins
+    /// with words the previous final already committed. We trim that overlap at
+    /// the text level: if a new hypothesis arrives shortly after a final and its
+    /// leading words match the final's trailing words (case/punctuation
+    /// insensitive), the duplicated prefix is dropped before emission.
+    private var lastFinalTailWords: [String] = []
+    private var lastFinalAt: Date?
+    private static let overlapTrimWindowSeconds: TimeInterval = 4
 
     init(channel: AudioChannel, locale: Locale, sink: AsyncStream<TranscriptUpdate>.Continuation, log: Logger, autoRestart: Bool = true) throws {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
@@ -288,6 +299,7 @@ private final class ChannelPipe {
         // don't double-emit. A later natural-final from SFSpeech (or a new
         // partial) will reset this flag and re-arm flushing.
         pendingSegmentHasNaturalFinal = true
+        if needs { recordFinalizedTextLocked(text) }
         mutex.unlock()
         guard needs else { return nil }
         let update = TranscriptUpdate(
@@ -316,6 +328,7 @@ private final class ChannelPipe {
         pendingSegmentLastText = ""
         pendingSegmentHasNaturalFinal = false
         segmentId = UUID()
+        if needs { recordFinalizedTextLocked(text) }
         mutex.unlock()
         if needs {
             sink.yield(TranscriptUpdate(
@@ -329,6 +342,30 @@ private final class ChannelPipe {
         }
     }
 
+    /// Records the tail of a just-finalized text so the next hypothesis (which
+    /// starts from replayed audio) can have its duplicated prefix trimmed.
+    /// Caller must hold `mutex`.
+    private func recordFinalizedTextLocked(_ text: String) {
+        lastFinalTailWords = ReplayOverlapTrimmer.tailWords(of: text)
+        lastFinalAt = Date()
+    }
+
+    /// Drops the leading words of `text` that duplicate the trailing words of
+    /// the previous final on this channel. Only applies within
+    /// `overlapTrimWindowSeconds` of that final — beyond it, matching words are
+    /// far more likely a genuine repetition than replay overlap. Returns the
+    /// (possibly empty) remainder.
+    private func trimReplayOverlap(_ text: String) -> String {
+        mutex.lock()
+        let tail = lastFinalTailWords
+        let finalAt = lastFinalAt
+        mutex.unlock()
+        guard let finalAt,
+              Date().timeIntervalSince(finalAt) <= Self.overlapTrimWindowSeconds,
+              !tail.isEmpty else { return text }
+        return ReplayOverlapTrimmer.trim(text, againstTail: tail)
+    }
+
     private func startTask() {
         // Reserve the task slot under the mutex so concurrent callers (append
         // from the audio thread + cycleAtBoundary from main, etc.) can't both
@@ -337,6 +374,13 @@ private final class ChannelPipe {
         guard !isFinished else { mutex.unlock(); return }
         guard task == nil else { mutex.unlock(); return }
         let currentRequest = request
+        // The segment this task transcribes into. `segmentId` only advances at
+        // points that also replace the request + task (natural final, VAD cycle,
+        // restart, empty final), so one task maps to exactly one segment — and a
+        // *late* callback from a replaced task must attribute its text to the
+        // segment the task was created for, never to whatever the shared
+        // `segmentId` has moved on to.
+        let taskSegmentId = segmentId
         mutex.unlock()
 
         var firstCallback = true
@@ -346,9 +390,26 @@ private final class ChannelPipe {
                 wpInfo("Transcriber.\(channel) recognitionTask first callback (result=\(result != nil), error=\(error != nil))")
                 firstCallback = false
             }
+            // True while this callback belongs to the task on the *current*
+            // request. `cycleAtBoundary` / `scheduleRestart` swap the request and
+            // start a fresh task, but the old task can still deliver late results
+            // afterwards (endAudio commonly produces one last isFinal). A stale
+            // callback must never mutate the shared segment/pending state or run
+            // the task-lifecycle actions (continueAfterFinalization /
+            // scheduleRestart) — those belong to the *new* task now. Its final
+            // text is still valuable (SFSpeech's closing pass adds punctuation
+            // and fixes words), so we emit it under `taskSegmentId`, where all
+            // id-keyed consumers merge it into the already-flushed synthetic
+            // final in place.
+            let isCurrent: () -> Bool = { [weak self] in
+                guard let self else { return false }
+                self.mutex.lock()
+                defer { self.mutex.unlock() }
+                return self.request === currentRequest
+            }
             if let result {
-                let text = result.bestTranscription.formattedString
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let rawText = result.bestTranscription.formattedString
+                let rawTrimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 // SFSpeech sometimes emits empty-text results — typically partials with
                 // empty content during state transitions, or empty isFinal markers on
@@ -356,23 +417,86 @@ private final class ChannelPipe {
                 // with no text or, worse, overwrites the previous segment's real text
                 // with "". Drop them at the source. Still rotate `segmentId` on empty
                 // finals so the next non-empty result starts a fresh transcript line.
-                if trimmed.isEmpty {
-                    if result.isFinal {
+                if rawTrimmed.isEmpty {
+                    if result.isFinal, isCurrent() {
                         self.emitSyntheticFinalIfPendingAndAdvanceSegment()
                         self.continueAfterFinalization()
                         // Don't fall through to error handling — we've already replaced
                         // the request + task. A delayed scheduleRestart from a stale
                         // error on the same callback would clobber the new request and
                         // discard everything appended in the meantime.
-                        return
                     }
                     return
                 }
 
+                // Strip words duplicated by the replay buffer at the previous task
+                // boundary. If the whole hypothesis is overlap (the new task has
+                // only re-heard replayed audio so far), skip the emission entirely —
+                // otherwise we'd commit a line that duplicates the previous final.
+                let text = self.trimReplayOverlap(rawTrimmed)
+                if text.isEmpty {
+                    if result.isFinal, isCurrent() { self.continueAfterFinalization() }
+                    return
+                }
+
+                if result.isFinal {
+                    // Check-and-mutate under one lock acquisition so a concurrent
+                    // cycle/restart can't swap the request between the staleness
+                    // check and the state reset.
+                    self.mutex.lock()
+                    let current = self.request === currentRequest
+                    if current {
+                        self.segmentId = UUID()
+                        self.pendingSegmentLastText = ""
+                        self.pendingSegmentHasNaturalFinal = false
+                        // Only a current final may update the shared overlap-trim
+                        // tail. A stale final's tail was already recorded by the
+                        // synthetic flush that replaced its task; re-recording it
+                        // here would move `lastFinalAt` forward and could trim
+                        // words off the utterance the *new* task is transcribing.
+                        self.recordFinalizedTextLocked(text)
+                    }
+                    self.mutex.unlock()
+
+                    let update = TranscriptUpdate(
+                        id: taskSegmentId,
+                        text: text,
+                        isFinal: true,
+                        channel: channel,
+                        timestamp: Date()
+                    )
+                    sink.yield(update)
+                    transcriptsEmitted += 1
+                    wpInfo("Transcriber.\(channel) FINAL\(current ? "" : " (late)"): \"\(text)\"")
+                    if current { self.continueAfterFinalization() }
+                    // Don't fall through to the error branch — see comment above.
+                    return
+                }
+
+                // Partial. A stale task's partial describes audio the synthetic
+                // final at swap time already covered — emitting it would fight
+                // the new task's hypothesis for the display. Drop it.
+                self.mutex.lock()
+                let current = self.request === currentRequest
+                if current {
+                    // Remember the latest partial so we can synthesize an
+                    // isFinal=true from it if SFSpeech never delivers one
+                    // (endAudio only happens at VAD boundaries, so mid-utterance
+                    // the only natural finals come from silence timeouts that we
+                    // explicitly catch as errors). Also clear `hasNaturalFinal`
+                    // so the next flush (synthetic or natural) re-emits — the new
+                    // partial means the previous final no longer reflects what's
+                    // being said.
+                    self.pendingSegmentLastText = text
+                    self.pendingSegmentHasNaturalFinal = false
+                }
+                self.mutex.unlock()
+                guard current else { return }
+
                 let update = TranscriptUpdate(
-                    id: segmentId,
+                    id: taskSegmentId,
                     text: text,
-                    isFinal: result.isFinal,
+                    isFinal: false,
                     channel: channel,
                     timestamp: Date()
                 )
@@ -381,33 +505,6 @@ private final class ChannelPipe {
                 if transcriptsEmitted == 1 {
                     wpInfo("Transcriber.\(channel) FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
                 }
-                if result.isFinal {
-                    // SFSpeech naturally finalized — consumers got their
-                    // isFinal=true via the yield above. Just reset pending state
-                    // and advance the segment id for the next utterance.
-                    self.mutex.lock()
-                    self.segmentId = UUID()
-                    self.pendingSegmentLastText = ""
-                    self.pendingSegmentHasNaturalFinal = false
-                    self.mutex.unlock()
-                    wpInfo("Transcriber.\(channel) FINAL: \"\(update.text)\"")
-                    self.continueAfterFinalization()
-                    // See comment above — don't fall through to the error branch.
-                    return
-                } else {
-                    // Remember the latest partial so we can synthesize an
-                    // isFinal=true from it if SFSpeech never delivers one (the
-                    // default `utteranceBoundary = .auto` path never calls
-                    // endAudio, so the only natural finals come from silence
-                    // timeouts that we explicitly catch as errors). Also clear
-                    // `hasNaturalFinal` so the next flush (synthetic or natural)
-                    // re-emits — the new partial means the previous final no
-                    // longer reflects what's being said.
-                    self.mutex.lock()
-                    self.pendingSegmentLastText = text
-                    self.pendingSegmentHasNaturalFinal = false
-                    self.mutex.unlock()
-                }
             }
             if let error {
                 // "No speech detected" (SFSpeech error 1110) is benign — it fires after
@@ -415,6 +512,14 @@ private final class ChannelPipe {
                 // silence too long. Log at info, not error, so it doesn't spam the
                 // user's alert badge during a quiet conversation.
                 let nserror = error as NSError
+                // Code 216 is "recognition request was canceled" — the deliberate
+                // outcome of cycleAtBoundary / scheduleRestart / stop cancelling the
+                // old task, which have already flushed pending text and installed a
+                // replacement. Reacting to it (synthetic flush + restart) would
+                // fire against the *new* segment's state.
+                if nserror.domain == "kAFAssistantErrorDomain" && nserror.code == 216 {
+                    return
+                }
                 let isNoSpeech = nserror.domain == "kAFAssistantErrorDomain" && nserror.code == 1110
                 if isNoSpeech {
                     wpInfo("Transcriber.\(channel) silence timeout (no speech in window) — task will reattach when speech resumes")
@@ -426,7 +531,11 @@ private final class ChannelPipe {
                 // transcript.md persistence) see *something* for this utterance —
                 // without it the user speaks, sees the live transcript, and then
                 // the AI claims to not know what was said because no isFinal=true
-                // ever reached the context.
+                // ever reached the context. Stale errors (from a task that a
+                // cycle/restart already replaced) get neither the flush nor the
+                // restart: the swap that replaced them flushed already, and
+                // touching the shared state now would corrupt the new segment.
+                guard isCurrent() else { return }
                 self.emitSyntheticFinalIfPendingAndAdvanceSegment()
                 if self.autoRestart {
                     self.scheduleRestart()
@@ -530,6 +639,49 @@ private final class ChannelPipe {
         startTask()
     }
 
+}
+
+/// Pure word-overlap trimming used by `AppleSpeechTranscriber` at task seams.
+/// The replay buffer re-feeds the last ~1.2 s of audio into every fresh
+/// recognition request so no words are lost at a task boundary; the cost is
+/// that the new task's hypothesis usually begins with words the previous final
+/// already committed. This trims that duplicated prefix at the text level.
+/// Extracted as a standalone enum so the smoke-test suite can pin its behavior.
+enum ReplayOverlapTrimmer {
+    /// Longest overlap we look for. ~1.2 s of speech is at most ~5–6 words; 8
+    /// gives margin without risking eating a genuinely repeated long phrase.
+    static let maxWords = 8
+
+    /// Case/punctuation-insensitive word key used for overlap matching.
+    static func normalizeWord(_ word: Substring) -> String {
+        word.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
+    /// Normalized tail (up to `maxWords`) of a finalized text, for matching
+    /// against the next hypothesis's prefix.
+    static func tailWords(of text: String) -> [String] {
+        text.split(whereSeparator: \.isWhitespace)
+            .suffix(maxWords)
+            .map(normalizeWord)
+            .filter { !$0.isEmpty }
+    }
+
+    /// Drops the longest leading run of words in `text` that matches a trailing
+    /// run of `tail` (both normalized). Returns the (possibly empty) remainder
+    /// with original casing/punctuation preserved.
+    static func trim(_ text: String, againstTail tail: [String]) -> String {
+        guard !tail.isEmpty else { return text }
+        let words = text.split(whereSeparator: \.isWhitespace)
+        let normalized = words.map(normalizeWord)
+        let maxOverlap = min(tail.count, normalized.count)
+        var overlap = 0
+        for k in stride(from: maxOverlap, through: 1, by: -1) where Array(tail.suffix(k)) == Array(normalized.prefix(k)) {
+            overlap = k
+            break
+        }
+        guard overlap > 0 else { return text }
+        return words.dropFirst(overlap).joined(separator: " ")
+    }
 }
 
 enum TranscriberError: LocalizedError {

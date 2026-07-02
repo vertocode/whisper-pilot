@@ -60,9 +60,9 @@ protocol TranscriptionProvider {
 
 `TranscriptUpdate` carries `(segmentId, text, isFinal, channel, timestamp)` — `channel` is preserved end-to-end so the overlay shows `OTHER:` vs `ME:` and the trigger engine can ignore the user's own utterances.
 
-The default implementation, `AppleSpeechTranscriber`, runs two `SFSpeechRecognizer` pipes in parallel — one per channel — with `requiresOnDeviceRecognition` set when the locale supports it. Drop-in alternatives planned: `WhisperKitTranscriber` (Core ML, runs on the ANE on Apple Silicon), `WhisperCppTranscriber`.
+On macOS 26+ the default implementation is `SpeechAnalyzerTranscriber` (Apple's long-form `SpeechAnalyzer`/`SpeechTranscriber` framework); older systems fall back to `AppleSpeechTranscriber`, which runs two `SFSpeechRecognizer` pipes in parallel — one per channel — cycling its recognition tasks at VAD utterance boundaries and trimming replay overlap at task seams. Selection is automatic; there is no user-facing engine setting.
 
-`TranscriptBuffer` is a rolling actor-backed buffer keyed by segment ID. Partial hypotheses overwrite their slot until they're finalized. The buffer publishes its current state to `OverlayState` and its finalized lines to `ConversationContext`.
+`TranscriptBuffer` is an actor holding the live-caption display model: finalized segments are append-only and immutable, and each channel has at most one volatile (in-progress) segment that partial hypotheses replace wholesale. A final on a channel consumes that channel's volatile slot, and consecutive near-duplicate finals are merged. The buffer publishes its current state to `OverlayState`; finalized lines flow to `ConversationContext`.
 
 ### 3. Context
 

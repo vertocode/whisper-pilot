@@ -2,52 +2,6 @@ import Combine
 import Foundation
 import SwiftUI
 
-/// When to start a new transcript line. `auto` lets the speech recognizer finalize on
-/// its own (no time-based cutting — long single utterances stay on one line). The other
-/// options force a line break after the chosen pause length.
-enum UtteranceBoundary: String, CaseIterable, Codable, Sendable {
-    case auto      // No time-based cycling. Trust SFSpeech's natural finalization.
-    case quick     // 1.5 s
-    case normal    // 3 s
-    case relaxed   // 5 s
-    case patient   // 10 s
-    case minute    // 60 s
-
-    /// Returns nil for `.auto` (no scheduled cycle).
-    var seconds: TimeInterval? {
-        switch self {
-        case .auto: return nil
-        case .quick: return 1.5
-        case .normal: return 3
-        case .relaxed: return 5
-        case .patient: return 10
-        case .minute: return 60
-        }
-    }
-
-    var displayName: String {
-        switch self {
-        case .auto: return "Auto (no time-based cuts)"
-        case .quick: return "Quick (1.5 s pause)"
-        case .normal: return "Normal (3 s pause)"
-        case .relaxed: return "Relaxed (5 s pause)"
-        case .patient: return "Patient (10 s pause)"
-        case .minute: return "Every minute"
-        }
-    }
-
-    var description: String {
-        switch self {
-        case .auto: return "Default. Lines are split only when the speech recognizer naturally finishes — no artificial cutting on pauses."
-        case .quick: return "Snappy line breaks for crisp, fast-paced speech."
-        case .normal: return "Splits lines on a 3-second pause."
-        case .relaxed: return "Tolerates longer thinking pauses without splitting."
-        case .patient: return "For very slow speakers or long monologues."
-        case .minute: return "Forces a new line every 60 seconds, regardless of speech."
-        }
-    }
-}
-
 @MainActor
 final class SettingsStore: ObservableObject {
     private enum Keys {
@@ -79,7 +33,6 @@ final class SettingsStore: ObservableObject {
         static let geminiAPIKey = "gemini.api_key"
         static let anthropicAPIKey = "anthropic.api_key"
         static let microphoneDeviceUID = "capture.microphoneDeviceUID"
-        static let utteranceBoundary = "transcription.utteranceBoundary"
         static let autoDetectQuestionsEnabled = "ai.autoDetectQuestionsEnabled"      // legacy bool — migrated into the per-channel pair below
         static let autoDetectQuestionsFromOther = "ai.autoDetectQuestionsFromOther"
         static let autoDetectQuestionsFromMe    = "ai.autoDetectQuestionsFromMe"
@@ -119,9 +72,13 @@ final class SettingsStore: ObservableObject {
     /// preferred by default because it doesn't ask for Screen Recording
     /// permission, but on some Macs (notably some Mac mini configurations) it
     /// creates without error and then silently delivers zero frames — system
-    /// audio never reaches the transcriber. Flipping this on forces SCK, which
-    /// triggers macOS's Screen Recording permission prompt and reliably
-    /// captures system audio in those environments.
+    /// audio never reaches the transcriber.
+    ///
+    /// Not user-facing. The coordinator's silent-tap watchdog manages this flag
+    /// itself: when the tap is provably silent while the mic transcribes fine,
+    /// it switches to SCK automatically (silently when Screen Recording is
+    /// already granted, via a one-click confirmation note otherwise) and the
+    /// choice persists so every later session starts on the working path.
     @Published var forceScreenCaptureKitForSystemAudio: Bool {
         didSet { defaults.set(forceScreenCaptureKitForSystemAudio, forKey: Keys.forceScreenCaptureKitForSystemAudio) }
     }
@@ -307,10 +264,6 @@ final class SettingsStore: ObservableObject {
                 defaults.removeObject(forKey: Keys.microphoneDeviceUID)
             }
         }
-    }
-
-    @Published var utteranceBoundary: UtteranceBoundary {
-        didSet { defaults.set(utteranceBoundary.rawValue, forKey: Keys.utteranceBoundary) }
     }
 
     /// Auto-fire the AI when "Other" (system audio) asks a question. Default on —
@@ -550,7 +503,6 @@ final class SettingsStore: ObservableObject {
         self.overlayCompactChrome = defaults.object(forKey: Keys.overlayCompactChrome) as? Bool ?? false
         self.localeIdentifier = defaults.string(forKey: Keys.localeIdentifier) ?? Locale.current.identifier
         self.microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
-        self.utteranceBoundary = UtteranceBoundary(rawValue: defaults.string(forKey: Keys.utteranceBoundary) ?? "") ?? .auto
         // AI behavior toggles default to true so the assistant works the way users
         // expect on first launch. Existing settings persist; only fresh installs see
         // the defaults.

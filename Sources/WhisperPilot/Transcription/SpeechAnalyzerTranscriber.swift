@@ -1,5 +1,4 @@
 import AVFoundation
-import CoreMedia
 import Foundation
 import Speech
 
@@ -12,8 +11,9 @@ import Speech
 /// - no "No speech detected" silence-timeout failure mode
 /// - no manual VAD-driven `cycleAtBoundary`/`continueAfterFinalization` cycling — the
 ///   analyzer emits volatile partials that flip to finalized on its own boundary calls
-/// - finalization signal comes from the analyzer's `volatileRange` rather than the
-///   recognizer's per-task `isFinal` flag
+/// - finalization signal is `result.isFinal` on each `SpeechTranscriber.Result`:
+///   volatile results replace each other for the current audio range until one
+///   finalized (immutable, non-overlapping) result commits it
 @available(macOS 26.0, *)
 final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendable {
     let transcripts: AsyncStream<TranscriptUpdate>
@@ -139,34 +139,14 @@ private final class Pipe: @unchecked Sendable {
 
     private let mutex = NSLock()
     private var isFinished = false
-    /// Active segment id reused for emissions on this channel that arrive within
-    /// `coalesceWindowSeconds` of the previous one. The recognizer's progressive
-    /// transcription mode emits many results per second with refining hypotheses —
-    /// keying segment ids by `range.start` made each refinement its own transcript
-    /// line, so a single phrase ended up split across dozens of partial fragments
-    /// in the live UI, the AI context, and transcript.md. Reusing the same id
-    /// while the emission cadence is hot collapses those refinements into one
-    /// segment that updates in place across all three downstream consumers
-    /// (`TranscriptBuffer.apply` overwrites same-id segments, `ConversationContext`
-    /// dedupes by id, `queueTranscriptPersistence` replaces in-memory pending
-    /// without touching disk). The trade-off is that two genuinely distinct short
-    /// utterances spoken within ~1s of each other collapse into one row — but
-    /// real phrase boundaries from a human speaker virtually always carry a
-    /// breath / pause longer than that, so the trade is worth it for the
-    /// dramatic noise reduction on noisy audio paths (Process Tap without
-    /// ScreenCaptureKit in particular).
-    private var activeSegmentId: UUID?
-    private var lastEmissionAt: Date?
-    private static let coalesceWindowSeconds: TimeInterval = 1.2
-    /// Start of the analyzer's current volatile (unfinalized) audio range. A result is
-    /// considered final once its range ends at or before this point. Updated by the
-    /// `volatileRangeChangedHandler` we install on the analyzer.
-    ///
-    /// We track it separately from "have we ever received a handler callback" because
-    /// before the first callback `volatileStart` is `.zero`, and treating that as the
-    /// finalization frontier would incorrectly mark every very early result as final.
-    private var volatileStart: CMTime = .zero
-    private var hasVolatileRange = false
+    /// Segment id for the analyzer's *current* audio range. The WWDC25 contract:
+    /// volatile results for a range keep replacing each other until one last
+    /// finalized result commits that range, after which the transcriber moves
+    /// on to the next range. We mint one id when a range's first result arrives,
+    /// reuse it for every volatile refinement, emit the final under it, then
+    /// clear it so the next range starts a fresh transcript line. No wall-clock
+    /// heuristics — segment identity tracks the analyzer's own range lifecycle.
+    private var currentSegmentId: UUID?
     private var buffersFed: Int = 0
     private var resultsSeen: Int = 0
     /// Latest hypothesis for the active segment, plus whether the analyzer has
@@ -258,7 +238,6 @@ private final class Pipe: @unchecked Sendable {
             converter: converter,
             sink: sink
         )
-        await pipe.installVolatileRangeHandler()
         pipe.startConsumingResults()
         return pipe
     }
@@ -332,16 +311,6 @@ private final class Pipe: @unchecked Sendable {
         }
     }
 
-    private func installVolatileRangeHandler() async {
-        await analyzer.setVolatileRangeChangedHandler { [weak self] range, _, _ in
-            guard let self else { return }
-            self.mutex.lock()
-            self.volatileStart = range.start
-            self.hasVolatileRange = true
-            self.mutex.unlock()
-        }
-    }
-
     private func startConsumingResults() {
         Task.detached { [weak self] in
             guard let self else { return }
@@ -365,29 +334,14 @@ private final class Pipe: @unchecked Sendable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return }
 
-        let now = Date()
+        // `isFinal` comes straight from the transcriber: volatile results keep
+        // replacing each other for the current audio range; the one finalized
+        // result commits the range and the analyzer moves on. Finalized results
+        // are immutable and never overlap (WWDC25 session 277 contract).
+        let isFinal = result.isFinal
         mutex.lock()
-        // Time-window coalescing: while results on this channel keep arriving within
-        // `coalesceWindowSeconds` of the previous emission, they all share the same
-        // segment id and downstream consumers treat them as one updating segment.
-        // After a gap longer than the window, the next result mints a fresh id and
-        // becomes a new transcript line. See the field doc above for the rationale.
-        let segmentId: UUID
-        if let active = activeSegmentId,
-           let last = lastEmissionAt,
-           now.timeIntervalSince(last) <= Self.coalesceWindowSeconds {
-            segmentId = active
-        } else {
-            segmentId = UUID()
-            activeSegmentId = segmentId
-        }
-        lastEmissionAt = now
-        // A result is final once its range ends at or before the volatile region's
-        // start — meaning the analyzer has committed that audio segment and won't
-        // revise it. Before the volatile-range handler has fired even once, we
-        // can't tell, so emit as volatile and let a later result for the same
-        // range upgrade it.
-        let isFinal = hasVolatileRange && CMTimeCompare(result.range.end, volatileStart) <= 0
+        let segmentId = currentSegmentId ?? UUID()
+        currentSegmentId = isFinal ? nil : segmentId
         resultsSeen += 1
         let count = resultsSeen
         // Track the active hypothesis for the pre-prompt synthetic-final flush.

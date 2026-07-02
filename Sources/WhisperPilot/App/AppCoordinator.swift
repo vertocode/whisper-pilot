@@ -78,6 +78,11 @@ final class AppCoordinator {
     /// and ConversationContext both already dedupe by id; this brings disk
     /// persistence in line with that semantic.
     private var pendingTranscriptLineByChannel: [AudioChannel: (id: UUID, text: String, timestamp: Date)] = [:]
+    /// The most recent line each channel actually wrote to `transcript.md`.
+    /// Lets `queueTranscriptPersistence` drop a late re-final of an utterance
+    /// that already hit the disk (same id, or containment-duplicate text within
+    /// the merge window) instead of appending it as a duplicate line.
+    private var lastPersistedLineByChannel: [AudioChannel: (id: UUID, text: String, timestamp: Date)] = [:]
     /// Currently-streaming AI completions, keyed by the assistant message ID they
     /// render into. Tracked as a dictionary (not a single slot) because a follow-up
     /// detected question can arrive while the answer to the previous one is still
@@ -370,10 +375,11 @@ final class AppCoordinator {
         // pure audio capture, no Screen Recording prompt, no "screen is being recorded"
         // mode that breaks Live Captions and confuses some macOS audio routing setups.
         // ScreenCaptureKit remains the fallback for older OSes or when the tap fails.
-        // The `forceScreenCaptureKitForSystemAudio` opt-out is for Macs (some Mac mini
-        // configurations) where ProcessTap creates without error but silently delivers
-        // zero frames — flipping the setting forces the SCK path, which triggers the
-        // Screen Recording permission prompt and reliably captures audio there.
+        // The `forceScreenCaptureKitForSystemAudio` flag is auto-managed by the
+        // silent-tap watchdog for Macs (some Mac mini configurations) where
+        // ProcessTap creates without error but silently delivers zero frames —
+        // once set, the SCK path is used instead, which triggers the Screen
+        // Recording permission prompt and reliably captures audio there.
         if #available(macOS 14.4, *), !settings.forceScreenCaptureKitForSystemAudio {
             let pt = ProcessAudioCapture()
             do {
@@ -385,7 +391,7 @@ final class AppCoordinator {
                 wpWarn("Process Tap unavailable (\(error.localizedDescription)); falling back to ScreenCaptureKit")
             }
         } else if settings.forceScreenCaptureKitForSystemAudio {
-            wpInfo("[Coordinator] ProcessTap skipped by user setting (forceScreenCaptureKitForSystemAudio = true)")
+            wpInfo("[Coordinator] ProcessTap skipped (forceScreenCaptureKitForSystemAudio = true — set by the silent-tap watchdog on a previous session)")
         }
 
         if processTapFrames == nil {
@@ -717,9 +723,11 @@ final class AppCoordinator {
             // output device (USB / Bluetooth / aggregate) bypasses the global
             // audio mixdown. The audio in the captured buffer is bit-for-bit
             // zero, so no amount of gain helps. Switching to ScreenCaptureKit
-            // uses a different capture mechanism and usually works in this
-            // setup — surface the fix as a one-click button rather than
-            // expecting the user to dig through Settings → Capture.
+            // uses a different capture mechanism and reliably works in this
+            // setup. When Screen Recording permission is already granted we
+            // make the switch automatically (persisted, so future sessions
+            // start on the working path); otherwise switching would fire the
+            // macOS permission prompt, so we ask first via a one-click note.
             let sysFrames = self.overlayState.systemAudioFrameCount
             let sysTranscripts = self.overlayState.systemTranscriptCount
             let micTranscripts = self.overlayState.microphoneTranscriptCount
@@ -730,14 +738,30 @@ final class AppCoordinator {
                sysFrames > 100,
                sysTranscripts == 0,
                micTranscripts > 0 {
-                let message = "System audio frames are arriving (sys=\(sysFrames)) but contain silence — the macOS audio mixdown that Core Audio Process Tap reads from looks empty. This usually happens when the Mac's output device (USB headset, Bluetooth headphones, aggregate / virtual driver) routes audio in a way that bypasses the mixdown. Switching to ScreenCaptureKit uses a different capture path and typically works around it."
+                let message = "System audio frames are arriving (sys=\(sysFrames)) but contain silence — the macOS audio mixdown that Core Audio Process Tap reads from looks empty. This usually happens when the Mac's output device (USB headset, Bluetooth headphones, aggregate / virtual driver) routes audio in a way that bypasses the mixdown. ScreenCaptureKit uses a different capture path that works around it."
                 wpWarn(message)
-                self.overlayState.appendSystemNote(
-                    "⚠️ \(message)",
-                    category: .transcript,
-                    actionLabel: "Enable ScreenCaptureKit & retry",
-                    actionKind: .enableForceSCKAndRestart
-                )
+                if self.permissions.snapshot.screenRecording == .granted {
+                    self.settings.forceScreenCaptureKitForSystemAudio = true
+                    self.overlayState.appendSystemNote(
+                        "🔧 System audio wasn't reaching the transcriber via the default capture path — switched to ScreenCaptureKit automatically and restarting the session. This choice is remembered.",
+                        category: .transcript
+                    )
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        // If the user hit Stop in the gap since the watchdog
+                        // fired, honor it — don't resurrect a stopped session.
+                        guard self.isRunning else { return }
+                        await self.stopListening()
+                        await self.startListening()
+                    }
+                } else {
+                    self.overlayState.appendSystemNote(
+                        "⚠️ \(message) Switching needs macOS Screen Recording permission (audio only — no video is recorded).",
+                        category: .transcript,
+                        actionLabel: "Switch capture path & retry",
+                        actionKind: .enableForceSCKAndRestart
+                    )
+                }
             }
         }
     }
@@ -901,6 +925,8 @@ final class AppCoordinator {
         // session's transcript.md before we change `currentSession`, otherwise
         // the in-flight utterance would land in the new session's file.
         await flushPendingTranscriptLines()
+        // The just-persisted dedup memory belongs to the old session's file.
+        lastPersistedLineByChannel.removeAll()
 
         currentSession = session
         overlayState.transcript = []
@@ -1864,27 +1890,33 @@ final class AppCoordinator {
         })
     }
 
+    /// Debounce between a VAD speech-end event and the utterance-boundary
+    /// notification. Combined with the VAD's own 0.4 s hangover, a ~1.5 s pause
+    /// starts a new transcript line — the split cadence Meet/Teams captions use.
+    /// Short mid-sentence pauses cancel the pending boundary when speech resumes.
+    /// Only the legacy SFSpeech engine acts on the notification (it cycles its
+    /// recognition task at the boundary, which is also the restart point that
+    /// avoids its ~1-minute task limit); SpeechAnalyzer segments on its own and
+    /// ignores it.
+    private static let utteranceBoundaryDebounceSeconds: TimeInterval = 1.1
+
     private func handleVADEvent(_ event: VoiceActivityEvent) async {
         await triggerEngine.absorb(event)
 
-        // Optional debounced utterance-boundary cycling. Default is `.auto` — no
-        // time-based cutting at all; we let SFSpeech finalize segments on its own.
-        // Users can opt into pause-driven line breaks via Settings → General.
-        if let delay = settings.utteranceBoundary.seconds {
-            switch event {
-            case .speechStarted(let channel, _):
-                pendingBoundaryTasks[channel]?.cancel()
-                pendingBoundaryTasks[channel] = nil
-            case .speechEnded(let channel, _, _, _):
-                pendingBoundaryTasks[channel]?.cancel()
-                let task = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    guard !Task.isCancelled, let self else { return }
-                    self.transcriber?.notifyVADBoundary(channel: channel)
-                    self.pendingBoundaryTasks[channel] = nil
-                }
-                pendingBoundaryTasks[channel] = task
+        switch event {
+        case .speechStarted(let channel, _):
+            pendingBoundaryTasks[channel]?.cancel()
+            pendingBoundaryTasks[channel] = nil
+        case .speechEnded(let channel, _, _, _):
+            pendingBoundaryTasks[channel]?.cancel()
+            let delay = Self.utteranceBoundaryDebounceSeconds
+            let task = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                self.transcriber?.notifyVADBoundary(channel: channel)
+                self.pendingBoundaryTasks[channel] = nil
             }
+            pendingBoundaryTasks[channel] = task
         }
 
         // Hand the most recent segment on the VAD event's channel to the trigger
@@ -2072,6 +2104,16 @@ final class AppCoordinator {
     /// utterance, with the latest (most complete) text.
     private func queueTranscriptPersistence(_ update: TranscriptUpdate) async {
         let channel = update.channel
+        // A late re-final of a line that already went to disk (the next
+        // utterance pushed it out before the recognizer's own final landed)
+        // can't be merged into the file — drop it instead of appending a
+        // duplicate line.
+        if let flushed = lastPersistedLineByChannel[channel],
+           update.id == flushed.id
+            || (update.timestamp.timeIntervalSince(flushed.timestamp) <= TranscriptDedup.mergeWindowSeconds
+                && TranscriptDedup.merged(previous: flushed.text, incoming: update.text) != nil) {
+            return
+        }
         if let pending = pendingTranscriptLineByChannel[channel] {
             if pending.id == update.id {
                 // Same utterance grew (or the pre-prompt flush emitted again).
@@ -2083,7 +2125,21 @@ final class AppCoordinator {
                 )
                 return
             }
-            // Different segment id ⇒ previous utterance is done. Flush it.
+            // Different id but containment-duplicate text shortly after ⇒ the
+            // same utterance finalized twice (synthetic pre-flush + the
+            // recognizer's own final). Merge into the pending record — same
+            // rule as `TranscriptBuffer` and `ConversationContext`, so the
+            // saved transcript.md matches what the user saw on screen.
+            if update.timestamp.timeIntervalSince(pending.timestamp) <= TranscriptDedup.mergeWindowSeconds,
+               let mergedText = TranscriptDedup.merged(previous: pending.text, incoming: update.text) {
+                pendingTranscriptLineByChannel[channel] = (
+                    id: update.id,
+                    text: mergedText,
+                    timestamp: update.timestamp
+                )
+                return
+            }
+            // Genuinely new utterance ⇒ the previous one is done. Flush it.
             await persistPendingTranscriptLine(channel: channel, pending: pending)
         }
         pendingTranscriptLineByChannel[channel] = (
@@ -2109,6 +2165,7 @@ final class AppCoordinator {
         pending: (id: UUID, text: String, timestamp: Date)
     ) async {
         guard let sessionID = currentSession?.id else { return }
+        lastPersistedLineByChannel[channel] = pending
         await SessionStore.shared.appendTranscriptLine(
             channel: channel,
             text: pending.text,
