@@ -78,12 +78,17 @@ struct OverlayView: View {
             composer
         }
         .frame(minWidth: 340, minHeight: 150)
-        // Only the translucent panel honors the opacity setting — content (text,
-        // buttons) stays fully opaque so a see-through overlay is still readable.
+        // Solid opaque base so the overlay stays readable over any window behind
+        // it. The material frost on top honors the opacity setting for a subtle
+        // tint, but the base color underneath is always fully opaque.
         .background {
             RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .opacity(settings.overlayBackgroundOpacity)
+                .fill(Color(NSColor.windowBackgroundColor))
+                .overlay {
+                    RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .opacity(settings.overlayBackgroundOpacity)
+                }
         }
         .overlay(
             RoundedRectangle(cornerRadius: WP.Radius.xl, style: .continuous)
