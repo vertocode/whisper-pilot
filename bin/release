@@ -169,6 +169,20 @@ command -v xcodegen   >/dev/null || { echo "Missing xcodegen — run: brew insta
 command -v xcodebuild >/dev/null || { echo "Missing xcodebuild — install Xcode."             >&2; exit 1; }
 command -v create-dmg >/dev/null || { echo "Missing create-dmg — run: brew install create-dmg" >&2; exit 1; }
 
+# `xcodebuild` also ships with the Command Line Tools, so `command -v` passes even
+# without a full Xcode.app — but `xcodebuild archive` then dies deep into the run.
+# Detect that up front: if the active developer dir is a CommandLineTools instance
+# (or xcode-select can't resolve a real Xcode), fail here with a clear fix.
+XCODE_DEV_DIR="$(xcode-select -p 2>/dev/null || true)"
+if [[ "$XCODE_DEV_DIR" != *"/Xcode.app/"* ]] || ! xcodebuild -version >/dev/null 2>&1; then
+  echo "Error: full Xcode is required to archive, but the active developer directory is:" >&2
+  echo "         ${XCODE_DEV_DIR:-<none>}" >&2
+  echo "       Install Xcode, then point xcode-select at it:" >&2
+  echo "         brew install xcodes && xcodes install --latest   # or install from the App Store" >&2
+  echo "         sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
+  exit 1
+fi
+
 if [[ $SKIP_PUBLISH -eq 0 ]] || [[ $SKIP_TAP -eq 0 ]]; then
   command -v gh >/dev/null || { echo "Missing gh CLI — run: brew install gh && gh auth login." >&2; exit 1; }
 fi
