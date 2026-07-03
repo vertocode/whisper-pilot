@@ -2118,9 +2118,11 @@ final class AppCoordinator {
             if pending.id == update.id {
                 // Same utterance grew (or the pre-prompt flush emitted again).
                 // Update the in-memory record; don't touch disk yet.
+                // Containment-guarded: the pending line may already be a
+                // merged/rolled-up composite that a fragment must not clobber.
                 pendingTranscriptLineByChannel[channel] = (
                     id: update.id,
-                    text: update.text,
+                    text: TranscriptDedup.merged(previous: pending.text, incoming: update.text) ?? pending.text,
                     timestamp: update.timestamp
                 )
                 return
@@ -2135,6 +2137,22 @@ final class AppCoordinator {
                 pendingTranscriptLineByChannel[channel] = (
                     id: update.id,
                     text: mergedText,
+                    timestamp: update.timestamp
+                )
+                return
+            }
+            // Continuation of the same speaker turn (task churn finalized
+            // mid-sentence) ⇒ append to the pending line, mirroring the
+            // display buffer's roll-up, instead of flushing a fragment row.
+            if TranscriptDedup.shouldRollUp(
+                previousText: pending.text,
+                previousAt: pending.timestamp,
+                incomingText: update.text,
+                incomingAt: update.timestamp
+            ) {
+                pendingTranscriptLineByChannel[channel] = (
+                    id: update.id,
+                    text: TranscriptDedup.rolledUp(previousText: pending.text, incomingText: update.text),
                     timestamp: update.timestamp
                 )
                 return

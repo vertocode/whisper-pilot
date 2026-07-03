@@ -57,6 +57,45 @@ enum TranscriptDedup {
         }
         return false
     }
+
+    // MARK: Roll-up (continuation joining)
+
+    /// Max gap between two finals on a channel for the second to count as a
+    /// continuation of the first. Mirrors the paragraph cadence Meet/Teams
+    /// captions use: a speaker pausing longer than this starts a new line.
+    static let rollUpWindowSeconds: TimeInterval = 2.5
+    /// Cap on a rolled-up line so one monologue can't grow a single row forever.
+    static let rollUpMaxCharacters = 600
+    /// Lines shorter than this many words are joined even when punctuated —
+    /// they're fragments, not sentences.
+    static let rollUpShortLineWordCount = 6
+
+    /// True when `incoming` should be appended to the previous line rather than
+    /// opening a new row: it landed within the roll-up window, the combined
+    /// length stays reasonable, and the previous line looks unfinished (short,
+    /// or lacking terminal punctuation). Recognizer task churn mid-sentence
+    /// otherwise shreds one spoken sentence across many rows.
+    static func shouldRollUp(
+        previousText: String,
+        previousAt: Date,
+        incomingText: String,
+        incomingAt: Date
+    ) -> Bool {
+        guard incomingAt.timeIntervalSince(previousAt) <= rollUpWindowSeconds else { return false }
+        guard previousText.count + incomingText.count <= rollUpMaxCharacters else { return false }
+        let previous = previousText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !previous.isEmpty else { return false }
+        let isShort = previous.split(whereSeparator: \.isWhitespace).count < rollUpShortLineWordCount
+        let endsSentence = previous.last.map { ".!?…".contains($0) } ?? false
+        return isShort || !endsSentence
+    }
+
+    /// The joined text for a roll-up.
+    static func rolledUp(previousText: String, incomingText: String) -> String {
+        previousText.trimmingCharacters(in: .whitespacesAndNewlines)
+            + " "
+            + incomingText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 /// Live-caption display model, following the pattern production captioners
@@ -107,8 +146,13 @@ actor TranscriptBuffer {
         // same id. Grow the committed line in place (it keeps its white,
         // finalized styling) rather than resurrecting a gray duplicate below it
         // — or worse, dropping the rest of the sentence from the display.
+        // Containment-guarded: several ids can map onto one merged/rolled-up
+        // row, and a single fragment's refinement must never clobber the whole
+        // composite line.
         if let idx = finalIndexByID[update.id] {
-            finals[idx].text = update.text
+            if let mergedText = TranscriptDedup.merged(previous: finals[idx].text, incoming: update.text) {
+                finals[idx].text = mergedText
+            }
             finals[idx].updatedAt = update.timestamp
             return
         }
@@ -137,9 +181,12 @@ actor TranscriptBuffer {
     private func applyFinal(_ update: TranscriptUpdate, trimmed: String) {
         // Repeated final for an already-committed segment: refresh its text in
         // place (the synthetic-final flush re-emits one utterance as it grows).
+        // Containment-guarded like `applyVolatile`'s same-id branch — a
+        // fragment re-final must not clobber a merged/rolled-up composite row.
         if let idx = finalIndexByID[update.id] {
-            if !trimmed.isEmpty {
-                finals[idx].text = update.text
+            if !trimmed.isEmpty,
+               let mergedText = TranscriptDedup.merged(previous: finals[idx].text, incoming: update.text) {
+                finals[idx].text = mergedText
             }
             finals[idx].updatedAt = update.timestamp
             if volatileByChannel[update.channel]?.id == update.id {
@@ -175,6 +222,23 @@ actor TranscriptBuffer {
            update.timestamp.timeIntervalSince(finals[lastIdx].updatedAt) <= TranscriptDedup.mergeWindowSeconds,
            let mergedText = TranscriptDedup.merged(previous: finals[lastIdx].text, incoming: update.text) {
             finals[lastIdx].text = mergedText
+            finals[lastIdx].updatedAt = update.timestamp
+            finalIndexByID[update.id] = lastIdx
+            return
+        }
+
+        // Roll-up: not a duplicate, but a *continuation* — recognizer task
+        // churn finalized mid-sentence and the rest of the sentence is arriving
+        // as separate finals. Append to the previous line instead of opening a
+        // new row, the way Meet/Teams captions build paragraphs.
+        if let lastIdx = lastFinalIndex(on: update.channel),
+           TranscriptDedup.shouldRollUp(
+               previousText: finals[lastIdx].text,
+               previousAt: finals[lastIdx].updatedAt,
+               incomingText: trimmed,
+               incomingAt: update.timestamp
+           ) {
+            finals[lastIdx].text = TranscriptDedup.rolledUp(previousText: finals[lastIdx].text, incomingText: trimmed)
             finals[lastIdx].updatedAt = update.timestamp
             finalIndexByID[update.id] = lastIdx
             return

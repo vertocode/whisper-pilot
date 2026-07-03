@@ -374,14 +374,16 @@ struct SmokeTestRunner {
                 await expect(snap.first?.text == "first half and second half", "same-id final grew in place")
             }
 
-            // 5. Distinct utterances become distinct rows; channels stay independent.
+            // 5. Distinct utterances separated by a real pause become distinct
+            //    rows; channels stay independent.
             do {
                 let buffer = TranscriptBuffer()
-                await buffer.apply(update("question from the other side", final: true, channel: .system))
-                await buffer.apply(update("my own answer", final: true, channel: .microphone))
-                await buffer.apply(update("totally new topic", final: true, channel: .system))
+                let t0 = Date()
+                await buffer.apply(update("question from the other side", final: true, channel: .system, at: t0))
+                await buffer.apply(update("my own answer", final: true, channel: .microphone, at: t0.addingTimeInterval(3)))
+                await buffer.apply(update("totally new topic", final: true, channel: .system, at: t0.addingTimeInterval(6)))
                 let snap = await buffer.snapshot()
-                await expect(snap.count == 3, "3 distinct finals → 3 rows (got \(snap.count))")
+                await expect(snap.count == 3, "3 distinct pause-separated finals → 3 rows (got \(snap.count))")
             }
 
             // 6. A genuine repeat outside the merge window is preserved as its own row.
@@ -485,6 +487,30 @@ struct SmokeTestRunner {
                          "word-level matching — 'ship' must not merge into 'shipped'")
             await expect(TranscriptDedup.merged(previous: "totally different", incoming: "another thing entirely") == nil,
                          "distinct utterances never merge")
+
+            // Roll-up gate.
+            let t0 = Date()
+            await expect(TranscriptDedup.shouldRollUp(
+                previousText: "and so we're gonna", previousAt: t0,
+                incomingText: "be optimizing our image loading", incomingAt: t0.addingTimeInterval(1)),
+                "unpunctuated mid-sentence fragment rolls up")
+            await expect(!TranscriptDedup.shouldRollUp(
+                previousText: "That is the whole plan for this quarter.", previousAt: t0,
+                incomingText: "Now something unrelated", incomingAt: t0.addingTimeInterval(1)),
+                "complete punctuated sentence does not roll up")
+            await expect(TranscriptDedup.shouldRollUp(
+                previousText: "Yes.", previousAt: t0,
+                incomingText: "Okay, let's do it.", incomingAt: t0.addingTimeInterval(1)),
+                "short punctuated fragment still rolls up (it's the same speaker turn)")
+            await expect(!TranscriptDedup.shouldRollUp(
+                previousText: "and so we're gonna", previousAt: t0,
+                incomingText: "something after a pause", incomingAt: t0.addingTimeInterval(5)),
+                "a real pause (>2.5 s) breaks the roll-up")
+            let long = String(repeating: "word ", count: 130)
+            await expect(!TranscriptDedup.shouldRollUp(
+                previousText: long, previousAt: t0,
+                incomingText: "more", incomingAt: t0.addingTimeInterval(1)),
+                "length cap stops a single row from growing forever")
         }
     }
 
@@ -494,6 +520,10 @@ struct SmokeTestRunner {
     /// utterance fragmented across multiple lines.
     static func runTranscriptRobustnessSuite() async {
         await suite("Transcript robustness (long-text simulations)") {
+            // Sentences carry terminal punctuation — `addsPunctuation` is on
+            // for the real recognizer, and the roll-up rule uses it as the
+            // "sentence complete" signal that keeps full sentences on their
+            // own lines.
             let paragraph = [
                 "Good morning everyone and thanks for joining the quarterly planning call on such short notice.",
                 "The main topic today is the migration of our billing pipeline to the new event driven architecture.",
@@ -655,9 +685,10 @@ struct SmokeTestRunner {
                              "committed lines keep speaking order")
             }
 
-            // ── Simulation 4: short utterances in quick succession stay
-            // separate lines (distinct text), while a double-emitted duplicate
-            // collapses.
+            // ── Simulation 4: short phrases in rapid succession are one
+            // speaker turn — they roll up into a single readable line (the
+            // Meet/Teams paragraph behavior). The same phrases separated by
+            // real pauses stay on their own lines.
             do {
                 let buffer = TranscriptBuffer()
                 var t = base
@@ -669,10 +700,57 @@ struct SmokeTestRunner {
                     await buffer.apply(TranscriptUpdate(id: id, text: phrase, isFinal: true, channel: .microphone, timestamp: t))
                 }
                 let rows = await buffer.snapshot()
-                await expect(rows.count == 4,
-                             "four distinct quick phrases → four lines (got \(rows.count))")
-                await expect(rows.map(\.text) == ["Yes.", "Okay, let's do it.", "Sounds good.", "Ship it."],
-                             "phrases in order, none merged or fragmented")
+                // Fragments join while the line is still short; once the rolled
+                // line is a full punctuated sentence, the next phrase starts a
+                // new row — paragraphs grow, but bounded at sentence edges.
+                await expect(rows.count == 2,
+                             "rapid short phrases join into sentence-bounded lines (got \(rows.count))")
+                await expect(rows.map(\.text) == ["Yes. Okay, let's do it. Sounds good.", "Ship it."],
+                             "joined lines keep every phrase in order (got \(rows.map(\.text)))")
+
+                let paused = TranscriptBuffer()
+                var t2 = base
+                for phrase in ["Yes.", "Okay, let's do it.", "Sounds good.", "Ship it."] {
+                    let id = UUID()
+                    t2.addTimeInterval(4.0)
+                    await paused.apply(TranscriptUpdate(id: id, text: phrase, isFinal: true, channel: .microphone, timestamp: t2))
+                }
+                let pausedRows = await paused.snapshot()
+                await expect(pausedRows.count == 4,
+                             "pause-separated phrases keep their own lines (got \(pausedRows.count))")
+            }
+
+            // ── Simulation 5: the real-world finalization storm (verbatim
+            // fragment sequence from a user transcript where one spoken
+            // sentence — "Suspense isn't just about loading data, it's also
+            // about loading really any asynchronous thing and so we…" — was
+            // shredded into ~20 garbled rows). Containment absorbs the
+            // duplicates; roll-up joins the rest. The storm must collapse to a
+            // single line instead of a wall of fragments.
+            do {
+                let buffer = TranscriptBuffer()
+                var t = base
+                let fragments = [
+                    "So sus", "Suspense isn't just", "Spencer",
+                    "Fence isn't just about loading data", "Just about load",
+                    "About loading data", "Outloading data", "Loading data",
+                    "Did it", "Say it", "It's also", "It", "Also about",
+                    "How about", "load", "Loading", "Really", "any",
+                    "asynchronous", "As", "Asynchronous",
+                    "Synchronous thing and so we",
+                ]
+                for fragment in fragments {
+                    t.addTimeInterval(0.3)
+                    await buffer.apply(TranscriptUpdate(id: UUID(), text: fragment, isFinal: true, channel: .system, timestamp: t))
+                }
+                let rows = await buffer.snapshot()
+                await expect(rows.count <= 2,
+                             "storm of \(fragments.count) fragment finals collapses to ≤2 lines (got \(rows.count))")
+                let joinedWords = rows.map(\.text).joined(separator: " ").split(whereSeparator: \.isWhitespace).count
+                let inputWords = fragments.joined(separator: " ").split(whereSeparator: \.isWhitespace).count
+                await expect(joinedWords <= inputWords,
+                             "collapse never invents text (got \(joinedWords) words from \(inputWords))")
+                await expect(rows.allSatisfy { $0.isFinal }, "storm lines are committed")
             }
         }
     }

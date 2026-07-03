@@ -42,7 +42,11 @@ actor ConversationContext {
     func absorb(_ update: TranscriptUpdate) {
         guard update.isFinal, !update.text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         if let idx = lines.firstIndex(where: { $0.id == update.id }) {
-            lines[idx].text = update.text
+            // Containment-guarded: multiple ids can map onto one merged or
+            // rolled-up line; a fragment's re-final must not clobber it.
+            if let mergedText = TranscriptDedup.merged(previous: lines[idx].text, incoming: update.text) {
+                lines[idx].text = mergedText
+            }
             lines[idx].at = update.timestamp
         } else if let lastIdx = lines.lastIndex(where: { $0.channel == update.channel }),
                   update.timestamp.timeIntervalSince(lines[lastIdx].at) <= TranscriptDedup.mergeWindowSeconds,
@@ -53,6 +57,17 @@ actor ConversationContext {
             // model's view aligned with the on-screen transcript — without this
             // the prompt shows the utterance twice.
             lines[lastIdx].text = mergedText
+            lines[lastIdx].at = update.timestamp
+        } else if let lastIdx = lines.lastIndex(where: { $0.channel == update.channel }),
+                  TranscriptDedup.shouldRollUp(
+                      previousText: lines[lastIdx].text,
+                      previousAt: lines[lastIdx].at,
+                      incomingText: update.text,
+                      incomingAt: update.timestamp
+                  ) {
+            // Continuation of the same speaker turn — join it, mirroring the
+            // display buffer's roll-up.
+            lines[lastIdx].text = TranscriptDedup.rolledUp(previousText: lines[lastIdx].text, incomingText: update.text)
             lines[lastIdx].at = update.timestamp
         } else {
             lines.append(Line(id: update.id, channel: update.channel, text: update.text, at: update.timestamp))

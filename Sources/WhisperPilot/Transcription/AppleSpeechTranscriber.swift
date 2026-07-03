@@ -128,13 +128,17 @@ private final class ChannelPipe {
     /// Set when SFSpeech itself delivered an `isFinal=true` for the current
     /// segment, so the synthetic-final emitter knows not to double-fire.
     private var pendingSegmentHasNaturalFinal: Bool = false
-    /// Rolling tail of recently-appended audio (~`replayMaxSeconds` worth). Replayed into
-    /// every new request we install so audio that arrived while the previous task was
-    /// finalizing (or dying with an error) is recovered. Without this, SFSpeech finalizing
-    /// after a comma-length pause silently drops the next ~0.5–2 s of speech — the user
-    /// sees "first phrase captured, middle vanished, third phrase captured" even though
-    /// the audio pipeline was delivering buffers the whole time. Accepts some text
-    /// duplication near task boundaries as a worthwhile trade vs. lost words.
+    /// Rolling tail of recently-appended audio (~`replayMaxSeconds` worth), a
+    /// portion of which is replayed into each new request so audio that arrived
+    /// while the previous task was finalizing (or dying with an error) is
+    /// recovered. Without this, SFSpeech finalizing after a comma-length pause
+    /// silently drops the next stretch of speech — "first phrase captured,
+    /// middle vanished, third phrase captured". How much is replayed depends on
+    /// how the previous task ended (see `replayTailLocked` call sites): the full
+    /// budget after an error (that audio was never consumed), only
+    /// `postFinalReplaySeconds` after a natural final (that audio WAS consumed;
+    /// re-feeding it restarts recognition mid-word and garbles text), and
+    /// nothing during a finalization storm.
     private var replayBuffers: [AVAudioPCMBuffer] = []
     private var replaySecondsBuffered: Double = 0
     private static let replayMaxSeconds: Double = 1.2
@@ -149,6 +153,23 @@ private final class ChannelPipe {
     private var lastFinalTailWords: [String] = []
     private var lastFinalAt: Date?
     private static let overlapTrimWindowSeconds: TimeInterval = 4
+    /// Replay budget after a *natural finalization*. The finalized task consumed
+    /// its audio, so only the short callback gap needs covering — replaying the
+    /// full 1.2 s tail re-feeds already-transcribed audio that restarts
+    /// MID-WORD, and the recognizer then hallucinates mutated fragments
+    /// ("sus-pense" → "Spencer", "net-work" → "Work") that no text-level dedup
+    /// can catch. Error restarts keep the full budget: their task died without
+    /// consuming the tail.
+    private static let postFinalReplaySeconds: Double = 0.4
+    /// Finalization-storm brake. When SFSpeech gets into a rapid
+    /// finalize→restart→replay loop (observed: 3–5 finals/second shredding one
+    /// sentence into ~20 garbled fragments), every replay feeds the next
+    /// garbage hypothesis. Once `stormFinalThreshold` finals land within
+    /// `stormWindowSeconds`, stop replaying entirely until the rate drops —
+    /// losing ≤0.4 s of audio beats amplifying the loop.
+    private var recentFinalTimestamps: [Date] = []
+    private static let stormWindowSeconds: TimeInterval = 3
+    private static let stormFinalThreshold = 4
 
     init(channel: AudioChannel, locale: Locale, sink: AsyncStream<TranscriptUpdate>.Continuation, log: Logger, autoRestart: Bool = true) throws {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
@@ -164,16 +185,52 @@ private final class ChannelPipe {
         self.sink = sink
         self.log = log
         self.autoRestart = autoRestart
-        self.request = SFSpeechAudioBufferRecognitionRequest()
-        self.request.shouldReportPartialResults = true
+        self.request = Self.makeRequest()
+        wpInfo("Transcriber.\(channel) ready (locale=\(locale.identifier), onDeviceSupported=\(recognizer.supportsOnDeviceRecognition), requiresOnDevice=false, autoRestart=\(autoRestart))")
+        startTask()
+    }
+
+    /// One canonical request configuration for every task this pipe creates
+    /// (initial, VAD cycle, error restart, post-finalization continuation).
+    private static func makeRequest() -> SFSpeechAudioBufferRecognitionRequest {
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
         // Permissive: prefer on-device, but allow server fallback. Setting this to `true`
         // when the locale's on-device model isn't fully ready causes the task to silently
         // produce no output — exactly the symptom we kept hitting. Always-false here means
         // recognition will use on-device when available, and Apple's servers when not.
-        self.request.requiresOnDeviceRecognition = false
-        self.request.taskHint = .dictation
-        wpInfo("Transcriber.\(channel) ready (locale=\(locale.identifier), onDeviceSupported=\(recognizer.supportsOnDeviceRecognition), requiresOnDevice=false, autoRestart=\(autoRestart))")
-        startTask()
+        request.requiresOnDeviceRecognition = false
+        request.taskHint = .dictation
+        // Punctuated finals read dramatically better and give the transcript
+        // roll-up rule a "sentence is complete" signal to key on.
+        request.addsPunctuation = true
+        return request
+    }
+
+    /// The tail of recently-appended audio to seed into a fresh request, capped
+    /// at `maxSeconds` and suppressed entirely during a finalization storm.
+    /// Caller must hold `mutex`.
+    private func replayTailLocked(maxSeconds: Double) -> [AVAudioPCMBuffer] {
+        guard !isInFinalStormLocked() else { return [] }
+        var tail: [AVAudioPCMBuffer] = []
+        var seconds = 0.0
+        for buffer in replayBuffers.reversed() {
+            let bufferSeconds = buffer.format.sampleRate > 0
+                ? Double(buffer.frameLength) / buffer.format.sampleRate
+                : 0
+            if seconds + bufferSeconds > maxSeconds { break }
+            tail.append(buffer)
+            seconds += bufferSeconds
+        }
+        return tail.reversed()
+    }
+
+    /// True while finals are landing faster than any human speaks in distinct
+    /// utterances — the finalize→restart feedback loop. Caller must hold `mutex`.
+    private func isInFinalStormLocked() -> Bool {
+        let now = Date()
+        recentFinalTimestamps = recentFinalTimestamps.filter { now.timeIntervalSince($0) < Self.stormWindowSeconds }
+        return recentFinalTimestamps.count >= Self.stormFinalThreshold
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
@@ -262,11 +319,10 @@ private final class ChannelPipe {
         guard buffersAppended > 0 else { mutex.unlock(); return }
         let oldRequest = request
         let oldTask = task
-        let next = SFSpeechAudioBufferRecognitionRequest()
-        next.shouldReportPartialResults = true
-        next.requiresOnDeviceRecognition = false
-        next.taskHint = .dictation
-        for buffer in replayBuffers { next.append(buffer) }
+        let next = Self.makeRequest()
+        // A VAD boundary means ≥1 s of silence already elapsed — the short tail
+        // is silence, and anything older was consumed by the finalized task.
+        for buffer in replayTailLocked(maxSeconds: Self.postFinalReplaySeconds) { next.append(buffer) }
         request = next
         task = nil
         mutex.unlock()
@@ -347,7 +403,10 @@ private final class ChannelPipe {
     /// Caller must hold `mutex`.
     private func recordFinalizedTextLocked(_ text: String) {
         lastFinalTailWords = ReplayOverlapTrimmer.tailWords(of: text)
-        lastFinalAt = Date()
+        let now = Date()
+        lastFinalAt = now
+        recentFinalTimestamps = recentFinalTimestamps.filter { now.timeIntervalSince($0) < Self.stormWindowSeconds }
+        recentFinalTimestamps.append(now)
     }
 
     /// Drops the leading words of `text` that duplicate the trailing words of
@@ -585,12 +644,13 @@ private final class ChannelPipe {
         recentRestartTimestamps.append(now)
         restartCount += 1
 
-        let next = SFSpeechAudioBufferRecognitionRequest()
-        next.shouldReportPartialResults = true
-        next.requiresOnDeviceRecognition = false
-        next.taskHint = .dictation
-        for buffer in replayBuffers { next.append(buffer) }
-        let replayedCount = replayBuffers.count
+        let next = Self.makeRequest()
+        // Error restarts get the full replay budget: the dead task never
+        // consumed this audio, so replaying it is recovery, not duplication.
+        // (Still suppressed during a finalization storm.)
+        let replayTail = replayTailLocked(maxSeconds: Self.replayMaxSeconds)
+        for buffer in replayTail { next.append(buffer) }
+        let replayedCount = replayTail.count
         request = next
         task?.cancel()
         task = nil
@@ -616,20 +676,20 @@ private final class ChannelPipe {
     /// until an error eventually triggers `scheduleRestart`. Spin up a fresh request +
     /// task immediately so continuous speech stays transcribed without a multi-second gap.
     ///
-    /// We also seed the new request with the recent audio tail. SFSpeech's internal
-    /// "I'm finalizing" decision happens some time before our callback fires, and any
-    /// buffers appended during that window were lost to the dead request. Replaying the
-    /// last ~1 s of audio recovers them; the cost is occasional duplicated words near
-    /// the boundary, which the user will tolerate far better than missing ones.
+    /// We also seed the new request with a SHORT audio tail
+    /// (`postFinalReplaySeconds`): SFSpeech's internal "I'm finalizing" decision
+    /// happens shortly before our callback fires, and buffers appended in that
+    /// gap were lost to the dead request. Only that gap is worth replaying —
+    /// the finalized task already consumed everything older, and re-feeding it
+    /// restarts recognition mid-word, which is what shredded fast speech into
+    /// garbled fragment lines ("Spencer" / "Fence isn't just…").
     private func continueAfterFinalization() {
         mutex.lock()
         guard !isFinished else { mutex.unlock(); return }
-        let next = SFSpeechAudioBufferRecognitionRequest()
-        next.shouldReportPartialResults = true
-        next.requiresOnDeviceRecognition = false
-        next.taskHint = .dictation
-        for buffer in replayBuffers { next.append(buffer) }
-        let replayedCount = replayBuffers.count
+        let next = Self.makeRequest()
+        let replayTail = replayTailLocked(maxSeconds: Self.postFinalReplaySeconds)
+        for buffer in replayTail { next.append(buffer) }
+        let replayedCount = replayTail.count
         request = next
         task = nil
         mutex.unlock()
