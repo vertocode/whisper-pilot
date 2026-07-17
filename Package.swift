@@ -17,9 +17,15 @@ import PackageDescription
 let package = Package(
     name: "WhisperPilot",
     platforms: [.macOS(.v14)],
+    dependencies: [
+        .package(url: "https://github.com/FluidInference/FluidAudio", from: "0.15.5")
+    ],
     targets: [
         .target(
             name: "WhisperPilot",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio")
+            ],
             path: "Sources/WhisperPilot",
             exclude: [
                 "App/WhisperPilotApp.swift",

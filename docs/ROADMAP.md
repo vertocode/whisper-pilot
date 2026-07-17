@@ -4,7 +4,8 @@ Living document. Items are loosely ordered.
 
 ## Near term
 
-- [ ] **WhisperKit transcriber.** Drop-in `TranscriptionProvider` using [WhisperKit](https://github.com/argmaxinc/WhisperKit). Better quality than `SFSpeechRecognizer`, fully on-device, runs on the Apple Neural Engine. Needs first-run model download UX.
+- [x] **High-accuracy transcriber.** Done as `ParakeetTranscriber` — Parakeet Unified 0.6B via [FluidAudio](https://github.com/FluidInference/FluidAudio), fully on-device on the Apple Neural Engine, 1.79% LibriSpeech WER with punctuation (beats WhisperKit's Whisper large-v3-turbo for streaming English). English-only for now.
+- [ ] **Multilingual high-accuracy engine.** Extend beyond English — FluidAudio's Nemotron Speech Streaming Multilingual (~40 languages) once its CoreML bundles are published on Hugging Face, or Parakeet TDT v3 (25 languages) behind a higher-latency sliding-window path.
 - [ ] **Speaker diarization.** Today the trigger engine assumes anything from the *system* channel is "the other party" and anything from the *microphone* channel is "the user." Useful approximation but breaks on speakerphone. Real diarization (per-speaker embeddings) lives behind a small protocol and feeds into `ConversationContext`.
 - [ ] **Trigger engine snapshot tests.** The heuristic question detector is the most brittle piece of the app. Snapshot tests on real transcript fixtures.
 - [ ] **End-of-session export.** A "Generate summary" button on the Sessions window that runs one final Gemini call against the markdown to produce action items, decisions, and follow-ups.

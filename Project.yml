@@ -6,6 +6,13 @@ options:
   createIntermediateGroups: true
   generateEmptyDirectories: false
 
+# FluidAudio provides the Parakeet Unified streaming ASR engine (CoreML, ANE).
+# Pinned by minor version: its streaming APIs are still pre-1.0 and move fast.
+packages:
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio
+    from: 0.15.5
+
 settings:
   base:
     SWIFT_VERSION: "5.9"
@@ -33,12 +40,14 @@ targets:
       # ensures the menu bar / Sessions header / Settings still show the real logo
       # instead of the SF Symbol fallback.
       - path: Resources/Branding/whisper-logo-nobg.png
+    dependencies:
+      - package: FluidAudio
     info:
       path: Resources/Info.plist
       properties:
         CFBundleName: Whisper Pilot
         CFBundleDisplayName: Whisper Pilot
-        CFBundleShortVersionString: "0.1.17"
+        CFBundleShortVersionString: "0.1.18"
         CFBundleVersion: "1"
         LSApplicationCategoryType: public.app-category.productivity
         LSUIElement: true

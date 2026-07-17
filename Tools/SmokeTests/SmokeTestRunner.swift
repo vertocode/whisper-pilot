@@ -20,10 +20,12 @@ struct SmokeTestRunner {
         await runSystemAudioGainSuite()
         await runTranscriptBufferSuite()
         await runReplayOverlapTrimmerSuite()
+        await runTranscriptStreamSegmenterSuite()
         await runTranscriptDedupSuite()
         await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
         await runSpeechRecognitionIntegrationSuite()
+        await runParakeetIntegrationSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
@@ -470,6 +472,88 @@ struct SmokeTestRunner {
         }
     }
 
+    /// Pins the utterance-cutting rules that turn the Parakeet engine's
+    /// continuous token stream into transcript lines.
+    static func runTranscriptStreamSegmenterSuite() async {
+        await suite("TranscriptStreamSegmenter") {
+            func token(_ piece: String, _ start: TimeInterval, _ end: TimeInterval) -> StreamToken {
+                StreamToken(piece: piece, startTime: start, endTime: end)
+            }
+
+            // Word assembly across drain batches: a word split over two absorb
+            // calls must reassemble, not become two words.
+            let assembly = TranscriptStreamSegmenter()
+            var finals = assembly.absorb([token(" hel", 0.0, 0.1)])
+            finals += assembly.absorb([token("lo", 0.1, 0.2), token(" world", 0.3, 0.5)])
+            await expect(finals.isEmpty, "no cut during continuous speech")
+            await expect(assembly.currentText == "hello world",
+                         "sub-word tokens straddling a batch boundary reassemble (got \"\(assembly.currentText)\")")
+
+            // Punctuation tokens (no leading space) attach to the open word.
+            _ = assembly.absorb([token(".", 0.5, 0.55)])
+            await expect(assembly.currentText == "hello world.",
+                         "punctuation token extends the open word")
+
+            // Gap cut: a word starting ≥ gapSeconds after the previous token's
+            // end closes the segment; the new word opens the next one.
+            let gap = TranscriptStreamSegmenter()
+            _ = gap.absorb([token(" how", 0.0, 0.2), token(" are", 0.25, 0.4), token(" you?", 0.45, 0.7)])
+            let gapFinals = gap.absorb([token(" Great", 2.5, 2.7)])
+            await expect(gapFinals.count == 1 && gapFinals[0].text == "how are you?",
+                         "≥1 s pause between words cuts the segment")
+            await expect(gap.currentText == "Great", "word after the pause opens the next segment")
+
+            // Idle cut fires only once the decoded frontier is past the last
+            // token by idleSeconds — not while decode is merely catching up.
+            let idle = TranscriptStreamSegmenter()
+            _ = idle.absorb([token(" done", 0.0, 0.3)])
+            await expect(idle.tick(decodedThrough: 1.0) == nil, "no idle cut before threshold")
+            let idleFinal = idle.tick(decodedThrough: 1.5)
+            await expect(idleFinal?.text == "done", "idle cut closes the trailing utterance")
+            await expect(idle.currentText.isEmpty, "segment empty after idle cut")
+            await expect(idle.tick(decodedThrough: 9.9) == nil, "idle cut doesn't re-fire on empty segment")
+
+            // Pending-final flush: idempotent, keeps the segment open under the
+            // same id so later emissions merge in place downstream.
+            let pending = TranscriptStreamSegmenter()
+            _ = pending.absorb([token(" ship", 0.0, 0.2), token(" it", 0.25, 0.4)])
+            let flushId = pending.segmentId
+            let flush1 = pending.takePendingFinal()
+            await expect(flush1?.text == "ship it" && flush1?.segmentId == flushId,
+                         "pending final carries the open segment's id and text")
+            await expect(pending.takePendingFinal() == nil, "second flush with no new tokens is nil")
+            _ = pending.absorb([token(" now", 0.5, 0.7)])
+            let flush2 = pending.takePendingFinal()
+            await expect(flush2?.text == "ship it now" && flush2?.segmentId == flushId,
+                         "new tokens re-arm the flush under the same segment id")
+
+            // A gap cut after a flush emits the full segment under that same id
+            // (downstream consumers replace by id), then rotates the id.
+            let cutAfterFlush = pending.absorb([token(" Next", 3.0, 3.2)])
+            await expect(cutAfterFlush.count == 1 && cutAfterFlush[0].segmentId == flushId
+                         && cutAfterFlush[0].text == "ship it now",
+                         "natural cut re-emits the flushed segment under its original id")
+            await expect(pending.segmentId != flushId, "segment id rotates after a cut")
+
+            // finish() closes whatever is open (stream teardown).
+            let teardown = TranscriptStreamSegmenter()
+            _ = teardown.absorb([token(" last", 0.0, 0.2), token(" words", 0.3, 0.5)])
+            await expect(teardown.finish()?.text == "last words", "finish flushes the open segment")
+            await expect(teardown.finish() == nil, "finish on empty segmenter is nil")
+
+            // Length cut: monologue with no pause closes at sentence punctuation
+            // once past the soft cap.
+            let long = TranscriptStreamSegmenter(
+                config: .init(gapSeconds: 1.0, idleSeconds: 1.1, softMaxCharacters: 15, hardMaxCharacters: 40)
+            )
+            var longFinals: [SegmenterFinal] = []
+            longFinals += long.absorb([token(" this", 0.0, 0.1), token(" is", 0.15, 0.2)])
+            longFinals += long.absorb([token(" quite", 0.25, 0.35), token(" long.", 0.4, 0.5)])
+            await expect(longFinals.count == 1 && longFinals[0].text == "this is quite long.",
+                         "soft length cap cuts at sentence-final punctuation")
+        }
+    }
+
     /// Pins the shared containment-merge rule used by TranscriptBuffer,
     /// ConversationContext, and transcript.md persistence.
     static func runTranscriptDedupSuite() async {
@@ -760,6 +844,98 @@ struct SmokeTestRunner {
     /// `AppleSpeechTranscriber`, and verify a non-empty transcript comes back. Skipped if
     /// the toolchain doesn't have Speech Recognition authorized — that's a TCC environment
     /// issue, not a code bug, and we report it as such.
+    /// End-to-end probe of the Parakeet engine: real model download + CoreML
+    /// load + streaming decode + segmentation, fed with `say`-synthesized
+    /// speech. Opt-in (downloads ~600 MB on first run, pre-warming the same
+    /// cache the app uses): `WP_PARAKEET_INTEGRATION=1 swift run SmokeTests`.
+    static func runParakeetIntegrationSuite() async {
+        await suite("Parakeet (integration)") {
+            guard ProcessInfo.processInfo.environment["WP_PARAKEET_INTEGRATION"] == "1" else {
+                print("  ⓘ Set WP_PARAKEET_INTEGRATION=1 to run the Parakeet end-to-end probe (first run downloads ~600 MB).")
+                return
+            }
+
+            // Synthesize a known phrase to a file with the system voice.
+            let phrase = "The quick brown fox jumps over the lazy dog"
+            let aiff = FileManager.default.temporaryDirectory
+                .appendingPathComponent("wp-parakeet-probe-\(UUID().uuidString).aiff")
+            defer { try? FileManager.default.removeItem(at: aiff) }
+            let say = Process()
+            say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+            say.arguments = ["-o", aiff.path, phrase]
+            do {
+                try say.run()
+                say.waitUntilExit()
+            } catch {
+                await expect(false, "say(1) failed: \(error.localizedDescription)")
+                return
+            }
+            guard say.terminationStatus == 0 else {
+                await expect(false, "say(1) exited with status \(say.terminationStatus)")
+                return
+            }
+
+            let transcriber = ParakeetTranscriber(statusNote: { print("  ⓘ \($0)") })
+            do {
+                try await transcriber.start(enabledChannels: [.system])
+            } catch {
+                await expect(false, "ParakeetTranscriber.start() threw: \(error.localizedDescription)")
+                return
+            }
+            defer { transcriber.stop() }
+
+            actor FinalCollector {
+                var finals: [String] = []
+                func append(_ text: String) { finals.append(text) }
+                func snapshot() -> [String] { finals }
+            }
+            let collector = FinalCollector()
+            let collectorTask = Task {
+                for await update in transcriber.transcripts where update.isFinal {
+                    await collector.append(update.text)
+                }
+            }
+
+            // Feed the synthesized speech, then enough silence to cover the
+            // engine's ~2 s lookahead plus the idle cut.
+            do {
+                let file = try AVAudioFile(forReading: aiff)
+                let canonical = CanonicalAudioFormat.make()
+                guard let converter = AVAudioConverter(from: file.processingFormat, to: canonical) else {
+                    await expect(false, "no converter for \(file.processingFormat)")
+                    return
+                }
+                let chunk = AVAudioFrameCount(file.processingFormat.sampleRate / 10)
+                while file.framePosition < file.length {
+                    guard let inBuf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk) else { break }
+                    try file.read(into: inBuf, frameCount: chunk)
+                    guard inBuf.frameLength > 0 else { break }
+                    if let out = StreamingAudioConverter.convert(inBuf, using: converter, label: "ParakeetProbe") {
+                        transcriber.feed(out, channel: .system)
+                    }
+                }
+                guard let silence = AVAudioPCMBuffer(pcmFormat: canonical, frameCapacity: 1600) else { return }
+                silence.frameLength = 1600 // 100 ms of zeros
+                for _ in 0..<60 { transcriber.feed(silence, channel: .system) }
+            } catch {
+                await expect(false, "feeding audio threw: \(error.localizedDescription)")
+                return
+            }
+
+            // Give the pump time to decode and idle-cut, then check the finals.
+            for _ in 0..<60 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if !(await collector.snapshot()).isEmpty { break }
+            }
+            collectorTask.cancel()
+            let finals = await collector.snapshot()
+            let combined = finals.joined(separator: " ").lowercased()
+            print("  ⓘ Parakeet finals: \(finals)")
+            await expect(combined.contains("quick brown fox"), "decoded phrase contains 'quick brown fox' (got: \"\(combined)\")")
+            await expect(combined.contains("lazy dog"), "decoded phrase contains 'lazy dog' (got: \"\(combined)\")")
+        }
+    }
+
     static func runSpeechRecognitionIntegrationSuite() async {
         await suite("SpeechRecognition (integration)") {
             let auth = SFSpeechRecognizer.authorizationStatus()

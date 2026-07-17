@@ -1293,11 +1293,17 @@ final class AppCoordinator {
 
     // MARK: - Transcriber selection
 
-    /// Constructs and starts a transcription provider. Prefers the macOS 26
-    /// `SpeechAnalyzer` framework (no per-task ~60 s cap, no silence-timeout failure
-    /// mode, native streaming) and falls back to the legacy `SFSpeechRecognizer`-based
-    /// path on older systems — or if the modern path fails to start (e.g. locale model
-    /// unavailable, asset install denied). Throws only when both paths fail.
+    /// Constructs and starts a transcription provider, best engine first:
+    ///
+    /// 1. **Parakeet Unified 0.6B** (FluidAudio, CoreML on the Neural Engine) for
+    ///    English locales — 1.79% WER on LibriSpeech test-clean with punctuation,
+    ///    the same accuracy class as Meet/Teams server captions. Falls through if
+    ///    the one-time ~600 MB model download or the CoreML load fails.
+    /// 2. **`SpeechAnalyzer`** (macOS 26+) — Apple's long-form engine; supports
+    ///    every locale Apple ships a model for.
+    /// 3. **`SFSpeechRecognizer`** legacy path on older systems.
+    ///
+    /// Throws only when every applicable path fails.
     private func makeStartedTranscriber() async throws -> TranscriptionProvider {
         // Tell the transcriber only about channels we'll actually feed. Without
         // the mic flag, an unused mic pipe still spins up its own recognizer task
@@ -1305,6 +1311,25 @@ final class AppCoordinator {
         // the user's log and a misleading signal during debugging.
         var channels: Set<AudioChannel> = [.system]
         if settings.captureMicrophone { channels.insert(.microphone) }
+
+        // Parakeet is English-only; other locales go straight to the Apple engines.
+        if settings.localeIdentifier.lowercased().hasPrefix("en") {
+            let parakeet = ParakeetTranscriber(statusNote: { [weak self] note in
+                Task { @MainActor [weak self] in
+                    self?.overlayState.appendSystemNote(note, category: .general)
+                }
+            })
+            do {
+                try await parakeet.start(enabledChannels: channels)
+                wpInfo("[Coordinator] using Parakeet Unified (FluidAudio) transcriber (channels=\(channels))")
+                return parakeet
+            } catch {
+                wpWarn("[Coordinator] Parakeet start failed (\(error.localizedDescription)); falling back to Apple speech engines")
+                parakeet.stop()
+            }
+        } else {
+            wpInfo("[Coordinator] locale \(settings.localeIdentifier) is not English — using Apple speech engines")
+        }
 
         if #available(macOS 26.0, *) {
             let modern = SpeechAnalyzerTranscriber(locale: settings.locale)

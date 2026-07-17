@@ -60,7 +60,11 @@ protocol TranscriptionProvider {
 
 `TranscriptUpdate` carries `(segmentId, text, isFinal, channel, timestamp)` — `channel` is preserved end-to-end so the overlay shows `OTHER:` vs `ME:` and the trigger engine can ignore the user's own utterances.
 
-On macOS 26+ the default implementation is `SpeechAnalyzerTranscriber` (Apple's long-form `SpeechAnalyzer`/`SpeechTranscriber` framework); older systems fall back to `AppleSpeechTranscriber`, which runs two `SFSpeechRecognizer` pipes in parallel — one per channel — cycling its recognition tasks at VAD utterance boundaries and trimming replay overlap at task seams. Selection is automatic; there is no user-facing engine setting.
+Engine selection is automatic — there is no user-facing setting — and goes best-first:
+
+1. **`ParakeetTranscriber`** (English locales): FluidAudio's Parakeet Unified 0.6B CoreML engine, one `StreamingUnifiedAsrManager` per channel on the Neural Engine. Chosen for transcript quality: 1.79% aggregate WER on LibriSpeech test-clean *with punctuation and capitalization* — the accuracy class of Meet/Teams server captions, and well ahead of the Apple engines. True streaming (~2 s latency), designed for hour-long sessions. The engine emits one continuous token stream with per-token audio timings; `TranscriptStreamSegmenter` owns the cutting rules that turn it into utterance-sized lines (pause-based gap cut on decoder timings, idle cut against the decoded frontier, length cut for pauseless monologues). Models (~600 MB) auto-download from Hugging Face on first use, cached under Application Support/FluidAudio; failure (offline first launch, unsupported hardware) falls through to the Apple engines.
+2. **`SpeechAnalyzerTranscriber`** (macOS 26+): Apple's long-form `SpeechAnalyzer`/`SpeechTranscriber` framework. Handles every locale Apple ships a model for.
+3. **`AppleSpeechTranscriber`** (older systems): two `SFSpeechRecognizer` pipes in parallel — one per channel — cycling recognition tasks at VAD utterance boundaries and trimming replay overlap at task seams.
 
 `TranscriptBuffer` is an actor holding the live-caption display model: finalized segments are append-only and immutable, and each channel has at most one volatile (in-progress) segment that partial hypotheses replace wholesale. A final on a channel consumes that channel's volatile slot, and consecutive near-duplicate finals are merged. The buffer publishes its current state to `OverlayState`; finalized lines flow to `ConversationContext`.
 
@@ -155,7 +159,7 @@ The Settings window is owned by `AppDelegate`, not by SwiftUI's `Settings { }` s
 
 ## Why these choices
 
-- **`SFSpeechRecognizer` over WhisperKit on day one.** No model download, no Core ML compile, works on first launch. The `TranscriptionProvider` protocol means swapping in WhisperKit later is a single conformance.
+- **Parakeet Unified over WhisperKit for the quality engine.** Better English WER than Whisper large-v3-turbo, true streaming instead of chunk-re-decode, no hallucination-on-silence failure mode, and an int8 encoder that lives on the ANE. The Apple engines stay as zero-download fallbacks (non-English locales, offline first launch), and the `TranscriptionProvider` protocol keeps any future engine a single conformance.
 - **Gemini Flash over Pro by default.** Latency is the dominant UX signal here. Flash's first-token latency on streamed completion is consistently sub-second.
 - **No SwiftData / no Core Data.** The persistence model is markdown files on disk. Plain text outlives any database we'd pick. If we ever need indexing, we'll add it on top of the same files.
 - **`NSWindow` (not `NSPanel`) for the overlay.** Window managers refuse to touch panels and borderless windows. Real `NSWindow` with hidden chrome gives both the borderless look and full window-manager support.

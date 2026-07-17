@@ -95,7 +95,7 @@ The overlay is always available once you've picked a session.
 
 ## Privacy
 
-- **Audio never leaves your device.** Capture and transcription are entirely local — `SFSpeechRecognizer` with on-device recognition where the locale supports it.
+- **Audio never leaves your device.** Capture and transcription are entirely local. English sessions use the Parakeet Unified 0.6B CoreML model (via [FluidAudio](https://github.com/FluidInference/FluidAudio)) running on the Neural Engine — the same accuracy class as Meet/Teams server captions; it downloads once (~600 MB) on first use. Other locales use Apple's on-device speech engines.
 - **The LLM is the only thing that talks to the network**, and only when *you* trigger it (auto-send tick, detected question, or composer submit). No background polling.
 - **Your API key lives in the macOS Keychain.** Never written to disk in plaintext.
 - **Screenshots are sent only when you tick *See my screen*** — never cached, never persisted.
@@ -113,7 +113,7 @@ The overlay is always available once you've picked a session.
 
 ## Contributing
 
-The codebase is small, protocol-first, and intentionally non-magical — most contributions fit inside a single module. Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), then [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md). High-value areas right now: WhisperKit transcriber, Ollama provider, snapshot tests for the trigger heuristics, real app icon.
+The codebase is small, protocol-first, and intentionally non-magical — most contributions fit inside a single module. Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), then [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md). High-value areas right now: multilingual Parakeet/Nemotron engines, Ollama provider, snapshot tests for the trigger heuristics, real app icon.
 
 ## License
 

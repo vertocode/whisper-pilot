@@ -26,7 +26,7 @@ Every setting below is reachable from the overlay's `…` menu → **Settings**.
 | Setting | Default | Notes |
 | --- | --- | --- |
 | **Response style** | `concise` | One of `concise` / `detailed` / `strategic` / `follow-up`. Tunes the system prompt. |
-| **Locale** | system locale | `SFSpeechRecognizer` is locale-bound — match the language being spoken. |
+| **Locale** | system locale | Match the language being spoken. English locales use the high-accuracy Parakeet engine (one-time ~600 MB model download, cached in `~/Library/Application Support/FluidAudio/`); other locales use Apple's locale-bound speech engines. |
 | **Auto-send to AI** | `Off` | `Off` / `30 s` / `1 min` / `2 min` / `5 min`. When on, the assistant proactively summarizes recent transcript on every tick. Skipped if no new transcripts since the last send. |
 
 Transcript line-breaking is no longer configurable: lines split automatically at natural utterance boundaries (a ~1.5 s pause), the same cadence Meet/Teams captions use.
