@@ -91,6 +91,12 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
             if payload.isEmpty || payload == "[DONE]" { continue }
             guard let data = payload.data(using: .utf8) else { continue }
             if let chunk = try? JSONDecoder().decode(GeminiResponse.self, from: data) {
+                if let blockReason = chunk.promptFeedback?.blockReason {
+                    // Input blocked: no candidates will ever arrive. Surface the
+                    // real cause instead of ending reason-less (which downstream
+                    // reads as "likely a network drop").
+                    throw GeminiError.promptBlocked(reason: blockReason)
+                }
                 if let text = chunk.firstText, !text.isEmpty {
                     continuation.yield(.delta(text))
                 }
@@ -258,7 +264,14 @@ private struct GeminiResponse: Decodable {
         let content: Content?
         let finishReason: String?
     }
+    struct PromptFeedback: Decodable {
+        let blockReason: String?
+    }
     let candidates: [Candidate]?
+    /// Present (with `blockReason`) when the *input* was blocked — the response
+    /// then has zero candidates and no finishReason, which without this field
+    /// was indistinguishable from a transport drop.
+    let promptFeedback: PromptFeedback?
 
     var firstText: String? {
         candidates?.first?.content?.parts?.compactMap(\.text).joined()
@@ -274,9 +287,12 @@ private struct GeminiResponse: Decodable {
 
 enum GeminiError: LocalizedError {
     case http(status: Int, body: String?)
+    case promptBlocked(reason: String)
 
     var errorDescription: String? {
         switch self {
+        case .promptBlocked(let reason):
+            return "Gemini blocked the request before generating (\(reason)). Usually a safety filter on the prompt content — rephrase the question or trim the attached context."
         case .http(let status, let body):
             switch status {
             case 401, 403:
