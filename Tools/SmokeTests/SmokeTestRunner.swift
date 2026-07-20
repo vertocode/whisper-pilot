@@ -253,6 +253,21 @@ struct SmokeTestRunner {
                          "action-items prompt pins the exact empty-state sentence")
             await expect(actions.context.contains("send the PR for review"),
                          "action-items carries the transcript context through")
+
+            // Budget clamps: a resumed multi-hour session must not paste the whole
+            // transcript.md/chat.md into the prompt. Tail is kept (recent end
+            // matters live); user context files keep their head.
+            var bigSnapshot = snapshotFor()
+            bigSnapshot.priorTranscriptMarkdown =
+                "OLDEST-LINE\n" + String(repeating: "x", count: PromptBuilder.priorTranscriptBudget * 2) + "\nNEWEST-LINE"
+            bigSnapshot.globalContextBlock =
+                "DOC-HEAD\n" + String(repeating: "y", count: PromptBuilder.contextFileBudget * 2) + "\nDOC-TAIL"
+            let clamped = PromptBuilder.build(context: bigSnapshot, history: [], question: "?", style: .concise)
+            await expect(clamped.context.contains("NEWEST-LINE"), "prior transcript keeps its tail")
+            await expect(!clamped.context.contains("OLDEST-LINE"), "prior transcript head is truncated")
+            await expect(clamped.context.contains("DOC-HEAD"), "context file keeps its head")
+            await expect(!clamped.context.contains("DOC-TAIL"), "context file tail is truncated")
+            await expect(clamped.context.contains("truncated"), "truncation is marked in the prompt")
         }
     }
 

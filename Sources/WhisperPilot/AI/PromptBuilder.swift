@@ -201,6 +201,31 @@ enum PromptBuilder {
         )
     }
 
+    // MARK: - Context budgets
+    //
+    // Per-section character caps (~4 chars ≈ 1 token). Without them a resumed
+    // hours-long session pastes the *entire* transcript.md + chat.md into every
+    // single trigger, and context files add up to 200 KB each — easy request-size
+    // 400s on Gemini's free tier and uncontrolled per-call spend on Claude.
+    // User-attached context keeps its head (documents front-load what they are);
+    // transcripts and chat keep their tail (the recent end is what matters live).
+
+    static let contextFileBudget = 16_000
+    static let priorTranscriptBudget = 20_000
+    static let priorChatBudget = 10_000
+
+    /// Keeps the first `limit` characters, marking the cut.
+    static func clampHead(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return text.prefix(limit) + "\n[… truncated — content continues but was cut to fit the prompt budget …]"
+    }
+
+    /// Keeps the last `limit` characters, marking the cut.
+    static func clampTail(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return "[… earlier content truncated to fit the prompt budget …]\n" + text.suffix(limit)
+    }
+
     private static func contextBlock(transcript: ConversationSnapshot, history: [ChatTurn]) -> String {
         var sections: [String] = []
 
@@ -210,17 +235,17 @@ enum PromptBuilder {
         // as authoritative when answering things like "based on my notes" / "what
         // does the attached file say about X".
         if let globalContext = transcript.globalContextBlock {
-            sections.append("Global context provided by the user (applies to every session):\n\(globalContext)")
+            sections.append("Global context provided by the user (applies to every session):\n\(clampHead(globalContext, to: contextFileBudget))")
         }
         if let sessionContext = transcript.sessionContextBlock {
-            sections.append("Session context provided by the user (specific to this session):\n\(sessionContext)")
+            sections.append("Session context provided by the user (specific to this session):\n\(clampHead(sessionContext, to: contextFileBudget))")
         }
 
         if let priorTranscript = transcript.priorTranscriptMarkdown {
-            sections.append("Prior session transcript (resumed):\n\(priorTranscript)")
+            sections.append("Prior session transcript (resumed):\n\(clampTail(priorTranscript, to: priorTranscriptBudget))")
         }
         if let priorChat = transcript.priorChatMarkdown {
-            sections.append("Prior session AI chat (resumed):\n\(priorChat)")
+            sections.append("Prior session AI chat (resumed):\n\(clampTail(priorChat, to: priorChatBudget))")
         }
 
         let recent = transcript.recentLines.suffix(20).joined(separator: "\n")
