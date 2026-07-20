@@ -103,8 +103,27 @@ final class CrashLogger: @unchecked Sendable {
         // Catch fatal POSIX signals. SIGABRT is what Swift's `fatalError` and
         // optional-unwrap-of-nil raise — these are the most common Swift-side
         // hard crashes.
+        //
+        // `sigaction` + `SA_ONSTACK` on an alternate stack instead of plain
+        // `signal()`: a stack-overflow SIGSEGV cannot run its handler on the
+        // exhausted stack — the handler itself re-faults and the crash goes
+        // unlogged. That's the single most common hard-crash class, so it's
+        // exactly the one worth catching. The alternate stack is deliberately
+        // never freed; it must outlive everything.
+        var altStack = stack_t()
+        let stackSize = max(Int(SIGSTKSZ), 64 * 1024)
+        altStack.ss_sp = malloc(stackSize)
+        altStack.ss_size = stackSize
+        altStack.ss_flags = 0
+        if sigaltstack(&altStack, nil) != 0 {
+            writeLine("⚠️ sigaltstack failed (errno=\(errno)) — stack-overflow crashes won't be logged")
+        }
         for sig in [SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE] as [Int32] {
-            signal(sig, crashLogger_signalHandler)
+            var action = sigaction()
+            action.__sigaction_u = __sigaction_u(__sa_handler: crashLogger_signalHandler)
+            action.sa_flags = SA_ONSTACK
+            sigemptyset(&action.sa_mask)
+            sigaction(sig, &action, nil)
         }
 
         // Memory pressure: when macOS is about to OOM-kill us, we get a warning
