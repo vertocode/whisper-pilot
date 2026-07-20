@@ -43,11 +43,33 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
 
         // Build the requested pipes in parallel — asset install + format probe can
         // take a noticeable moment on first launch; doing them concurrently halves
-        // startup when both are wanted.
-        async let micPipe: Pipe? = wantMic ? Pipe.make(channel: .microphone, locale: locale, sink: continuation) : nil
-        async let sysPipe: Pipe? = wantSys ? Pipe.make(channel: .system, locale: locale, sink: continuation) : nil
-        let mic = try await micPipe
-        let sys = try await sysPipe
+        // startup when both are wanted. Each side resolves to a Result rather
+        // than throwing directly: with `try await` on two `async let`s, one side
+        // failing would discard the other's already-running pipe (analyzer live,
+        // input stream open) without ever calling `finish()` on it.
+        async let micResult: Result<Pipe, Error>? = wantMic ? makePipe(channel: .microphone) : nil
+        async let sysResult: Result<Pipe, Error>? = wantSys ? makePipe(channel: .system) : nil
+        let micR = await micResult
+        let sysR = await sysResult
+
+        var mic: Pipe?
+        var sys: Pipe?
+        var firstError: Error?
+        switch micR {
+        case .success(let pipe)?: mic = pipe
+        case .failure(let error)?: firstError = error
+        case nil: break
+        }
+        switch sysR {
+        case .success(let pipe)?: sys = pipe
+        case .failure(let error)?: firstError = firstError ?? error
+        case nil: break
+        }
+        if let firstError {
+            mic?.finish()
+            sys?.finish()
+            throw firstError
+        }
 
         if !installPipes(mic: mic, sys: sys) {
             mic?.finish()
@@ -55,6 +77,14 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
             return
         }
         wpInfo("SpeechAnalyzer: channel pipes ready (mic=\(mic != nil), sys=\(sys != nil))")
+    }
+
+    private func makePipe(channel: AudioChannel) async -> Result<Pipe, Error> {
+        do {
+            return .success(try await Pipe.make(channel: channel, locale: locale, sink: continuation))
+        } catch {
+            return .failure(error)
+        }
     }
 
     /// Non-async wrapper around the locked dict update — Swift 6 strict concurrency
@@ -110,6 +140,9 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
     }
 
     deinit {
+        // Dropping the transcriber without an explicit `stop()` must still end
+        // the channel pipes — each keeps a live analyzer + open input stream.
+        for pipe in pipes.values { pipe.finish() }
         continuation.finish()
     }
 

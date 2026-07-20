@@ -67,6 +67,10 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
     }
 
     deinit {
+        // Dropping the transcriber without an explicit `stop()` must still end
+        // the channel pipes — each keeps a live recognizer task alive.
+        systemPipe?.finish()
+        micPipe?.finish()
         continuation.finish()
     }
 

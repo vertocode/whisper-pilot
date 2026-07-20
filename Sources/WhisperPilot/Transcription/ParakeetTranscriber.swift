@@ -47,12 +47,20 @@ final class ParakeetTranscriber: TranscriptionProvider, @unchecked Sendable {
         // model download; the second then loads from the same cache instead of
         // racing a duplicate download of the same ~600 MB bundle.
         var built: [AudioChannel: Pipe] = [:]
-        for channel in [AudioChannel.system, .microphone] where enabledChannels.contains(channel) {
-            built[channel] = try await Pipe.make(
-                channel: channel,
-                sink: continuation,
-                statusNote: statusNote
-            )
+        do {
+            for channel in [AudioChannel.system, .microphone] where enabledChannels.contains(channel) {
+                built[channel] = try await Pipe.make(
+                    channel: channel,
+                    sink: continuation,
+                    statusNote: statusNote
+                )
+            }
+        } catch {
+            // If the second channel's build throws, the first pipe is already
+            // pumping and holds its multi-hundred-MB ASR manager alive — finish
+            // it before propagating or it leaks for the app's lifetime.
+            for pipe in built.values { pipe.finish() }
+            throw error
         }
 
         mutex.lock()
@@ -98,6 +106,9 @@ final class ParakeetTranscriber: TranscriptionProvider, @unchecked Sendable {
     }
 
     deinit {
+        // Dropping the transcriber without an explicit `stop()` must still end
+        // the channel pumps — each holds its ASR manager alive until finished.
+        for pipe in pipes.values { pipe.finish() }
         continuation.finish()
     }
 }
