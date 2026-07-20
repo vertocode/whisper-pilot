@@ -190,13 +190,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        Task { await coordinator.shutdown() }
-        // Mark a clean shutdown so the next launch doesn't false-alarm
-        // "previous run ended unexpectedly". Runs after the coordinator's
-        // own shutdown is queued — the sentinel removal is what differentiates
-        // a clean exit from a kernel-killed one.
-        CrashLogger.shared.markCleanShutdown()
+    /// Delay termination until the coordinator has actually flushed its pending
+    /// transcript lines / context saves. A fire-and-forget Task from
+    /// `applicationWillTerminate` loses the race against process exit, silently
+    /// dropping the last utterance and the most recent context edits. The
+    /// timeout guards against a hung shutdown keeping the app alive forever.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor [coordinator] in
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await coordinator.shutdown() }
+                group.addTask { try? await Task.sleep(nanoseconds: 5_000_000_000) }
+                await group.next()
+                group.cancelAll()
+            }
+            // Mark a clean shutdown so the next launch doesn't false-alarm
+            // "previous run ended unexpectedly". Runs only after the flushes
+            // above have completed (or timed out).
+            CrashLogger.shared.markCleanShutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func showSettings() {
