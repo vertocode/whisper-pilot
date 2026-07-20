@@ -56,6 +56,10 @@ Flags:
                           and Homebrew tap update.
       --skip-publish      Build (and update tap, if enabled). Skip GH Release.
       --skip-tap          Build + create GH Release. Skip the tap update.
+      --push-bump         After a successful release, commit the in-repo
+                          version bumps (Project.yml, Resources/Info.plist,
+                          Casks/whisper-pilot.rb) and push them to main.
+                          Default is to leave them uncommitted for review.
   -h, --help              Show this help.
 
 Examples:
@@ -70,6 +74,7 @@ VERSION=""
 BUILD_ONLY=0
 SKIP_PUBLISH=0
 SKIP_TAP=0
+PUSH_BUMP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -79,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     --build-only)    BUILD_ONLY=1; shift ;;
     --skip-publish)  SKIP_PUBLISH=1; shift ;;
     --skip-tap)      SKIP_TAP=1; shift ;;
+    --push-bump)     PUSH_BUMP=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     --)              shift; break ;;
     -*)              echo "Unknown flag: $1" >&2; usage >&2; exit 1 ;;
@@ -441,17 +447,45 @@ fi
 echo
 done_step "Release v${VERSION} complete."
 
-# --- Hint: uncommitted in-repo version bumps -------------------------------
-# The version-bump edits live in the working tree until the user commits them
-# themselves — a release script auto-pushing to main was deliberately ruled
-# out as too aggressive. Surface a clear nudge so the bumps don't just sit
-# uncommitted forever, drifting from the released tag.
-if [[ ${PROJECT_YML_BUMPED:-0} -eq 1 ]] || [[ ${CASK_BUMPED:-0} -eq 1 ]]; then
+# --- In-repo version bumps: auto-push or hint -------------------------------
+# The version-bump edits live in the working tree. By default they are left
+# uncommitted for review (auto-pushing to main unconditionally was ruled out
+# as too aggressive); pass --push-bump to opt into committing and pushing
+# them automatically after a successful release.
+CHANGED_FILES=()
+[[ ${PROJECT_YML_BUMPED:-0} -eq 1 ]] && CHANGED_FILES+=("Project.yml")
+# Resources/Info.plist is regenerated from Project.yml by ./bin/regenerate,
+# so it changes as a side effect of the Project.yml bump.
+if ! git diff --quiet -- Resources/Info.plist 2>/dev/null; then
+  CHANGED_FILES+=("Resources/Info.plist")
+fi
+[[ ${CASK_BUMPED:-0} -eq 1 ]] && CHANGED_FILES+=("Casks/whisper-pilot.rb")
+
+if [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
   echo
-  CHANGED_FILES=()
-  [[ ${PROJECT_YML_BUMPED:-0} -eq 1 ]] && CHANGED_FILES+=("Project.yml")
-  [[ ${CASK_BUMPED:-0} -eq 1 ]] && CHANGED_FILES+=("Casks/whisper-pilot.rb")
-  warn "Uncommitted version bump in: ${CHANGED_FILES[*]}"
-  warn "Review the diff and commit when ready:"
-  warn "    git add ${CHANGED_FILES[*]} && git commit -m 'chore: bump to v${VERSION}'"
+  if [[ ${PUSH_BUMP} -eq 1 ]]; then
+    BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+    if [[ "${BRANCH}" != "main" ]]; then
+      warn "--push-bump requested but not on main (on '${BRANCH:-detached HEAD}') — skipping auto-push."
+      warn "Commit manually when ready:"
+      warn "    git add ${CHANGED_FILES[*]} && git commit -m 'chore: bump to v${VERSION}'"
+    else
+      step "Committing + pushing version bump (${CHANGED_FILES[*]})"
+      # The release itself is already published at this point — a commit/push
+      # failure must not trip the ERR trap's "Nothing was published" banner.
+      if git add "${CHANGED_FILES[@]}" \
+          && git commit -m "chore: bump to v${VERSION}" \
+          && git push origin main; then
+        done_step "Version bump committed and pushed to main."
+      else
+        warn "Auto commit/push failed — finish manually:"
+        warn "    git add ${CHANGED_FILES[*]} && git commit -m 'chore: bump to v${VERSION}' && git push origin main"
+      fi
+    fi
+  else
+    warn "Uncommitted version bump in: ${CHANGED_FILES[*]}"
+    warn "Review the diff and commit when ready:"
+    warn "    git add ${CHANGED_FILES[*]} && git commit -m 'chore: bump to v${VERSION}'"
+    warn "(or re-run with --push-bump to do this automatically next time)"
+  fi
 fi
