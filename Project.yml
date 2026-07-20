@@ -47,7 +47,7 @@ targets:
       properties:
         CFBundleName: Whisper Pilot
         CFBundleDisplayName: Whisper Pilot
-        CFBundleShortVersionString: "0.1.18"
+        CFBundleShortVersionString: "0.1.19"
         CFBundleVersion: "1"
         LSApplicationCategoryType: public.app-category.productivity
         LSUIElement: true
