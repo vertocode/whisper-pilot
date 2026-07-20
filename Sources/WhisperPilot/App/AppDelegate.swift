@@ -172,8 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // "Starting…" state.
             Task { [coordinator] in
                 if await coordinator.isRunning {
-                    await coordinator.stopListening()
-                    await coordinator.startListening()
+                    await coordinator.restartListening()
                 }
                 await MainActor.run {
                     coordinator.overlayState.appendSystemNote(

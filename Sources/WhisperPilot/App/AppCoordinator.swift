@@ -173,6 +173,17 @@ final class AppCoordinator {
     private var isLoadingSessionContext: Bool = false
 
     private(set) var isRunning = false
+    /// Monotonic session counter, bumped on every start AND stop. Watchdog tasks
+    /// capture the generation they were armed for and no-op if it moved on —
+    /// without this, a quick stop→start left session N's 6 s/14 s watchdogs
+    /// alive to fire against session N+1's counters (false "no audio" warnings,
+    /// and in the worst case an auto-SCK switch bouncing the wrong session).
+    private var sessionGeneration = 0
+    /// One-shot override for the mic-mute default applied at session start.
+    /// Set by `restartListening()` so an automatic bounce (silent-tap watchdog,
+    /// capture-path switch) preserves the user's in-session mute instead of
+    /// resetting it to the `alwaysTranscribeMic` default.
+    private var pendingMicMuteRestore: Bool?
     /// Set for the duration of `startListening`. Prevents the user from double-clicking
     /// Play (or the disabled-but-still-clickable stop affordance) from re-entering startup
     /// while audio capture is mid-setup, which would leave duplicate captures running.
@@ -335,6 +346,7 @@ final class AppCoordinator {
         }
         isStartingUp = true
         defer { isStartingUp = false }
+        sessionGeneration += 1
         wpInfo("[Coordinator] ▶ startListening")
         // Fresh AsyncStream instances per session — see the property declarations
         // for why. Doing this here (rather than at `stopListening` time) keeps the
@@ -488,8 +500,10 @@ final class AppCoordinator {
         // mic channel starts muted (frames dropped before VAD/transcription) so the mic
         // recognizer doesn't run by default; system audio still transcribes. The user can
         // flip it on any time with the in-session mic toggle. Set before the pipeline so
-        // the mute mirror is in place before the first frame is processed.
-        overlayState.isMicrophoneMuted = !settings.alwaysTranscribeMic
+        // the mute mirror is in place before the first frame is processed. An automatic
+        // bounce (`restartListening`) restores the user's in-session choice instead.
+        overlayState.isMicrophoneMuted = pendingMicMuteRestore ?? !settings.alwaysTranscribeMic
+        pendingMicMuteRestore = nil
 
         startPipeline(transcriber: transcriber, ai: aiProvider)
 
@@ -677,9 +691,10 @@ final class AppCoordinator {
     /// transcripts started. The 14s gate fires only if audio is flowing — that's the case
     /// where SFSpeechRecognizer is the bottleneck and the user needs a concrete next step.
     private func startNoFramesWatchdog() {
+        let generation = sessionGeneration
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 6_000_000_000)
-            guard let self, self.isRunning else { return }
+            guard let self, self.isRunning, self.sessionGeneration == generation else { return }
             let sysCount = self.overlayState.systemAudioFrameCount
             let micCount = self.overlayState.microphoneFrameCount
             let outName = MicrophoneCapture.defaultOutputDeviceInfo()?.name ?? "unknown"
@@ -715,7 +730,7 @@ final class AppCoordinator {
 
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 14_000_000_000)
-            guard let self, self.isRunning else { return }
+            guard let self, self.isRunning, self.sessionGeneration == generation else { return }
             if self.overlayState.audioFrameCount > 0, self.overlayState.transcriptCount == 0 {
                 let locale = self.settings.localeIdentifier
                 let message = "Still no transcripts after 14 seconds (locale=\(locale)). Likely causes: (a) Speech Recognition not authorized — check System Settings → Privacy & Security → Speech Recognition; (b) wrong locale — open Settings → General → Locale and try \"en-US\"; (c) the audio is silent or non-speech. Open the 🐞 Diagnostics panel to see RMS values per buffer."
@@ -756,9 +771,8 @@ final class AppCoordinator {
                         guard let self else { return }
                         // If the user hit Stop in the gap since the watchdog
                         // fired, honor it — don't resurrect a stopped session.
-                        guard self.isRunning else { return }
-                        await self.stopListening()
-                        await self.startListening()
+                        guard self.isRunning, self.sessionGeneration == generation else { return }
+                        await self.restartListening()
                     }
                 } else {
                     self.overlayState.appendSystemNote(
@@ -813,10 +827,11 @@ final class AppCoordinator {
     /// Fires only while `status == .starting`, so it auto-cancels itself once
     /// startup completes (or fails).
     private func startStartupWatchdog() {
+        let generation = sessionGeneration
         // ~8s: gentle nudge — "this is taking a while, here's probably why".
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 8_000_000_000)
-            guard let self else { return }
+            guard let self, self.sessionGeneration == generation else { return }
             guard self.overlayState.status == .starting else { return }
             let message = "Startup is taking longer than usual. On a fresh install macOS may be downloading on-device speech recognition models in the background — this can take 30 seconds to a few minutes. Hang tight."
             wpInfo(message)
@@ -829,7 +844,7 @@ final class AppCoordinator {
         // chosen locale, etc.).
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 30_000_000_000)
-            guard let self else { return }
+            guard let self, self.sessionGeneration == generation else { return }
             guard self.overlayState.status == .starting else { return }
             let locale = self.settings.localeIdentifier
             // Only suggest an alternate locale when the current one isn't already
@@ -875,6 +890,7 @@ final class AppCoordinator {
 
     func stopListening() async {
         guard isRunning || transcriber != nil else { return }
+        sessionGeneration += 1
         log.info("⏹ stopListening")
         for task in consumerTasks { task.cancel() }
         consumerTasks.removeAll()
@@ -921,6 +937,15 @@ final class AppCoordinator {
 
     func toggleListening() async {
         if isRunning { await stopListening() } else { await startListening() }
+    }
+
+    /// Stop + start on behalf of an automatic recovery path (silent-tap watchdog,
+    /// capture-path switch). Unlike a user-initiated stop/start, this preserves
+    /// in-session state the user set — currently the mic mute toggle.
+    func restartListening() async {
+        pendingMicMuteRestore = overlayState.isMicrophoneMuted
+        await stopListening()
+        await startListening()
     }
 
     func toggleAIPaused() {
