@@ -121,6 +121,16 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
                    let reason = chunk.delta?.stop_reason {
                     stopReason = reason
                 }
+            case "error":
+                // Mid-stream API errors (overloaded_error, api_error, …) arrive
+                // as their own SSE event. Dropping them here would end the
+                // stream with no stop_reason and get misreported downstream as
+                // a network drop — throw the real cause instead.
+                let decoded = try? JSONDecoder().decode(AnthropicStreamErrorEvent.self, from: data)
+                throw AnthropicError.stream(
+                    type: decoded?.error?.type,
+                    message: decoded?.error?.message
+                )
             default:
                 continue
             }
@@ -298,11 +308,29 @@ private struct AnthropicMessageDelta: Decodable {
     let delta: Delta?
 }
 
+private struct AnthropicStreamErrorEvent: Decodable {
+    struct Err: Decodable {
+        let type: String?
+        let message: String?
+    }
+    let error: Err?
+}
+
 enum AnthropicError: LocalizedError {
     case http(status: Int, body: String?)
+    case stream(type: String?, message: String?)
 
     var errorDescription: String? {
         switch self {
+        case .stream(let type, let message):
+            switch type {
+            case "overloaded_error":
+                return "Anthropic is temporarily overloaded — retry in a moment."
+            default:
+                let label = type ?? "unknown"
+                let detail = message.map { ": \($0)" } ?? ""
+                return "Anthropic stream error (\(label))\(detail)"
+            }
         case .http(let status, let body):
             switch status {
             case 401, 403:

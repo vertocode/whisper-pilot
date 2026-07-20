@@ -131,9 +131,7 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
     private func endpoint(streaming: Bool) -> URL {
         let method = streaming ? "streamGenerateContent" : "generateContent"
         var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):\(method)")!
-        var items = [URLQueryItem(name: "key", value: apiKey)]
-        if streaming { items.append(URLQueryItem(name: "alt", value: "sse")) }
-        components.queryItems = items
+        if streaming { components.queryItems = [URLQueryItem(name: "alt", value: "sse")] }
         return components.url!
     }
 
@@ -141,6 +139,9 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Key goes in a header, not a `?key=` query parameter — URLs leak into
+        // proxy/server logs and error messages that embed the request URL.
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.httpBody = body
         request.timeoutInterval = 60
         return request
