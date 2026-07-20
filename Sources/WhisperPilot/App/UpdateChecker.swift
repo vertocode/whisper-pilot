@@ -25,17 +25,23 @@ final class UpdateChecker: ObservableObject {
 
     /// Throttle: re-checking on every header render would hammer the API and
     /// the unauthenticated GitHub rate limit (60/hr/IP). Once per app run is
-    /// almost always enough; the interval re-arms long sessions.
-    private var lastCheckedAt: Date?
+    /// almost always enough; the interval re-arms long sessions. A transport
+    /// failure (launched offline, DNS hiccup) re-arms with the short retry
+    /// instead — claiming the full 6 h on a failed check meant a launch-time
+    /// network blip suppressed update discovery for the rest of the workday.
+    private var nextCheckAllowedAt: Date = .distantPast
     private let minCheckInterval: TimeInterval = 6 * 60 * 60
+    private let failureRetryInterval: TimeInterval = 5 * 60
 
     private init() {}
 
     /// Checks for a newer release, throttled. Safe to call from every
     /// `.task` on the header views — repeat calls inside the interval no-op.
     func checkForUpdates() async {
-        if let last = lastCheckedAt, Date().timeIntervalSince(last) < minCheckInterval { return }
-        lastCheckedAt = Date()
+        guard Date() >= nextCheckAllowedAt else { return }
+        // Claim the full interval up front so overlapping calls from the two
+        // header views can't double-fire; shortened again on failure below.
+        nextCheckAllowedAt = Date().addingTimeInterval(minCheckInterval)
 
         guard let endpoint = URL(string: "https://api.github.com/repos/vertocode/whisper-pilot/releases/latest") else { return }
         var request = URLRequest(url: endpoint)
@@ -68,8 +74,9 @@ final class UpdateChecker: ObservableObject {
             available = Release(version: latest, url: pageURL)
         } catch {
             // Offline / DNS / TLS failures are routine for an ambient app —
-            // log for diagnostics, never surface a scary banner.
+            // log for diagnostics, never surface a scary banner, retry soon.
             wpInfo("Update check failed: \(error.localizedDescription)")
+            nextCheckAllowedAt = Date().addingTimeInterval(failureRetryInterval)
         }
     }
 
