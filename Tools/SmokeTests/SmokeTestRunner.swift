@@ -1162,16 +1162,46 @@ struct SmokeTestRunner {
                              "load high through the escalation window → .tier2Stop")
             }
 
-            // Load recovering after Tier-1 → back to .ok.
+            // Load recovering after Tier-1 → back to .ok, but only after the
+            // recovery sustain (hysteresis): a single calm sample must NOT
+            // release the tier, or load oscillating around the threshold flaps
+            // Tier-1 on/off and cancels in-flight AI completions each time.
             do {
                 let gov = ResourceGovernor(config: config)
                 _ = gov.evaluate(nominal(cpu: 85), at: 0)
                 let t1 = config.cpuSustainSeconds
                 await expect(gov.evaluate(nominal(cpu: 85), at: t1) == .tier1Pause,
                              "enters Tier-1 once sustained")
-                await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5) == .ok,
-                             "load recovers below threshold → back to .ok")
+                await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5) == .tier1Pause,
+                             "first calm sample holds Tier-1 (recovery sustain running)")
+                await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5 + config.recoverySeconds) == .ok,
+                             "calm through the recovery window → back to .ok")
                 await expect(gov.tier == .normal, "recovery returns the governor to .normal")
+            }
+
+            // Middle band (release < cpu ≤ engage) holds Tier-1: neither
+            // releases nor escalates.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(cpu: 85), at: 0)
+                let t1 = config.cpuSustainSeconds
+                _ = gov.evaluate(nominal(cpu: 85), at: t1)
+                await expect(gov.evaluate(nominal(cpu: 65), at: t1 + config.tier2EscalationSeconds + 10) == .tier1Pause,
+                             "middle-band load holds Tier-1 without escalating to Tier-2")
+                await expect(gov.tier == .tier1, "middle band keeps the governor in .tier1")
+            }
+
+            // Spiky-but-high load: brief dips within the tolerance must not
+            // reset the sustain run — previously a single 750 ms dip restarted
+            // the 20 s clock and the valve never engaged under real spiky load.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(cpu: 85), at: 0)
+                _ = gov.evaluate(nominal(cpu: 85), at: 9)
+                _ = gov.evaluate(nominal(cpu: 60), at: 9.75)   // one 750 ms dip
+                _ = gov.evaluate(nominal(cpu: 85), at: 10.5)
+                await expect(gov.evaluate(nominal(cpu: 85), at: config.cpuSustainSeconds) == .tier1Pause,
+                             "sub-tolerance dips don't reset the sustain clock")
             }
 
             // Tier-2 is terminal until reset().

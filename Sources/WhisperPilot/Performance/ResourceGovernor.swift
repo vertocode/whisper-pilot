@@ -36,12 +36,27 @@ struct ResourceGovernorConfig: Sendable, Equatable {
     var memoryTier1Bytes: UInt64
     /// How long load may stay high after Tier-1 before escalating to Tier-2.
     var tier2EscalationSeconds: TimeInterval
+    /// Hysteresis release: Tier-1 only starts recovering once CPU is at or
+    /// below this (below the engage threshold, so load oscillating around the
+    /// engage point can't flap the tier on and off).
+    var cpuReleasePercent: Double
+    /// How long load must stay at/below `cpuReleasePercent` (and memory under
+    /// cap) before Tier-1 actually releases back to normal.
+    var recoverySeconds: TimeInterval
+    /// Brief sub-threshold dips shorter than this do NOT reset the sustain
+    /// run — spiky-but-consistently-high load (one 750 ms dip every few
+    /// samples) previously never accumulated 20 s of "sustained" and the
+    /// valve never engaged.
+    var cpuDipToleranceSeconds: TimeInterval
 
     static let `default` = ResourceGovernorConfig(
         cpuTier1Percent: 70,
         cpuSustainSeconds: 20,
         memoryTier1Bytes: 1_500_000_000, // ~1.5 GB
-        tier2EscalationSeconds: 15
+        tier2EscalationSeconds: 15,
+        cpuReleasePercent: 60,
+        recoverySeconds: 5,
+        cpuDipToleranceSeconds: 2
     )
 }
 
@@ -69,10 +84,15 @@ final class ResourceGovernor {
     private(set) var tier: Tier = .normal
 
     /// When CPU first crossed `cpuTier1Percent` in the current over-threshold run;
-    /// nil whenever the latest sample was at or below the threshold.
+    /// nil once CPU has been at/below threshold longer than the dip tolerance.
     private var cpuOverSince: TimeInterval?
+    /// Most recent over-threshold sample time; drives the dip tolerance.
+    private var lastCpuOverAt: TimeInterval?
     /// When Tier-1 was entered; drives the Tier-2 escalation clock.
     private var tier1Since: TimeInterval?
+    /// When load first dropped to/below the release threshold while in Tier-1;
+    /// drives the recovery sustain.
+    private var calmSince: TimeInterval?
 
     init(config: ResourceGovernorConfig = .default) {
         self.config = config
@@ -83,7 +103,9 @@ final class ResourceGovernor {
     func reset() {
         tier = .normal
         cpuOverSince = nil
+        lastCpuOverAt = nil
         tier1Since = nil
+        calmSince = nil
     }
 
     /// Feed one sample taken at monotonic time `now` (seconds). Returns the action
@@ -96,13 +118,17 @@ final class ResourceGovernor {
             return .tier2Stop
         }
 
-        // Track the CPU sustain window. The run resets the moment CPU drops to/below
-        // threshold so a brief spike never accumulates toward "sustained".
+        // Track the CPU sustain window. Dips shorter than the tolerance don't
+        // reset the run (spiky-but-high load still counts as sustained); a
+        // longer stretch below threshold resets it so a brief spike never
+        // accumulates toward "sustained".
         let cpuOver = sample.cpuPercent > config.cpuTier1Percent
         if cpuOver {
             if cpuOverSince == nil { cpuOverSince = now }
-        } else {
+            lastCpuOverAt = now
+        } else if let lastOver = lastCpuOverAt, now - lastOver > config.cpuDipToleranceSeconds {
             cpuOverSince = nil
+            lastCpuOverAt = nil
         }
         let cpuSustained = cpuOverSince.map { now - $0 >= config.cpuSustainSeconds } ?? false
         let memoryOver = sample.memoryBytes > config.memoryTier1Bytes
@@ -116,19 +142,34 @@ final class ResourceGovernor {
             if cpuSustained || memoryOver {
                 tier = .tier1
                 tier1Since = now
+                calmSince = nil
                 return .tier1Pause
             }
             return .ok
 
         case .tier1:
-            // "High" for escalation/recovery is the instantaneous reading: CPU over
-            // threshold (not the 20s sustain) or memory over cap.
-            let stillHigh = cpuOver || memoryOver
-            if !stillHigh {
-                reset()
-                return .ok
+            // Hysteresis: recovery only starts once CPU is at/below the release
+            // threshold (below the engage threshold) AND memory is under cap,
+            // and only completes after `recoverySeconds` of continuous calm.
+            // Releasing on a single sub-threshold sample made load oscillating
+            // around the engage point flap Tier-1 on/off — each engage cancels
+            // in-flight AI completions, so flapping was user-visible.
+            let calm = sample.cpuPercent <= config.cpuReleasePercent && !memoryOver
+            if calm {
+                if calmSince == nil { calmSince = now }
+                if let since = calmSince, now - since >= config.recoverySeconds {
+                    reset()
+                    return .ok
+                }
+                return .tier1Pause
             }
-            if let since = tier1Since, now - since >= config.tier2EscalationSeconds {
+            calmSince = nil
+
+            // Escalate only on instantaneously-high load (CPU over the engage
+            // threshold or memory over cap). The middle band between release
+            // and engage holds Tier-1 without escalating.
+            let stillHigh = cpuOver || memoryOver
+            if stillHigh, let since = tier1Since, now - since >= config.tier2EscalationSeconds {
                 tier = .tier2
                 return .tier2Stop
             }
