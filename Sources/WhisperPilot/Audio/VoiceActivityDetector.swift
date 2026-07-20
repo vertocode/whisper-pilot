@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 
@@ -68,12 +69,11 @@ actor VoiceActivityDetector {
         guard let channelData = buffer.floatChannelData else { return 0 }
         let frames = Int(buffer.frameLength)
         guard frames > 0 else { return 0 }
-        let pointer = channelData.pointee
-        var sum: Float = 0
-        for i in 0..<frames {
-            let sample = pointer[i]
-            sum += sample * sample
-        }
-        return (sum / Float(frames)).squareRoot()
+        // Hot path — one call per ~10 ms frame per channel; vDSP beats the
+        // scalar loop and matches it bit-for-bit closely enough for a
+        // threshold comparison.
+        var rms: Float = 0
+        vDSP_rmsqv(channelData.pointee, 1, &rms, vDSP_Length(frames))
+        return rms
     }
 }

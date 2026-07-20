@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 import OSLog
@@ -211,11 +212,22 @@ extension SystemAudioCapture: SCStreamOutput {
     static func applyGainInPlace(_ buffer: AVAudioPCMBuffer, gain: Float) {
         guard let outputData = buffer.floatChannelData else { return }
         let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return }
         let channels = Int(buffer.format.channelCount)
+        var gainFactor = gain
         for c in 0..<channels {
             let ptr = outputData[c]
-            for i in 0..<frames {
-                ptr[i] = softLimit(ptr[i] * gain)
+            // Hot path — every system-audio buffer. Vectorized multiply, then a
+            // cheap max-magnitude probe: below the knee (the overwhelmingly
+            // common case for speech) the soft limiter is the identity, so the
+            // per-sample tanh pass only runs on genuinely loud buffers.
+            vDSP_vsmul(ptr, 1, &gainFactor, ptr, 1, vDSP_Length(frames))
+            var peak: Float = 0
+            vDSP_maxmgv(ptr, 1, &peak, vDSP_Length(frames))
+            if peak > softLimitKnee {
+                for i in 0..<frames {
+                    ptr[i] = softLimit(ptr[i])
+                }
             }
         }
     }
