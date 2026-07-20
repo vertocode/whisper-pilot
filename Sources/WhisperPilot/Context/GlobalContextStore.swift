@@ -18,16 +18,23 @@ final class GlobalContextStore: ObservableObject {
     /// Set during `loadFromDisk` so the just-loaded value doesn't immediately
     /// schedule a write-back (would be a no-op, but pointless I/O).
     private var isLoading: Bool = false
+    /// True once the user has edited `context` in this run. Used by the async
+    /// disk load to yield: if the user started typing before the load landed,
+    /// their newer edit wins — assigning the loaded value on top would both
+    /// discard the edit visually and never persist it.
+    private var hasLocalEdit: Bool = false
 
     init() {
+        // Subscribe BEFORE the disk load so an edit made in the gap is tracked
+        // and persisted rather than silently dropped.
+        subscribeToChanges()
         Task { [weak self] in
             let loaded = await SessionStore.shared.loadGlobalContext()
             await MainActor.run {
-                guard let self else { return }
+                guard let self, !self.hasLocalEdit else { return }
                 self.isLoading = true
                 self.context = loaded
                 self.isLoading = false
-                self.subscribeToChanges()
             }
         }
     }
@@ -38,6 +45,7 @@ final class GlobalContextStore: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] newValue in
                 guard let self, !self.isLoading else { return }
+                self.hasLocalEdit = true
                 self.scheduleSave(newValue)
             }
     }
