@@ -1,6 +1,10 @@
 import SwiftUI
 
 struct TranscriptLane: View {
+    /// Upper bound on rows rendered in the lane. Long sessions accumulate
+    /// thousands of segments; the view only ever shows the recent window.
+    static let maxRenderedSegments = 150
+
     let segments: [TranscriptSegment]
     /// When true, only the header row is rendered (chevron flips to indicate
     /// expand). The body — segment list / "waiting for audio" placeholder — is
@@ -64,12 +68,21 @@ struct TranscriptLane: View {
                             .fill(.quinary)
                     )
                 } else {
-                    // Show every segment. Each utterance is its own row (VAD-driven).
-                    // The parent ScrollView in OverlayView handles overflow. Explicit
-                    // `.id()` lets the parent's ScrollViewReader auto-scroll to the
-                    // most recent line as it arrives, regardless of channel.
+                    // Render only the most recent window. Each utterance is its own
+                    // row (VAD-driven); the parent ScrollView in OverlayView handles
+                    // overflow, and explicit `.id()` lets the parent's
+                    // ScrollViewReader auto-scroll to the most recent line as it
+                    // arrives. Rendering the full history made every 250 ms publish
+                    // re-diff a lane that grows without bound in long sessions —
+                    // the full transcript is always on disk in transcript.md.
                     LazyVStack(alignment: .leading, spacing: WP.Space.xs + 2) {
-                        ForEach(segments) { segment in
+                        if segments.count > Self.maxRenderedSegments {
+                            Text("… earlier transcript trimmed from view (full history is in the session's transcript.md)")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, WP.Space.md - 2)
+                        }
+                        ForEach(segments.suffix(Self.maxRenderedSegments)) { segment in
                             TranscriptRow(segment: segment)
                                 .id(segment.id)
                         }
