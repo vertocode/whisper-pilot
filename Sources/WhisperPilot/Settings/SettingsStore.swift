@@ -370,6 +370,11 @@ final class SettingsStore: ObservableObject {
     private var cachedGeminiAPIKey: Cached<String> = .empty
     private var cachedAnthropicAPIKey: Cached<String> = .empty
 
+    /// Non-nil when the most recent API-key save was rejected by the Keychain.
+    /// Surfaced in the Settings AI-provider tab — a silently dropped key would
+    /// otherwise present as "AI features just don't work" with no explanation.
+    @Published private(set) var keychainErrorMessage: String? = nil
+
     var geminiAPIKey: String? {
         get {
             switch cachedGeminiAPIKey {
@@ -381,8 +386,12 @@ final class SettingsStore: ObservableObject {
             }
         }
         set {
-            KeychainHelper.set(newValue, forKey: Keys.geminiAPIKey)
-            cachedGeminiAPIKey = .loaded(newValue)
+            if KeychainHelper.set(newValue, forKey: Keys.geminiAPIKey) {
+                cachedGeminiAPIKey = .loaded(newValue)
+                keychainErrorMessage = nil
+            } else {
+                keychainErrorMessage = "Saving the Gemini API key to the Keychain failed — the key is NOT stored. Try again, or check Keychain Access for a locked/damaged login keychain."
+            }
             objectWillChange.send()
         }
     }
@@ -398,8 +407,12 @@ final class SettingsStore: ObservableObject {
             }
         }
         set {
-            KeychainHelper.set(newValue, forKey: Keys.anthropicAPIKey)
-            cachedAnthropicAPIKey = .loaded(newValue)
+            if KeychainHelper.set(newValue, forKey: Keys.anthropicAPIKey) {
+                cachedAnthropicAPIKey = .loaded(newValue)
+                keychainErrorMessage = nil
+            } else {
+                keychainErrorMessage = "Saving the Claude API key to the Keychain failed — the key is NOT stored. Try again, or check Keychain Access for a locked/damaged login keychain."
+            }
             objectWillChange.send()
         }
     }

@@ -226,6 +226,17 @@ struct SettingsView: View {
             }
 
             Section {
+                if let keychainError = store.keychainErrorMessage {
+                    HStack(alignment: .top, spacing: WP.Space.xs) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.red)
+                        Text(keychainError)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 HStack(spacing: WP.Space.xs) {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 10))
