@@ -20,7 +20,7 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    self.log.info("Gemini stream request → model=\(self.model, privacy: .public), question=\"\(prompt.question, privacy: .public)\", style=\(prompt.style.rawValue, privacy: .public)")
+                    self.log.info("Gemini stream request → model=\(self.model, privacy: .public), question=\"\(prompt.question, privacy: .private)\", style=\(prompt.style.rawValue, privacy: .public)")
                     let reason = try await stream(prompt: prompt, continuation: continuation)
                     self.log.info("Gemini stream complete (reason=\(String(describing: reason), privacy: .public))")
                     continuation.yield(.finish(reason))

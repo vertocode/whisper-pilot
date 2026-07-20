@@ -81,9 +81,12 @@ actor TriggerEngine {
         // the post-utterance pause, so the partial we react to is whatever the
         // recognizer's best hypothesis was when the speaker actually stopped.
         let score = detector.score(segment)
-        triggerLog.debug("Considered segment (channel=\(String(describing: segment.channel), privacy: .public), final=\(segment.isFinal, privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .public)\"")
+        // Spoken content is logged `.private` — the unified log is captured in
+        // sysdiagnoses and readable in Console.app, and leaking meeting audio
+        // transcripts there contradicts the app's local-privacy promise.
+        triggerLog.debug("Considered segment (channel=\(String(describing: segment.channel), privacy: .public), final=\(segment.isFinal, privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .private)\"")
         guard score >= threshold else { return }
-        triggerLog.info("Pending candidate (channel=\(String(describing: segment.channel), privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .public)\"")
+        triggerLog.info("Pending candidate (channel=\(String(describing: segment.channel), privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .private)\"")
         pendingCandidate[segment.channel] = segment
         attemptFire(on: segment.channel)
     }
@@ -127,8 +130,7 @@ actor TriggerEngine {
             firedAt: now,
             channel: channel
         )
-        triggerLog.info("🔔 FIRE (\(String(describing: channel), privacy: .public)): \"\(candidate.text, privacy: .public)\" (score=\(event.score, privacy: .public))")
-        print("[WP][Trigger] 🔔 FIRE (\(channel)): \"\(candidate.text)\" (score=\(event.score))")
+        triggerLog.info("🔔 FIRE (\(String(describing: channel), privacy: .public)): \"\(candidate.text, privacy: .private)\" (score=\(event.score, privacy: .public))")
         continuation.yield(event)
     }
 
