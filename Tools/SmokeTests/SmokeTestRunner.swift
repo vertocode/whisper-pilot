@@ -1220,6 +1220,19 @@ struct SmokeTestRunner {
                 let event = await collectFirstEvent(from: engine, within: 0.4)
                 await expect(event == nil, "Other-side candidate doesn't fire on a Me-side pause")
             }
+
+            // Re-arm: speech-ended arriving *before* the pause requirement has
+            // elapsed must not drop the candidate. If no further transcript
+            // partial arrives (recognizer already delivered its last
+            // hypothesis), the engine's internal retry timer has to fire once
+            // the pause gate opens on its own.
+            do {
+                let engine = TriggerEngine()
+                await engine.consider(segment: systemSegment("How would you scale this?"))
+                await engine.absorb(.speechEnded(channel: .system, at: Date(), duration: 2.0, silenceLeading: 0))
+                let event = await collectFirstEvent(from: engine, within: 1.5)
+                await expect(event != nil, "re-arm timer fires the held candidate once the pause elapses")
+            }
         }
     }
 

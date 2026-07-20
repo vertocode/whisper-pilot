@@ -44,6 +44,12 @@ actor TriggerEngine {
 
     private var pendingCandidate: [AudioChannel: TranscriptSegment] = [:]
     private var lastSpeechEndedAt: [AudioChannel: Date] = [:]
+    /// Re-arm timers, one per channel. When `attemptFire` holds because the pause
+    /// or cooldown hasn't elapsed *yet*, nothing external is guaranteed to call it
+    /// again (the recognizer may already have delivered its last hypothesis), so a
+    /// held candidate would otherwise be dropped silently. The timer retries at the
+    /// exact moment the gate opens.
+    private var retryTasks: [AudioChannel: Task<Void, Never>] = [:]
 
     init() {
         var capturedContinuation: AsyncStream<TriggerEvent>.Continuation!
@@ -59,6 +65,8 @@ actor TriggerEngine {
             // Speaker resumed — kill any pending candidate on that channel so we
             // don't fire mid-utterance.
             pendingCandidate[channel] = nil
+            retryTasks[channel]?.cancel()
+            retryTasks[channel] = nil
         case .speechEnded(let channel, let at, _, _):
             lastSpeechEndedAt[channel] = at
             attemptFire(on: channel)
@@ -91,11 +99,13 @@ actor TriggerEngine {
         let elapsedSincePause = now.timeIntervalSince(endedAt)
         guard elapsedSincePause >= pauseRequirement else {
             triggerLog.debug("Holding fire — pause too short (\(elapsedSincePause, privacy: .public)s < \(self.pauseRequirement, privacy: .public)s)")
+            scheduleRetry(on: channel, after: pauseRequirement - elapsedSincePause)
             return
         }
         let sinceLast = now.timeIntervalSince(lastFireAt)
         guard sinceLast >= cooldown else {
             triggerLog.info("Holding fire — cooldown (\(sinceLast, privacy: .public)s < \(self.cooldown, privacy: .public)s)")
+            scheduleRetry(on: channel, after: cooldown - sinceLast)
             return
         }
 
@@ -108,6 +118,8 @@ actor TriggerEngine {
         lastFireAt = now
         lastFiredText = normalized
         pendingCandidate[channel] = nil
+        retryTasks[channel]?.cancel()
+        retryTasks[channel] = nil
 
         let event = TriggerEvent(
             text: candidate.text,
@@ -120,7 +132,21 @@ actor TriggerEngine {
         continuation.yield(event)
     }
 
+    /// Retry `attemptFire` once the remaining gate time has elapsed. Replaces any
+    /// previously scheduled retry for the channel (the newest hold knows the most
+    /// current remaining delay). The small epsilon guards against re-holding on
+    /// timer jitter right at the boundary.
+    private func scheduleRetry(on channel: AudioChannel, after delay: TimeInterval) {
+        retryTasks[channel]?.cancel()
+        retryTasks[channel] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((delay + 0.05) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.attemptFire(on: channel)
+        }
+    }
+
     deinit {
+        for task in retryTasks.values { task.cancel() }
         continuation.finish()
     }
 }
