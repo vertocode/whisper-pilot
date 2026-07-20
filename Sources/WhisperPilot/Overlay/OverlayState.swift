@@ -305,8 +305,20 @@ final class OverlayState: ObservableObject {
     }
 
     private func trim() {
-        if messages.count > maxMessages {
-            messages.removeFirst(messages.count - maxMessages)
+        var excess = messages.count - maxMessages
+        guard excess > 0 else { return }
+        // Never evict a message that is still streaming — once it's gone,
+        // `appendDelta` can't find it and silently drops every remaining token
+        // of the live reply. Evict the oldest finished messages instead; in the
+        // (unlikely) case everything is streaming, allow a temporary overshoot.
+        var idx = 0
+        while excess > 0 && idx < messages.count {
+            if messages[idx].isStreaming {
+                idx += 1
+            } else {
+                messages.remove(at: idx)
+                excess -= 1
+            }
         }
     }
 }
