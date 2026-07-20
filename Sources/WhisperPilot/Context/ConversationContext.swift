@@ -33,8 +33,8 @@ actor ConversationContext {
         var at: Date
     }
     private var lines: [Line] = []
-    private var topics = OrderedSet<String>(maxSize: 24)
-    private var entities = OrderedSet<String>(maxSize: 32)
+    private var topics = OrderedSet(maxSize: 24)
+    private var entities = OrderedSet(maxSize: 32)
     private let retentionSeconds: TimeInterval = 300
 
     private let extractor = TopicExtractor()
@@ -131,21 +131,23 @@ actor ConversationContext {
     }
 }
 
-/// Tiny LRU-ish set that preserves insertion order and dedupes case-insensitively.
-private struct OrderedSet<T: Hashable> {
-    private(set) var values: [T] = []
-    private var seen: Set<T> = []
+/// Tiny LRU-ish set that preserves insertion order (and original casing) while
+/// deduping case-insensitively — "Hector" and "hector" are one entry.
+private struct OrderedSet {
+    private(set) var values: [String] = []
+    private var seen: Set<String> = []
     let maxSize: Int
 
     init(maxSize: Int) { self.maxSize = maxSize }
 
-    mutating func insert(_ value: T) {
-        if seen.contains(value) { return }
-        seen.insert(value)
+    mutating func insert(_ value: String) {
+        let key = value.lowercased()
+        if seen.contains(key) { return }
+        seen.insert(key)
         values.append(value)
         if values.count > maxSize, let dropped = values.first {
             values.removeFirst()
-            seen.remove(dropped)
+            seen.remove(dropped.lowercased())
         }
     }
 

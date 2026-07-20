@@ -60,7 +60,7 @@ private enum Stopwords {
     static let set: Set<String> = [
         "thing", "things", "stuff", "okay", "yeah", "right", "really",
         "kind", "sort", "lot", "lots", "time", "times", "way", "ways",
-        "people", "person", "thing", "guess", "actually", "mean", "going"
+        "people", "person", "guess", "actually", "mean", "going"
     ]
 
     static func contains(_ value: String) -> Bool {
