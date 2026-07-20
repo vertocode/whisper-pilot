@@ -52,6 +52,12 @@ final class ResourceSampler: ResourceSampling {
                     thread_info(threadList[index], thread_flavor_t(THREAD_BASIC_INFO), rawPtr, &count)
                 }
             }
+            // Every entry in `threadList` carries a +1 send right that
+            // `vm_deallocate` on the array does NOT release. Without this,
+            // the port table grows by ~thread-count on every sample (~750 ms
+            // cadence) until port-namespace exhaustion kills the process in
+            // long sessions.
+            mach_port_deallocate(mach_task_self_, threadList[index])
             guard kr == KERN_SUCCESS, (info.flags & TH_FLAGS_IDLE) == 0 else { continue }
             total += Double(info.cpu_usage) / Double(TH_USAGE_SCALE) * 100.0
         }
