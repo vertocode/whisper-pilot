@@ -23,6 +23,11 @@ final class MicrophoneCapture {
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private var framesEmitted: Int = 0
+    /// Set while capture is supposed to be live. Gates the configuration-change
+    /// rebuild so a change arriving after `stop()` doesn't resurrect capture.
+    private var isRunning = false
+    private var configChangeObserver: NSObjectProtocol?
+    private var restartTask: Task<Void, Never>?
 
     init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
@@ -82,17 +87,61 @@ final class MicrophoneCapture {
         }
 
         try engine.start()
+        isRunning = true
+        // Default input switch, sample-rate change, or sleep/wake stops the
+        // engine and would otherwise kill mic capture silently mid-session.
+        // Re-register each start (idempotent) and rebuild the tap on change.
+        if let existing = configChangeObserver {
+            NotificationCenter.default.removeObserver(existing)
+        }
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleConfigurationChange()
+        }
         log.info("✓ Microphone capture started at \(inputFormat.sampleRate, privacy: .public) Hz, \(inputFormat.channelCount, privacy: .public) ch")
         print("[WP][Microphone] started @ \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch")
     }
 
     func stop() async {
+        isRunning = false
+        restartTask?.cancel()
+        restartTask = nil
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         converter = nil
         sourceFormat = nil
         log.info("Microphone capture stopped after \(self.framesEmitted, privacy: .public) frames")
         framesEmitted = 0
+    }
+
+    /// Configuration changes arrive in bursts (device switch fires several);
+    /// debounce briefly, then tear the tap down and run the full `start()`
+    /// path again so the new device's format and the preferred-device
+    /// selection are re-applied.
+    private func handleConfigurationChange() {
+        wpWarn("Microphone engine configuration changed (device or sample-rate switch) — rebuilding capture")
+        restartTask?.cancel()
+        restartTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, let self, self.isRunning else { return }
+            self.engine.inputNode.removeTap(onBus: 0)
+            self.engine.stop()
+            self.converter = nil
+            self.sourceFormat = nil
+            do {
+                try await self.start()
+                wpInfo("Microphone capture rebuilt after configuration change")
+            } catch {
+                wpError("Microphone rebuild after configuration change failed: \(error.localizedDescription) — mic transcription stopped. Press Stop and Play to retry.")
+            }
+        }
     }
 
     deinit {
