@@ -81,16 +81,23 @@ final class PermissionsManager: ObservableObject {
         }
     }
 
-    /// Live probe for Screen Recording permission. We deliberately do *not* call
-    /// `CGPreflightScreenCaptureAccess` — its result is cached at app launch and never
-    /// reflects permission grants made while the app is running, which produced "stuck on
-    /// needs-permission" reports from users who had already granted access.
+    /// Passive check for Screen Recording permission. Deliberately uses
+    /// `CGPreflightScreenCaptureAccess` and NOT an `SCShareableContent` probe:
+    /// the probe *triggers* the TCC prompt (and registers the app in the Screen
+    /// Recording privacy pane) the first time it runs — and `refresh()` runs at
+    /// every launch, so users on the Process-Tap path (macOS 14.4+, no screen
+    /// recording involved at all) were being asked for Screen Recording they
+    /// never needed. The preflight's launch-time caching ("stuck on
+    /// needs-permission" after granting mid-run) is handled elsewhere: the SCK
+    /// fallback path in `startListening` does a live probe when screen capture
+    /// is genuinely required and calls `markScreenRecordingGranted()` on
+    /// success, as does `requestScreenRecording()` below.
     private func currentScreenRecording() async -> PermissionStatus {
-        do {
-            _ = try await SCShareableContent.current
+        if snapshot.screenRecording == .granted {
+            // A live probe already confirmed the grant this run — don't let the
+            // stale preflight cache downgrade it.
             return .granted
-        } catch {
-            return .unknown
         }
+        return CGPreflightScreenCaptureAccess() ? .granted : .unknown
     }
 }

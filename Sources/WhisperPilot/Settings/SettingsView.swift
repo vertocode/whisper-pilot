@@ -341,6 +341,10 @@ struct SettingsView: View {
                     .disabled(!store.captureMicrophone)
                 FormHint("When off, a new session starts with your mic muted — system audio (\"Other\") still transcribes, but your own voice is skipped until you unmute with the in-session mic toggle. Useful if you rarely need your own speech transcribed and want to avoid the mic recognizer's cost. Has no effect when microphone capture above is off.")
             }
+            Section("System audio capture path") {
+                Toggle("Use ScreenCaptureKit for system audio", isOn: $store.forceScreenCaptureKitForSystemAudio)
+                FormHint("Off (default): system audio is captured with a Core Audio Process Tap — audio only, no Screen Recording permission involved. On: the ScreenCaptureKit path is used instead, which requires Screen Recording permission. Whisper Pilot flips this on automatically when the tap silently delivers no audio on your hardware; turn it back off to retry the tap path (takes effect on the next Play). No video is ever recorded either way.")
+            }
         }
         .formStyle(.grouped)
     }
