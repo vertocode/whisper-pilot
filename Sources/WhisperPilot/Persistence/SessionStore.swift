@@ -276,23 +276,25 @@ actor SessionStore {
         return segments
     }
 
-    private static func parseChatMarkdown(_ markdown: String) -> [ChatMessage] {
-        // `## ` always appears at the start of a turn block. Split on `\n## ` so the
-        // first chunk is the file header (or empty) and every subsequent chunk starts
-        // with `Role [HH:MM:SS]\n\nbody…`.
-        let chunks = markdown.components(separatedBy: "\n## ")
+    /// Line-based parse: a `## ` line starts a new turn only when its remainder matches
+    /// the `Role [HH:MM:SS]` header shape. Any other `## ` line is markdown *inside* a
+    /// message body (assistant replies legitimately contain H2 headings) and stays part
+    /// of the current turn. A naive split on `\n## ` silently dropped those body
+    /// fragments on resume. Internal (not private) so the smoke tests can exercise it.
+    static func parseChatMarkdown(_ markdown: String) -> [ChatMessage] {
         let now = Date()
         var messages: [ChatMessage] = []
-        for chunk in chunks.dropFirst() {
-            guard let newlineIdx = chunk.firstIndex(of: "\n") else { continue }
-            let header = chunk[..<newlineIdx]
-            guard let match = header.firstMatch(of: chatHeaderRegex) else { continue }
-            let body = chunk[chunk.index(after: newlineIdx)...]
+        var currentHeader: (role: String, time: String)?
+        var bodyLines: [Substring] = []
+
+        func flush() {
+            guard let header = currentHeader else { return }
+            let body = bodyLines.joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !body.isEmpty else { continue }
-            let timestamp = parseTime(String(match.time)) ?? now
+            guard !body.isEmpty else { return }
+            let timestamp = parseTime(header.time) ?? now
             let role: ChatMessage.Role
-            switch match.role {
+            switch header.role {
             case "You": role = .user
             case "Assistant": role = .assistant
             default: role = .system
@@ -307,6 +309,18 @@ actor SessionStore {
                 category: role == .system ? .general : .ai
             ))
         }
+
+        for line in markdown.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("## "),
+               let match = line.dropFirst(3).wholeMatch(of: chatHeaderRegex) {
+                flush()
+                currentHeader = (role: String(match.role), time: String(match.time))
+                bodyLines = []
+            } else if currentHeader != nil {
+                bodyLines.append(line)
+            }
+        }
+        flush()
         return messages
     }
 
@@ -369,7 +383,11 @@ actor SessionStore {
         guard let s = try? String(contentsOf: folder.appendingPathComponent("chat.md"), encoding: .utf8) else {
             return 0
         }
-        return s.components(separatedBy: "\n## ").count - 1
+        // Same rule as `parseChatMarkdown`: only well-formed turn headers count,
+        // not `## ` headings inside a message body.
+        return s.split(separator: "\n").filter { line in
+            line.hasPrefix("## ") && line.dropFirst(3).wholeMatch(of: Self.chatHeaderRegex) != nil
+        }.count
     }
 
     private static let dateFormatter: DateFormatter = {

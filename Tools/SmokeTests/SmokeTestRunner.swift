@@ -24,6 +24,7 @@ struct SmokeTestRunner {
         await runTranscriptDedupSuite()
         await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
+        await runSessionStoreParsingSuite()
         await runSpeechRecognitionIntegrationSuite()
         await runParakeetIntegrationSuite()
 
@@ -933,6 +934,53 @@ struct SmokeTestRunner {
             print("  ⓘ Parakeet finals: \(finals)")
             await expect(combined.contains("quick brown fox"), "decoded phrase contains 'quick brown fox' (got: \"\(combined)\")")
             await expect(combined.contains("lazy dog"), "decoded phrase contains 'lazy dog' (got: \"\(combined)\")")
+        }
+    }
+
+    static func runSessionStoreParsingSuite() async {
+        await suite("SessionStore.parseChatMarkdown") {
+            let md = """
+            # Chat
+
+            _Conversation between you and the AI._
+
+            ## You [10:00:01]
+
+            What did we decide?
+
+            ## Assistant [10:00:03]
+
+            Summary below.
+
+            ## Decisions
+
+            - ship it
+
+            ## Follow-ups
+
+            - none
+
+            ## System [10:00:10]
+
+            Note text.
+            """
+            let messages = SessionStore.parseChatMarkdown(md)
+            await expect(messages.count == 3,
+                         "H2 headings inside a body must not split the turn (got \(messages.count) turns)")
+            guard messages.count == 3 else { return }
+            await expect(messages[0].role == .user, "first turn parses as user")
+            await expect(messages[0].text == "What did we decide?", "user body round-trips")
+            await expect(messages[1].role == .assistant, "second turn parses as assistant")
+            await expect(messages[1].text.contains("## Decisions") && messages[1].text.contains("## Follow-ups"),
+                         "assistant body keeps its own markdown headings")
+            await expect(messages[2].role == .system, "third turn parses as system")
+
+            // Malformed header stays in the previous body rather than being dropped.
+            let sloppy = "## Assistant [09:00:00]\n\nline one\n## Not A Header\nline two\n"
+            let parsed = SessionStore.parseChatMarkdown(sloppy)
+            await expect(parsed.count == 1, "non-header ## line must not start a new turn")
+            await expect(parsed.first?.text.contains("line two") == true,
+                         "content after a non-header ## line is preserved")
         }
     }
 
