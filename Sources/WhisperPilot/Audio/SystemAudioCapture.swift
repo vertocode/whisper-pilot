@@ -13,6 +13,9 @@ final class SystemAudioCapture: NSObject {
     private let queue = DispatchQueue(label: "com.whisperpilot.system-audio", qos: .userInitiated)
 
     private var stream: SCStream?
+    /// Guards `converter` / `sourceFormat`: the SCStream output callback reads
+    /// and rebuilds them on `queue` while `stop()` nils them from the caller.
+    private let stateLock = NSLock()
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private var framesEmitted: Int = 0
@@ -75,8 +78,10 @@ final class SystemAudioCapture: NSObject {
             log.error("Stop error: \(String(describing: error), privacy: .public)")
         }
         self.stream = nil
+        stateLock.lock()
         self.converter = nil
         self.sourceFormat = nil
+        stateLock.unlock()
         self.framesEmitted = 0
     }
 
@@ -121,6 +126,7 @@ extension SystemAudioCapture: SCStreamOutput {
         var streamDescription = asbd
         guard let inputFormat = AVAudioFormat(streamDescription: &streamDescription) else { return nil }
 
+        stateLock.lock()
         if sourceFormat?.isEqual(inputFormat) != true {
             if let newConverter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make()) {
                 sourceFormat = inputFormat
@@ -135,6 +141,8 @@ extension SystemAudioCapture: SCStreamOutput {
                 wpError("System audio: no converter for source format \(inputFormat.sampleRate) Hz / \(inputFormat.channelCount) ch — will retry on next buffer")
             }
         }
+        let converter = self.converter
+        stateLock.unlock()
         guard let converter else { return nil }
 
         let frameCount = AVAudioFrameCount(sample.numSamples)

@@ -12,8 +12,17 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
     private let locale: Locale
     private let autoRestart: Bool
 
+    /// Guards the pipe references: `feed()` runs on the detached pipeline task
+    /// while `stop()` nils them from the main actor.
+    private let stateLock = NSLock()
     private var systemPipe: ChannelPipe?
     private var micPipe: ChannelPipe?
+
+    private func pipe(for channel: AudioChannel) -> ChannelPipe? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return channel == .system ? systemPipe : micPipe
+    }
 
     init(locale: Locale, autoRestart: Bool = true) {
         self.locale = locale
@@ -31,39 +40,44 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
         log.info("Starting transcriber for locale=\(self.locale.identifier, privacy: .public) channels=\(String(describing: enabledChannels), privacy: .public)…")
         try await ensureAuthorization()
         print("[WP][Transcriber] auth ok")
-        if enabledChannels.contains(.system) {
-            systemPipe = try ChannelPipe(channel: .system, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
-        }
-        if enabledChannels.contains(.microphone) {
-            micPipe = try ChannelPipe(channel: .microphone, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
-        }
-        print("[WP][Transcriber] channel pipes ready (system=\(systemPipe != nil), mic=\(micPipe != nil))")
+        let newSystemPipe = enabledChannels.contains(.system)
+            ? try ChannelPipe(channel: .system, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
+            : nil
+        let newMicPipe = enabledChannels.contains(.microphone)
+            ? try ChannelPipe(channel: .microphone, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
+            : nil
+        stateLock.lock()
+        systemPipe = newSystemPipe
+        micPipe = newMicPipe
+        stateLock.unlock()
+        print("[WP][Transcriber] channel pipes ready (system=\(newSystemPipe != nil), mic=\(newMicPipe != nil))")
     }
 
     func stop() {
         log.info("Stopping transcriber")
-        systemPipe?.finish()
-        micPipe?.finish()
+        stateLock.lock()
+        let sys = systemPipe
+        let mic = micPipe
         systemPipe = nil
         micPipe = nil
+        stateLock.unlock()
+        sys?.finish()
+        mic?.finish()
     }
 
     func feed(_ buffer: AVAudioPCMBuffer, channel: AudioChannel) {
-        switch channel {
-        case .system: systemPipe?.append(buffer)
-        case .microphone: micPipe?.append(buffer)
-        }
+        pipe(for: channel)?.append(buffer)
     }
 
     func notifyVADBoundary(channel: AudioChannel) {
         switch channel {
-        case .system: systemPipe?.cycleAtBoundary()
-        case .microphone: micPipe?.cycleAtBoundary()
+        case .system: pipe(for: .system)?.cycleAtBoundary()
+        case .microphone: pipe(for: .microphone)?.cycleAtBoundary()
         }
     }
 
     func collectPendingFinals() -> [TranscriptUpdate] {
-        [systemPipe?.takePendingFinal(), micPipe?.takePendingFinal()].compactMap { $0 }
+        [pipe(for: .system)?.takePendingFinal(), pipe(for: .microphone)?.takePendingFinal()].compactMap { $0 }
     }
 
     deinit {
@@ -529,7 +543,9 @@ private final class ChannelPipe {
                         timestamp: Date()
                     )
                     sink.yield(update)
-                    transcriptsEmitted += 1
+                    self.mutex.lock()
+                    self.transcriptsEmitted += 1
+                    self.mutex.unlock()
                     wpInfo("Transcriber.\(channel) FINAL\(current ? "" : " (late)"): \"\(text)\"")
                     if current { self.continueAfterFinalization() }
                     // Don't fall through to the error branch — see comment above.
@@ -564,8 +580,11 @@ private final class ChannelPipe {
                     timestamp: Date()
                 )
                 sink.yield(update)
-                transcriptsEmitted += 1
-                if transcriptsEmitted == 1 {
+                self.mutex.lock()
+                self.transcriptsEmitted += 1
+                let isFirstTranscript = self.transcriptsEmitted == 1
+                self.mutex.unlock()
+                if isFirstTranscript {
                     wpInfo("Transcriber.\(channel) FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
                 }
             }

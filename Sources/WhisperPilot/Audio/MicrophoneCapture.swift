@@ -20,6 +20,10 @@ final class MicrophoneCapture {
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "Microphone")
 
     private let engine = AVAudioEngine()
+    /// Guards `converter` / `sourceFormat` / `framesEmitted`: the tap callback
+    /// reads them on the engine's render thread while `stop()` and the
+    /// config-change rebuild nil them from other contexts.
+    private let stateLock = NSLock()
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private var framesEmitted: Int = 0
@@ -79,8 +83,10 @@ final class MicrophoneCapture {
             log.error("Microphone returned invalid format (sampleRate=0)")
             throw MicrophoneError.invalidFormat
         }
+        stateLock.lock()
         sourceFormat = inputFormat
         converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
+        stateLock.unlock()
 
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.handle(buffer)
@@ -115,10 +121,13 @@ final class MicrophoneCapture {
         }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        stateLock.lock()
         converter = nil
         sourceFormat = nil
-        log.info("Microphone capture stopped after \(self.framesEmitted, privacy: .public) frames")
+        let emitted = framesEmitted
         framesEmitted = 0
+        stateLock.unlock()
+        log.info("Microphone capture stopped after \(emitted, privacy: .public) frames")
     }
 
     /// Configuration changes arrive in bursts (device switch fires several);
@@ -133,8 +142,10 @@ final class MicrophoneCapture {
             guard !Task.isCancelled, let self, self.isRunning else { return }
             self.engine.inputNode.removeTap(onBus: 0)
             self.engine.stop()
+            self.stateLock.lock()
             self.converter = nil
             self.sourceFormat = nil
+            self.stateLock.unlock()
             do {
                 try await self.start()
                 wpInfo("Microphone capture rebuilt after configuration change")
@@ -149,11 +160,16 @@ final class MicrophoneCapture {
     }
 
     private func handle(_ buffer: AVAudioPCMBuffer) {
+        stateLock.lock()
+        let converter = self.converter
+        stateLock.unlock()
         guard let converter else { return }
         // Streaming conversion — no per-buffer reset, so the resampler's filter
         // state carries across buffers. See `StreamingAudioConverter`.
         guard let output = StreamingAudioConverter.convert(buffer, using: converter, label: "Microphone") else { return }
+        stateLock.lock()
         framesEmitted += 1
+        stateLock.unlock()
         if framesEmitted < 5 || framesEmitted % 200 == 0 {
             let inRMS = Self.computeRMSAny(buffer)
             let outRMS = Self.computeRMSAny(output)

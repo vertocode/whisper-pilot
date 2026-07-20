@@ -32,6 +32,10 @@ final class ProcessAudioCapture {
     private var tapID: AudioObjectID = 0
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
+    /// Guards `inputFormat` / `converter`: the IO proc reads them on `queue`
+    /// while `cleanup()` (stop, deinit, device-change rebuild) nils them from
+    /// other contexts.
+    private let stateLock = NSLock()
     private var inputFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var framesEmitted: Int = 0
@@ -93,9 +97,11 @@ final class ProcessAudioCapture {
         guard let inputFormat = AVAudioFormat(streamDescription: &asbdCopy) else {
             throw ProcessAudioError.formatConversionFailed
         }
+        stateLock.lock()
         self.inputFormat = inputFormat
-        wpInfo("ProcessAudio: AVAudioFormat resolved — sampleRate=\(inputFormat.sampleRate), channels=\(inputFormat.channelCount), interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
         self.converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
+        stateLock.unlock()
+        wpInfo("ProcessAudio: AVAudioFormat resolved — sampleRate=\(inputFormat.sampleRate), channels=\(inputFormat.channelCount), interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
 
         // 4. Create a private aggregate device backed by the tap.
         // CRITICAL: anchor the aggregate to the system's default output device via
@@ -248,8 +254,10 @@ final class ProcessAudioCapture {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = 0
         }
+        stateLock.lock()
         converter = nil
         inputFormat = nil
+        stateLock.unlock()
     }
 
     deinit {
@@ -261,6 +269,10 @@ final class ProcessAudioCapture {
     /// `AudioBufferList` in an `AVAudioPCMBuffer`, runs it through our converter to the
     /// canonical 16 kHz mono format, and yields to the pipeline.
     private func handle(_ bufferList: UnsafePointer<AudioBufferList>) {
+        stateLock.lock()
+        let inputFormat = self.inputFormat
+        let converter = self.converter
+        stateLock.unlock()
         guard let inputFormat, let converter else { return }
 
         // Compute RMS directly from the AudioBufferList memory before any
