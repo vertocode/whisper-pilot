@@ -89,6 +89,14 @@ final class MenuBarController {
     }
 
     @objc private func toggleListening() {
+        // Starting with no session selected would transcribe into RAM only —
+        // the persistence layer drops every line without a session id, so a
+        // whole meeting could silently vanish. Route to the Sessions window
+        // so the user picks (or creates) a session first.
+        if !coordinator.isRunning, coordinator.currentSession == nil {
+            openSessions()
+            return
+        }
         Task { await coordinator.toggleListening() }
     }
 
