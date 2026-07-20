@@ -36,6 +36,11 @@ final class ProcessAudioCapture {
     private var converter: AVAudioConverter?
     private var framesEmitted: Int = 0
     private let queue = DispatchQueue(label: "com.whisperpilot.process-audio", qos: .userInitiated)
+    /// Set while capture is supposed to be live. Gates the device-change rebuild
+    /// so a change arriving after `stop()` doesn't resurrect capture.
+    private var isRunning = false
+    private var restartTask: Task<Void, Never>?
+    private var outputDeviceListener: AudioObjectPropertyListenerBlock?
 
     init() {
         var captured: AsyncStream<AudioFrame>.Continuation!
@@ -156,13 +161,77 @@ final class ProcessAudioCapture {
             throw ProcessAudioError.deviceStartFailed(startStatus)
         }
 
+        isRunning = true
+        installDefaultOutputListener()
         wpInfo("ProcessAudio: ✓ started, awaiting audio buffers")
     }
 
     func stop() {
+        isRunning = false
+        restartTask?.cancel()
+        restartTask = nil
+        removeDefaultOutputListener()
         cleanup()
         wpInfo("ProcessAudio: stopped after \(framesEmitted) frames")
         framesEmitted = 0
+    }
+
+    /// The aggregate device is anchored to the default output device's UID at
+    /// start time. When the user switches output (headphones ⇄ speakers ⇄
+    /// AirPods), the old anchor either disappears (tap clock dies → silent
+    /// buffers) or keeps a stale sample rate (pitch-shifted garbage fed to the
+    /// recognizer). Nothing recovers on its own, so listen for the default
+    /// output changing and rebuild the tap + aggregate against the new device.
+    private func installDefaultOutputListener() {
+        guard outputDeviceListener == nil else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.handleDefaultOutputDeviceChange()
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, queue, block
+        )
+        if status == noErr {
+            outputDeviceListener = block
+        } else {
+            wpWarn("ProcessAudio: couldn't install default-output-device listener (status=\(status)) — output switches mid-session won't be recovered")
+        }
+    }
+
+    private func removeDefaultOutputListener() {
+        guard let block = outputDeviceListener else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, queue, block
+        )
+        outputDeviceListener = nil
+    }
+
+    private func handleDefaultOutputDeviceChange() {
+        guard isRunning else { return }
+        wpWarn("ProcessAudio: default output device changed — rebuilding tap and aggregate")
+        restartTask?.cancel()
+        restartTask = Task { [weak self] in
+            // Output switches fire several property changes in a burst; let the
+            // routing settle before rebuilding once.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled, let self, self.isRunning else { return }
+            self.cleanup()
+            do {
+                try await self.start()
+                wpInfo("ProcessAudio: rebuilt after output device change")
+            } catch {
+                wpError("ProcessAudio: rebuild after output device change failed: \(error.localizedDescription) — system audio stopped. Press Stop and Play to retry.")
+            }
+        }
     }
 
     private func cleanup() {
