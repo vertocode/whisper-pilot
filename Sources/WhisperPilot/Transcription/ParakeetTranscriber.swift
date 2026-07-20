@@ -110,6 +110,7 @@ private final class Pipe: @unchecked Sendable {
     private let manager: StreamingUnifiedAsrManager
     private let inputContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
     private let sink: AsyncStream<TranscriptUpdate>.Continuation
+    private let statusNote: @Sendable (String) -> Void
 
     private let mutex = NSLock()
     private let segmenter = TranscriptStreamSegmenter()
@@ -150,6 +151,7 @@ private final class Pipe: @unchecked Sendable {
             manager: manager,
             inputContinuation: inputContinuation,
             sink: sink,
+            statusNote: statusNote,
             lookaheadSeconds: Double(engineConfig.chunkSamples + engineConfig.rightSamples) / 16_000.0
         )
         pipe.startPump(input: inputStream)
@@ -161,12 +163,14 @@ private final class Pipe: @unchecked Sendable {
         manager: StreamingUnifiedAsrManager,
         inputContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
         sink: AsyncStream<TranscriptUpdate>.Continuation,
+        statusNote: @escaping @Sendable (String) -> Void,
         lookaheadSeconds: TimeInterval
     ) {
         self.channel = channel
         self.manager = manager
         self.inputContinuation = inputContinuation
         self.sink = sink
+        self.statusNote = statusNote
         self.lookaheadSeconds = lookaheadSeconds
     }
 
@@ -234,6 +238,11 @@ private final class Pipe: @unchecked Sendable {
                     wpError("Parakeet.\(channel) processing error (#\(failures)): \(error.localizedDescription)")
                     if failures >= Self.maxConsecutiveErrors {
                         wpError("Parakeet.\(channel) too many consecutive errors — stopping this channel")
+                        // The other channel keeps running, so without a visible
+                        // note this failure is indistinguishable from "the other
+                        // side just went quiet".
+                        let who = channel == .system ? "the other party (system audio)" : "your microphone"
+                        self.statusNote("⚠️ High-accuracy transcription for \(who) hit repeated errors and stopped. Press Stop, then Play, to restart it.")
                         break
                     }
                 }
