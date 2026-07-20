@@ -89,8 +89,18 @@ actor SessionStore {
         let displayName = cleaned.isEmpty ? "Untitled session" : cleaned
         let slug = cleaned.isEmpty ? "session" : cleaned.slugify()
         let dateString = Self.dateFormatter.string(from: now)
-        let folderName = "\(slug)-\(dateString)"
-        let folder = baseURL.appendingPathComponent(folderName)
+        // The timestamp only has minute precision — two same-named sessions
+        // created in the same minute would collide into one folder, with the
+        // second clobbering the first's metadata and both appending to the same
+        // files. Suffix a counter until the name is free.
+        var folderName = "\(slug)-\(dateString)"
+        var folder = baseURL.appendingPathComponent(folderName)
+        var attempt = 2
+        while FileManager.default.fileExists(atPath: folder.path) {
+            folderName = "\(slug)-\(dateString)-\(attempt)"
+            folder = baseURL.appendingPathComponent(folderName)
+            attempt += 1
+        }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let meta = SessionMeta(
             folderName: folderName,
@@ -128,13 +138,26 @@ actor SessionStore {
         try FileManager.default.removeItem(at: sessionFolder(for: id))
     }
 
+    /// Minimum interval between `touch()` rewrites of metadata.json per session.
+    /// `touch` is called on *every* transcript line and chat turn; a full
+    /// read-decode-rewrite each time is needless churn, and `lastUsedAt` only
+    /// drives the Sessions-list sort order, where second-level precision is
+    /// irrelevant.
+    private static let touchInterval: TimeInterval = 15
+    private var lastTouchWriteAt: [SessionID: Date] = [:]
+
     func touch(_ id: SessionID) {
+        let now = Date()
+        if let last = lastTouchWriteAt[id], now.timeIntervalSince(last) < Self.touchInterval {
+            return
+        }
         let folder = sessionFolder(for: id)
         let metaURL = folder.appendingPathComponent("metadata.json")
         guard let data = try? Data(contentsOf: metaURL),
               var meta = try? makeDecoder().decode(SessionMeta.self, from: data) else { return }
-        meta.lastUsedAt = Date()
+        meta.lastUsedAt = now
         try? writeMetadata(meta, to: folder)
+        lastTouchWriteAt[id] = now
     }
 
     /// Persist the user's per-session model choice. Called whenever the
@@ -344,7 +367,10 @@ actor SessionStore {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(meta)
-        try data.write(to: folder.appendingPathComponent("metadata.json"))
+        // Atomic: a crash mid-write must not leave a truncated metadata.json —
+        // `listSessions` silently skips folders whose metadata fails to decode,
+        // which would hide the session (and all its intact data) forever.
+        try data.write(to: folder.appendingPathComponent("metadata.json"), options: .atomic)
     }
 
     private func makeDecoder() -> JSONDecoder {
