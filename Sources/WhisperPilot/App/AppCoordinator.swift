@@ -410,6 +410,7 @@ final class AppCoordinator {
                 overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.", category: .general)
                 overlayState.status = .needsPermission(.screenRecording)
                 await permissions.requestScreenRecording()
+                await abortStartupCapture()
                 return
             }
         }
@@ -423,6 +424,7 @@ final class AppCoordinator {
             } else {
                 overlayState.appendSystemNote("⚠️ Microphone permission was not granted. Either disable microphone capture in Settings or grant access via System Settings → Privacy & Security → Microphone.", category: .general)
                 overlayState.status = .needsPermission(.microphone)
+                await abortStartupCapture()
                 return
             }
         }
@@ -440,6 +442,7 @@ final class AppCoordinator {
             wpError("Transcriber start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             dismissStartupNotes()
+            await abortStartupCapture()
             return
         }
         self.transcriber = transcriber
@@ -475,6 +478,9 @@ final class AppCoordinator {
             wpError("Pipeline start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             dismissStartupNotes()
+            self.transcriber?.stop()
+            self.transcriber = nil
+            await abortStartupCapture()
             return
         }
 
@@ -848,6 +854,23 @@ final class AppCoordinator {
             overlayState.removeMessage(id: id)
             noTranscriptsWarningID = nil
         }
+    }
+
+    /// Releases whatever audio capture an aborted `startListening` already
+    /// started. Every early-return failure path after the capture setup must
+    /// call this: `stopListening` no-ops while `isRunning` is still false, so
+    /// an early return would otherwise leave the ProcessTap running forever —
+    /// and the next start would overwrite `processTapStop`, orphaning the old
+    /// tap for good. All the individual stops are idempotent no-ops for
+    /// capture that never started.
+    private func abortStartupCapture() async {
+        if let stop = processTapStop {
+            stop()
+            processTapStop = nil
+            processTapFrames = nil
+        }
+        await systemCapture.stop()
+        await micCapture.stop()
     }
 
     func stopListening() async {
