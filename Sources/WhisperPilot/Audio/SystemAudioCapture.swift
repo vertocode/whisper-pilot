@@ -16,6 +16,10 @@ final class SystemAudioCapture: NSObject {
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private var framesEmitted: Int = 0
+    /// True between `stop()` and the next `start()`. Lets the delegate's
+    /// crash-restart loop tell a deliberate teardown apart from a mid-session
+    /// stream failure.
+    private var manuallyStopped = false
 
     override init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
@@ -29,6 +33,7 @@ final class SystemAudioCapture: NSObject {
     func start() async throws {
         log.info("Starting system audio capture…")
         print("[WP][SystemAudio] start() begin")
+        manuallyStopped = false
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
             log.error("No display available for capture")
@@ -61,6 +66,7 @@ final class SystemAudioCapture: NSObject {
     }
 
     func stop() async {
+        manuallyStopped = true
         guard let stream else { return }
         do {
             try await stream.stopCapture()
@@ -116,9 +122,18 @@ extension SystemAudioCapture: SCStreamOutput {
         guard let inputFormat = AVAudioFormat(streamDescription: &streamDescription) else { return nil }
 
         if sourceFormat?.isEqual(inputFormat) != true {
-            sourceFormat = inputFormat
-            converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
-            wpInfo("System audio source format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
+            if let newConverter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make()) {
+                sourceFormat = inputFormat
+                converter = newConverter
+                wpInfo("System audio source format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
+            } else {
+                // Do NOT record the new format on failure — doing so would make
+                // the next buffer compare equal, skip this branch forever, and
+                // leave the channel permanently dead on a stale nil converter.
+                sourceFormat = nil
+                converter = nil
+                wpError("System audio: no converter for source format \(inputFormat.sampleRate) Hz / \(inputFormat.channelCount) ch — will retry on next buffer")
+            }
         }
         guard let converter else { return nil }
 
@@ -248,9 +263,31 @@ extension SystemAudioCapture: SCStreamOutput {
 }
 
 extension SystemAudioCapture: SCStreamDelegate {
+    /// SCStream can die mid-session — sleep/wake, display disconnect, Screen
+    /// Recording permission revoked. Logging alone leaves the system channel
+    /// silently dead for the rest of the session, so attempt a few in-place
+    /// restarts with backoff. `stop()` flips `manuallyStopped`, which both
+    /// distinguishes deliberate teardown from failure and aborts a restart
+    /// loop that's still pending when the user stops the session.
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log.error("SCStream stopped with error: \(String(describing: error), privacy: .public)")
-        print("[WP][SystemAudio] SCStream stopped with error: \(error.localizedDescription)")
+        wpWarn("System audio stream stopped unexpectedly (\(error.localizedDescription)) — attempting restart")
+        Task { [weak self] in
+            guard let self, self.stream === stream else { return }
+            self.stream = nil
+            for attempt in 1...3 {
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                guard !self.manuallyStopped, self.stream == nil else { return }
+                do {
+                    try await self.start()
+                    wpInfo("System audio capture restarted after stream stop (attempt \(attempt))")
+                    return
+                } catch {
+                    wpWarn("System audio restart attempt \(attempt) failed: \(error.localizedDescription)")
+                }
+            }
+            wpError("System audio capture could not be restarted — the \"Other\" channel is no longer transcribing. Press Stop and Play to retry.")
+        }
     }
 }
 
