@@ -64,17 +64,23 @@ final class ResourceSampler: ResourceSampling {
         return total
     }
 
-    /// Resident memory footprint of this process, in bytes.
+    /// Memory footprint of this process, in bytes. Uses `phys_footprint`
+    /// (TASK_VM_INFO) rather than `resident_size`: RSS counts clean mmapped
+    /// pages — including the CoreML model weights Parakeet maps in — so a
+    /// session could trip the governor's memory cap *because* the
+    /// high-accuracy engine loaded, even though that memory is reclaimable
+    /// and exerts no real pressure. `phys_footprint` is the same metric the
+    /// kernel's own memory-pressure accounting (and Xcode's memory gauge) use.
     private static func residentMemoryBytes() -> UInt64 {
-        var info = mach_task_basic_info_data_t()
+        var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
-            MemoryLayout<mach_task_basic_info_data_t>.size / MemoryLayout<natural_t>.size
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
         )
         let kr = withUnsafeMutablePointer(to: &info) { infoPtr in
             infoPtr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rawPtr in
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), rawPtr, &count)
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rawPtr, &count)
             }
         }
-        return kr == KERN_SUCCESS ? info.resident_size : 0
+        return kr == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0
     }
 }
