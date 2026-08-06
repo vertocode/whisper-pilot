@@ -176,10 +176,25 @@ actor SessionStore {
 
     // MARK: - Append (called from coordinator on every finalized event)
 
-    func appendTranscriptLine(channel: AudioChannel, text: String, at: Date, to id: SessionID) {
+    func appendTranscriptLine(
+        channel: AudioChannel,
+        text: String,
+        translation: String? = nil,
+        translationLanguage: String? = nil,
+        at: Date,
+        to id: SessionID
+    ) {
         let speaker = channel == .system ? "Other" : "Me"
         let timestamp = Self.timeFormatter.string(from: at)
-        let line = "**\(speaker)** [\(timestamp)] \(text)"
+        var line = "**\(speaker)** [\(timestamp)] \(text)"
+        // Translation goes on its own blockquote line rather than inline.
+        // `transcriptLineRegex` skips anything that doesn't match the speaker
+        // shape, so files written by this build still load in older ones and
+        // vice versa — no migration, no version field.
+        if let translation, !translation.isEmpty {
+            let tag = translationLanguage.map { "\($0) — " } ?? ""
+            line += "\n> \(tag)\(translation)"
+        }
         appendToFile(line + "\n\n", at: sessionFolder(for: id).appendingPathComponent("transcript.md"))
         touch(id)
     }
@@ -278,12 +293,26 @@ actor SessionStore {
     }
 
     private static let transcriptLineRegex = #/^\*\*(?<speaker>Me|Other)\*\* \[(?<time>\d{2}:\d{2}:\d{2})\] (?<text>.+)$/#
+    /// A persisted translation: `> pt-BR — Deveríamos lançar na sexta`. The
+    /// language tag is optional so a hand-edited file without one still loads.
+    static let transcriptTranslationRegex = #/^> (?:(?<language>[A-Za-z]{2}(?:-[A-Za-z0-9]{2,4})?) — )?(?<translation>.+)$/#
     private static let chatHeaderRegex = #/^(?<role>You|Assistant|System) \[(?<time>\d{2}:\d{2}:\d{2})\]$/#
 
-    private static func parseTranscriptMarkdown(_ markdown: String) -> [TranscriptSegment] {
+    /// Internal (not private) so the smoke tests can exercise it, matching
+    /// `parseChatMarkdown` below.
+    static func parseTranscriptMarkdown(_ markdown: String) -> [TranscriptSegment] {
         var segments: [TranscriptSegment] = []
         let now = Date()
         for line in markdown.split(separator: "\n", omittingEmptySubsequences: true) {
+            // A translation line attaches to the segment above it. Checked
+            // first because it can never match the speaker shape, and a stray
+            // one with no preceding segment is simply dropped.
+            if let translationMatch = line.firstMatch(of: transcriptTranslationRegex) {
+                if !segments.isEmpty {
+                    segments[segments.count - 1].translatedText = String(translationMatch.translation)
+                }
+                continue
+            }
             guard let match = line.firstMatch(of: transcriptLineRegex) else { continue }
             let channel: AudioChannel = match.speaker == "Me" ? .microphone : .system
             let timestamp = parseTime(String(match.time)) ?? now
@@ -297,6 +326,20 @@ actor SessionStore {
             ))
         }
         return segments
+    }
+
+    /// Strips persisted translation lines from raw transcript markdown.
+    ///
+    /// `ConversationContext.seedFromMarkdown` blobs this text straight into the
+    /// prompt without parsing, so a resumed session would otherwise ship *both*
+    /// languages of the entire prior transcript to the model — silently
+    /// doubling the prior-transcript token count, and undoing the deliberate
+    /// choice never to feed translations to the AI.
+    static func strippingTranslations(_ markdown: String) -> String {
+        markdown
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { $0.firstMatch(of: transcriptTranslationRegex) == nil }
+            .joined(separator: "\n")
     }
 
     /// Line-based parse: a `## ` line starts a new turn only when its remainder matches

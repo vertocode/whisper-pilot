@@ -7,6 +7,16 @@ struct TranscriptSegment: Sendable, Hashable, Identifiable {
     var channel: AudioChannel
     var startedAt: Date
     var updatedAt: Date
+    /// Live translation of `text`, when the translation feature is on and this
+    /// row's language pair is installed. Always trails `text` slightly — see
+    /// `TranslationQueue` for the debounce and ordering rules.
+    ///
+    /// Defaulted so every existing construction site (the coordinator's live
+    /// segment, `SessionStore`'s markdown rehydration, the smoke suite)
+    /// compiles unchanged. Participating in the synthesized `Hashable` is
+    /// deliberate: it's what makes SwiftUI re-render the row when a translation
+    /// lands.
+    var translatedText: String? = nil
 }
 
 /// Shared containment-merge logic for consecutive finalized transcript lines.
@@ -164,7 +174,12 @@ actor TranscriptBuffer {
                 isFinal: false,
                 channel: update.channel,
                 startedAt: existing.startedAt,
-                updatedAt: update.timestamp
+                updatedAt: update.timestamp,
+                // Carry the previous translation forward rather than blanking
+                // the translated column while the new one is computed. The
+                // stale line is a better read than an empty gap flickering
+                // several times a sentence.
+                translatedText: existing.translatedText
             )
         } else {
             volatileByChannel[update.channel] = TranscriptSegment(
@@ -209,7 +224,8 @@ actor TranscriptBuffer {
                     isFinal: true,
                     channel: vol.channel,
                     startedAt: vol.startedAt,
-                    updatedAt: update.timestamp
+                    updatedAt: update.timestamp,
+                    translatedText: vol.translatedText
                 ))
             }
             return
@@ -252,7 +268,11 @@ actor TranscriptBuffer {
             // Anchor the committed line where its hypothesis started so the row
             // doesn't jump when the volatile flips to final.
             startedAt: consumedVolatile?.startedAt ?? update.timestamp,
-            updatedAt: update.timestamp
+            updatedAt: update.timestamp,
+            // Inherit the hypothesis's translation so the translated column
+            // doesn't blank out at the moment a line commits — the queue will
+            // re-translate the settled text a beat later.
+            translatedText: consumedVolatile?.translatedText
         ))
     }
 
@@ -270,6 +290,40 @@ actor TranscriptBuffer {
 
     private func lastFinalIndex(on channel: AudioChannel) -> Int? {
         finals.lastIndex(where: { $0.channel == channel })
+    }
+
+    /// Attaches a translation to an existing row. Deliberately the only thing
+    /// this actor knows about translation: it never creates, removes, reorders,
+    /// or merges rows, so none of the display invariants above can be violated
+    /// by the translation feature. Scheduling, debouncing, and ordering all
+    /// live in `TranslationQueue`.
+    ///
+    /// A miss is normal and silent — the row may have been evicted or committed
+    /// under a different id while the engine was working.
+    func setTranslation(id: UUID, _ translated: String) {
+        let trimmed = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let index = finalIndexByID[id] {
+            finals[index].translatedText = trimmed
+            return
+        }
+        for (channel, segment) in volatileByChannel where segment.id == id {
+            volatileByChannel[channel]?.translatedText = trimmed
+            return
+        }
+    }
+
+    /// Translation currently attached to the row that `id` maps to, if any.
+    /// Used at persistence time so `transcript.md` records whatever translation
+    /// existed when the line was flushed. Roll-up and merge point several update
+    /// ids at one row, and `finalIndexByID` already encodes that, so a fragment
+    /// id resolves to its composite row's translation.
+    func translation(forID id: UUID) -> String? {
+        if let index = finalIndexByID[id] { return finals[index].translatedText }
+        for segment in volatileByChannel.values where segment.id == id {
+            return segment.translatedText
+        }
+        return nil
     }
 
     /// Ordered list for UI rendering: committed lines first (chronological),

@@ -98,6 +98,13 @@ final class AppCoordinator {
     /// monotonic timestamp) into the governor.
     /// Rebuilt at each session start from the user's Settings thresholds (see
     /// `startResourceMonitor`), so threshold edits take effect on the next listen.
+    /// Live translation scheduler. Non-nil only while a session is listening
+    /// *and* translation is configured *and* the language pack is installed.
+    /// Everything about the feature hangs off this being nil: no queue means no
+    /// enqueueing, no session, no CPU, and `TranscriptSegment.translatedText`
+    /// stays nil so the lane renders exactly as it did before the feature.
+    private var translationQueue: TranslationQueue?
+
     private var resourceGovernor = ResourceGovernor()
     private var resourceSampler: ResourceSampling = ResourceSampler()
     private var resourceMonitorTask: Task<Void, Never>?
@@ -516,6 +523,91 @@ final class AppCoordinator {
         wpInfo("[Coordinator] ✓ Pipeline started, awaiting first audio frame")
         startNoFramesWatchdog()
         startResourceMonitor()
+        Task { [weak self] in await self?.startTranslationIfNeeded() }
+    }
+
+    // MARK: - Live translation
+
+    /// Builds the translation pipeline for this session, if it should exist at
+    /// all. Every gate is a reason to stay nil, and staying nil is the whole
+    /// "off costs nothing" guarantee — no session, no queue, no work.
+    ///
+    /// The source language is the transcription locale rather than anything
+    /// detected per line: one transcriber instance serves both channels, so the
+    /// app can only ever hear one language anyway. Detecting a language the
+    /// recognizer can't transcribe would be theatre.
+    private func startTranslationIfNeeded() async {
+        guard translationQueue == nil else { return }
+        guard settings.translationIsConfigured else { return }
+        guard #available(macOS 26.0, *) else { return }
+
+        let sourceIdentifier = settings.localeIdentifier
+        let targetIdentifier = settings.translationTargetIdentifier
+        let availability = await TranslationSupport.availability(
+            from: sourceIdentifier, to: targetIdentifier)
+        guard availability == .installed else {
+            // Never prompt for a download here. The sheet can only be raised
+            // from the SwiftUI `.translationTask` path in Settings, and mid-
+            // meeting is the worst possible moment for a modal regardless.
+            overlayState.appendSystemNote(
+                "Live translation is on, but the \(languageName(targetIdentifier)) language pack isn't installed. Open Settings → Translation to download it. Transcription is unaffected.",
+                category: .transcript
+            )
+            return
+        }
+        guard
+            let source = TranslationSupport.language(from: sourceIdentifier),
+            let target = TranslationSupport.language(from: targetIdentifier)
+        else { return }
+
+        let service = AppleTranslationService(source: source, target: target)
+        let buffer = transcriptBuffer
+        let queue = TranslationQueue(provider: service) { [weak self] id, translated in
+            await buffer.setTranslation(id: id, translated)
+            // Republish so the row repaints with its translation. The
+            // transcript consumer's own publish is driven by incoming audio; a
+            // translation that lands during a pause would otherwise sit
+            // invisible until the next word was spoken.
+            let snapshot = await buffer.snapshot()
+            await MainActor.run { [weak self] in self?.overlayState.transcript = snapshot }
+        }
+        // Rows already on screen are never translated — enabling mid-session
+        // applies forward only, so the toggle can't fire a burst of up to 150
+        // calls and trip the very safety valve this feature hooks into.
+        await queue.markBaseline(await buffer.snapshot())
+        translationQueue = queue
+
+        wpInfo("[Coordinator] live translation on: \(sourceIdentifier) → \(targetIdentifier)")
+        // First call costs ~834 ms versus ~34 ms steady state. Paying it here,
+        // during startup, keeps it off the first line the user actually cares
+        // about.
+        await queue.prewarm()
+    }
+
+    private func stopTranslation() async {
+        guard let queue = translationQueue else { return }
+        translationQueue = nil
+        await queue.stop()
+    }
+
+    /// Reacts to the enable toggle being flipped during a live session. The
+    /// target language deliberately does *not* apply live — the session is
+    /// built from one fixed pair, and swapping it mid-meeting would leave the
+    /// lane holding two languages.
+    func translationSettingsChanged() {
+        Task { [weak self] in
+            guard let self else { return }
+            guard self.isRunning else { return }
+            if self.settings.translationIsConfigured {
+                await self.startTranslationIfNeeded()
+            } else {
+                await self.stopTranslation()
+            }
+        }
+    }
+
+    private func languageName(_ identifier: String) -> String {
+        Locale.current.localizedString(forIdentifier: identifier) ?? identifier
     }
 
     // MARK: - Performance safety valve
@@ -591,6 +683,12 @@ final class AppCoordinator {
             if tier1Engaged {
                 dismissTier1Note()
                 tier1Engaged = false
+                // Restore full-rate translation alongside the AI resume. Safe
+                // to send unconditionally — `setMode` is a no-op when the mode
+                // is already `.partials`.
+                if let queue = translationQueue {
+                    Task { await queue.setMode(.partials) }
+                }
                 if tier1PausedAI && overlayState.isAIPaused {
                     valveTogglingAI = true
                     overlayState.isAIPaused = false
@@ -633,8 +731,15 @@ final class AppCoordinator {
         // (a separate consumer task) keeps running.
         for task in inFlightCompletions.values { task.cancel() }
         inFlightCompletions.removeAll()
+        // Degrade translation rather than killing it: someone relying on
+        // captions to follow a meeting loses far more from them disappearing
+        // than from them lagging. Finals-only cuts the call rate roughly 5-10x
+        // and restores automatically when load recovers.
+        if let queue = translationQueue {
+            Task { await queue.setMode(.finalsOnly) }
+        }
         tier1NoteID = overlayState.appendSystemNote(
-            "⚠️ High system load — AI auto-suggestions paused to keep transcription smooth. Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
+            "⚠️ High system load — AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
             category: .ai,
             actionLabel: "Disable my mic for this session",
             actionKind: .shedMicrophoneForSession
@@ -901,6 +1006,9 @@ final class AppCoordinator {
         // Stop the safety-valve monitor and clear its per-session state so an idle
         // app never polls and the next session starts with a clean governor.
         stopResourceMonitor()
+        // Tear the translation session down before the transcript flush below,
+        // so no late translation can land on a row that's already on disk.
+        await stopTranslation()
         // Persist any in-flight context edit before tearing the session down so the
         // last few keystrokes of the user's notes don't disappear on stop.
         await flushPendingContextSave()
@@ -1018,7 +1126,14 @@ final class AppCoordinator {
             let messages = await SessionStore.shared.loadChatMessages(session.id)
             overlayState.transcript = segments
             overlayState.messages = messages
-            await context.seedFromMarkdown(transcript: transcript, chat: chat)
+            // Strip persisted translation lines before the model sees this.
+            // `seedFromMarkdown` assigns the raw blob straight into the prompt
+            // with no parsing, so leaving them in would ship both languages of
+            // the whole prior transcript on every resumed prompt — roughly
+            // double the prior-transcript tokens, for zero information gain
+            // (the models are already fluent in the target language).
+            let transcriptForAI = SessionStore.strippingTranslations(transcript)
+            await context.seedFromMarkdown(transcript: transcriptForAI, chat: chat)
         }
 
         // Apply the session's stored model selection. On resume we honor the
@@ -1879,6 +1994,15 @@ final class AppCoordinator {
                     let snapshot = await buffer.snapshot()
                     self?.overlayState.transcript = snapshot
                     lastTranscriptUIPublish = now
+                    // Feed the same snapshot to the translation queue. Diffing
+                    // it against what was last translated is what makes
+                    // containment merges and roll-ups — which rewrite rows
+                    // *after* they commit — re-translate without either path
+                    // being hooked. Nil queue (feature off) costs one
+                    // main-actor property read.
+                    if let queue = await MainActor.run(body: { self?.translationQueue }) {
+                        await queue.ingest(snapshot)
+                    }
                 }
                 transcriptsSeen += 1
                 self?.overlayState.transcriptCount = transcriptsSeen
@@ -2257,9 +2381,20 @@ final class AppCoordinator {
     ) async {
         guard let sessionID = currentSession?.id else { return }
         lastPersistedLineByChannel[channel] = pending
+        // Record whatever translation exists at flush time. Flushing is
+        // deferred until the *next* utterance arrives, which is typically
+        // seconds after the 400 ms debounce has landed, so in practice the
+        // translation is there. When it isn't — the last line of a session,
+        // say — the source is written alone and never retrofitted; a file that
+        // silently rewrites itself is worse than one line without a mirror.
+        let translation = translationQueue == nil
+            ? nil
+            : await transcriptBuffer.translation(forID: pending.id)
         await SessionStore.shared.appendTranscriptLine(
             channel: channel,
             text: pending.text,
+            translation: translation,
+            translationLanguage: translation == nil ? nil : settings.translationTargetIdentifier,
             at: pending.timestamp,
             to: sessionID
         )

@@ -39,6 +39,9 @@ final class SettingsStore: ObservableObject {
         static let includeTranscriptInPrompt = "ai.includeTranscriptInPrompt"
         static let includeSystemAudioInPrompt = "ai.includeSystemAudioInPrompt"
         static let includeChatHistoryInPrompt = "ai.includeChatHistoryInPrompt"
+        static let translationEnabled = "translation.enabled"
+        static let translationTarget = "translation.target"
+        static let translationLayout = "translation.layout"
         static let safetyValveEnabled = "performance.safetyValveEnabled"
         static let safetyValveCPUPercent = "performance.safetyValveCPUPercent"
         static let safetyValveMemoryMB = "performance.safetyValveMemoryMB"
@@ -308,6 +311,49 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(includeChatHistoryInPrompt, forKey: Keys.includeChatHistoryInPrompt) }
     }
 
+    // MARK: - Live translation
+
+    /// Master switch for the side-by-side translated transcript. Applies live —
+    /// it only gates enqueueing and rendering, so flipping it mid-session takes
+    /// effect on the next transcript line without a restart.
+    ///
+    /// When off, no `TranslationQueue` and no `TranslationSession` are ever
+    /// constructed, so the audio and transcription paths are byte-for-byte what
+    /// they were before the feature existed. Off is genuinely free.
+    @Published var translationEnabled: Bool {
+        didSet { defaults.set(translationEnabled, forKey: Keys.translationEnabled) }
+    }
+
+    /// Language identifier the transcript is translated *into* (e.g. `pt-BR`).
+    /// Empty means unset — the feature stays inert until the user picks one.
+    ///
+    /// Unlike the other two, this applies on the **next** session: the
+    /// `TranslationSession` is built once per session from a fixed source →
+    /// target pair, and swapping it mid-meeting would leave the lane holding
+    /// two different languages. Mirrors how `resourceGovernorConfig` is read at
+    /// session start.
+    @Published var translationTargetIdentifier: String {
+        didSet { defaults.set(translationTargetIdentifier, forKey: Keys.translationTarget) }
+    }
+
+    /// How source and translation are arranged in the transcript lane. Applies
+    /// live — it's a pure view concern.
+    @Published var translationLayout: TranslationLayout {
+        didSet { defaults.set(translationLayout.rawValue, forKey: Keys.translationLayout) }
+    }
+
+    /// True when translation is switched on, a target is chosen, and that target
+    /// is actually a different language from what we're transcribing. The
+    /// same-language case (transcribing `en-US`, targeting `en-GB`) would spend
+    /// calls to reproduce the input, so it disables the feature instead.
+    ///
+    /// Says nothing about whether the language pack is downloaded — that's an
+    /// async framework question, answered by `TranslationSupport.availability`.
+    var translationIsConfigured: Bool {
+        guard translationEnabled, !translationTargetIdentifier.isEmpty else { return false }
+        return !TranslationSupport.isSameLanguage(localeIdentifier, translationTargetIdentifier)
+    }
+
     // MARK: - Performance safety valve
 
     /// Master switch for the resource safety valve. When off, the monitor still
@@ -533,6 +579,13 @@ final class SettingsStore: ObservableObject {
         // Safety valve defaults track the PRD's tier values: on, CPU 70%, memory 1.5 GB.
         // `alwaysTranscribeMic` defaults on so existing behavior (mic transcribed by
         // default) is unchanged for users who never touch the setting.
+        // Translation is off on fresh installs: it's a deliberate opt-in that
+        // costs CPU, and most sessions are single-language. No target is
+        // guessed — picking one silently would be a surprising default for a
+        // feature the user hasn't asked for yet.
+        self.translationEnabled = defaults.object(forKey: Keys.translationEnabled) as? Bool ?? false
+        self.translationTargetIdentifier = defaults.string(forKey: Keys.translationTarget) ?? ""
+        self.translationLayout = TranslationLayout(rawValue: defaults.string(forKey: Keys.translationLayout) ?? "") ?? .auto
         self.safetyValveEnabled = defaults.object(forKey: Keys.safetyValveEnabled) as? Bool ?? true
         self.safetyValveCPUPercent = defaults.object(forKey: Keys.safetyValveCPUPercent) as? Double ?? 70
         self.safetyValveMemoryMB = defaults.object(forKey: Keys.safetyValveMemoryMB) as? Int ?? 1500

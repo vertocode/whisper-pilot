@@ -101,10 +101,19 @@ struct OverlayView: View {
         // settings dependency.
         .environment(\.overlayTextColor, settings.overlayTextColor)
         .environment(\.overlayCompact, compact)
+        .environment(\.translationLayout, activeTranslationLayout)
     }
 
     /// Whether to render the overlay chrome at its denser, smaller spacing.
     private var compact: Bool { settings.overlayCompactChrome }
+
+    /// The layout to render translations with, or nil to not render them at
+    /// all. Turning the feature off hides the translated column but does not
+    /// discard translations already computed — flipping it back on brings them
+    /// straight back, since the text still lives on each segment.
+    private var activeTranslationLayout: TranslationLayout? {
+        settings.translationIsConfigured ? settings.translationLayout : nil
+    }
 
     // MARK: - Header
 

@@ -25,6 +25,10 @@ struct SmokeTestRunner {
         await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
         await runSessionStoreParsingSuite()
+        await runTranslationLayoutSuite()
+        await runTranslationBufferSuite()
+        await runTranslationQueueSuite()
+        await runTranslationPersistenceSuite()
         await runSpeechRecognitionIntegrationSuite()
         await runParakeetIntegrationSuite()
 
@@ -1334,6 +1338,263 @@ struct SmokeTestRunner {
             await expect(UpdateChecker.isVersion("0.1.12.1", newerThan: "0.1.12"), "extra component counts")
             await expect(!UpdateChecker.isVersion("0.1.12", newerThan: "0.1.12.0"), "trailing zero is equal")
             await expect(!UpdateChecker.isVersion("garbage", newerThan: "0.1.12"), "malformed tag never claims newer")
+        }
+    }
+
+    // MARK: - Live translation
+
+    /// Stand-in translator. Records every call so tests can assert on *how
+    /// many* translations were issued, which is the whole point of the debounce
+    /// and generation machinery.
+    final class FakeTranslator: TranslationProviding, @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [String] = []
+        private let delay: Duration
+
+        init(delay: Duration = .zero) { self.delay = delay }
+
+        func translate(_ text: String) async throws -> String {
+            lock.lock(); recorded.append(text); lock.unlock()
+            if delay != .zero { try? await Task.sleep(for: delay) }
+            return "<\(text)>"
+        }
+
+        func prewarm() async {}
+
+        var calls: [String] {
+            lock.lock(); defer { lock.unlock() }
+            return recorded
+        }
+    }
+
+    actor TranslationSink {
+        private(set) var results: [UUID: String] = [:]
+        private(set) var writeCount = 0
+        func record(_ id: UUID, _ text: String) {
+            results[id] = text
+            writeCount += 1
+        }
+    }
+
+    static func volatileSystemSegment(id: UUID = UUID(), _ text: String) -> TranscriptSegment {
+        TranscriptSegment(id: id, text: text, isFinal: false, channel: .system,
+                          startedAt: Date(), updatedAt: Date())
+    }
+
+    static func finalSystemSegment(id: UUID = UUID(), _ text: String) -> TranscriptSegment {
+        TranscriptSegment(id: id, text: text, isFinal: true, channel: .system,
+                          startedAt: Date(), updatedAt: Date())
+    }
+
+    /// Long enough for a finals path (no debounce) to complete, short enough to
+    /// keep the suite quick.
+    static let translationSettleDelay: Duration = .milliseconds(150)
+
+    static func runTranslationLayoutSuite() async {
+        await suite("TranslationLayout") {
+            await expect(TranslationLayout.auto.resolved(forTextWidth: 680) == .sideBySide,
+                         "auto goes side-by-side at Standard/Focus width")
+            await expect(TranslationLayout.auto.resolved(forTextWidth: 428) == .stacked,
+                         "auto stacks at the default Sidebar width (428pt)")
+            await expect(TranslationLayout.auto.resolved(forTextWidth: 0) == .stacked,
+                         "unmeasured width stacks rather than cramming two columns")
+            await expect(TranslationLayout.sideBySide.resolved(forTextWidth: 100) == .sideBySide,
+                         "explicit side-by-side ignores the threshold")
+            await expect(TranslationLayout.stacked.resolved(forTextWidth: 2000) == .stacked,
+                         "explicit stacked ignores the threshold")
+            await expect(TranslationLayout.sourceWidthFraction < 0.5,
+                         "source gets less than half — translations run longer than English")
+
+            await expect(TranslationSupport.isSameLanguage("en-US", "en-GB"),
+                         "same language, different region counts as same")
+            await expect(!TranslationSupport.isSameLanguage("en-US", "pt-BR"),
+                         "different languages are not the same")
+            await expect(!TranslationSupport.isSameLanguage("", "pt-BR"),
+                         "empty identifier is never a match")
+        }
+    }
+
+    static func runTranslationBufferSuite() async {
+        await suite("TranscriptBuffer translation attachment") {
+            let buffer = TranscriptBuffer()
+            let id = UUID()
+            await buffer.apply(TranscriptUpdate(id: id, text: "We should ship Friday.", isFinal: true,
+                                                channel: .system, timestamp: Date()))
+            await buffer.setTranslation(id: id, "Devemos lançar na sexta.")
+            var snap = await buffer.snapshot()
+            await expect(snap.first?.translatedText == "Devemos lançar na sexta.",
+                         "translation attaches to a finalized row")
+            await expect(await buffer.translation(forID: id) == "Devemos lançar na sexta.",
+                         "translation(forID:) resolves the row for persistence")
+
+            // Volatile row, then a replacement hypothesis: the previous
+            // translation must carry forward so the column never blanks.
+            let volatileBuffer = TranscriptBuffer()
+            let v1 = UUID()
+            await volatileBuffer.apply(TranscriptUpdate(id: v1, text: "I don't", isFinal: false,
+                                                        channel: .system, timestamp: Date()))
+            await volatileBuffer.setTranslation(id: v1, "Eu não")
+            let v2 = UUID()
+            await volatileBuffer.apply(TranscriptUpdate(id: v2, text: "I don't think", isFinal: false,
+                                                        channel: .system, timestamp: Date()))
+            snap = await volatileBuffer.snapshot()
+            await expect(snap.first?.translatedText == "Eu não",
+                         "a replaced hypothesis keeps the previous translation instead of blanking")
+
+            // Committing that hypothesis must likewise inherit it.
+            await volatileBuffer.apply(TranscriptUpdate(id: v2, text: "I don't think", isFinal: true,
+                                                        channel: .system, timestamp: Date()))
+            snap = await volatileBuffer.snapshot()
+            await expect(snap.first?.isFinal == true, "row committed")
+            await expect(snap.first?.translatedText == "Eu não",
+                         "committing inherits the hypothesis's translation")
+
+            // Unknown ids are silently ignored rather than creating rows.
+            let before = await volatileBuffer.snapshot().count
+            await volatileBuffer.setTranslation(id: UUID(), "orphan")
+            await expect(await volatileBuffer.snapshot().count == before,
+                         "setTranslation never creates a row")
+
+            // Empty translations are refused — an empty string would blank a
+            // column that previously had good text.
+            await volatileBuffer.setTranslation(id: v2, "   ")
+            snap = await volatileBuffer.snapshot()
+            await expect(snap.first?.translatedText == "Eu não",
+                         "blank translation is ignored, not written")
+        }
+    }
+
+    static func runTranslationQueueSuite() async {
+        await suite("TranslationQueue scheduling") {
+            // Finalized system line translates without waiting for a debounce.
+            let fake = FakeTranslator()
+            let sink = TranslationSink()
+            let queue = TranslationQueue(provider: fake) { id, text in await sink.record(id, text) }
+            let segment = finalSystemSegment("We should ship Friday.")
+            await queue.ingest([segment])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(fake.calls == ["We should ship Friday."], "finalized line translates immediately")
+            await expect(await sink.results[segment.id] == "<We should ship Friday.>",
+                         "result is written back under the row's id")
+
+            // Re-ingesting the same text must not re-translate.
+            await queue.ingest([segment])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(fake.calls.count == 1, "unchanged text is not re-translated")
+
+            // A roll-up rewrites a committed row's text — that must re-translate.
+            var grown = segment
+            grown.text = "We should ship Friday. Or Monday."
+            await queue.ingest([grown])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(fake.calls.count == 2, "a rewritten committed row re-translates")
+            await expect(fake.calls.last == "We should ship Friday. Or Monday.",
+                         "re-translation uses the rewritten text")
+            await queue.stop()
+        }
+
+        await suite("TranslationQueue channel and baseline gating") {
+            let fake = FakeTranslator()
+            let queue = TranslationQueue(provider: fake) { _, _ in }
+            await queue.ingest([micSegment("This is me talking.")])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(fake.calls.isEmpty, "microphone lines are never translated")
+
+            // Rows on screen when the feature is switched on stay untranslated,
+            // so enabling mid-session can't fire a burst of ~150 calls.
+            let existing = finalSystemSegment("Said before translation was on.")
+            let queue2Fake = FakeTranslator()
+            let queue2 = TranslationQueue(provider: queue2Fake) { _, _ in }
+            await queue2.markBaseline([existing])
+            await queue2.ingest([existing, finalSystemSegment("Said after.")])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(queue2Fake.calls == ["Said after."],
+                         "baseline rows are skipped; only new lines translate")
+            await queue.stop()
+            await queue2.stop()
+        }
+
+        await suite("TranslationQueue debounce and degraded mode") {
+            // A growing hypothesis under one id should collapse to a single
+            // translation of the settled text, not one per revision.
+            let fake = FakeTranslator()
+            let queue = TranslationQueue(provider: fake) { _, _ in }
+            let id = UUID()
+            for text in ["I don't", "I don't think", "I don't think we should"] {
+                await queue.ingest([volatileSystemSegment(id: id, text)])
+                try? await Task.sleep(for: .milliseconds(40))
+            }
+            await expect(fake.calls.isEmpty, "nothing fires while the text is still changing")
+            try? await Task.sleep(for: .milliseconds(600))
+            await expect(fake.calls == ["I don't think we should"],
+                         "debounce collapses a growing hypothesis to one call on the settled text")
+            await queue.stop()
+
+            // Tier-1 degradation: volatile rows are ignored entirely.
+            let degradedFake = FakeTranslator()
+            let degraded = TranslationQueue(provider: degradedFake) { _, _ in }
+            await degraded.setMode(.finalsOnly)
+            await degraded.ingest([volatileSystemSegment("still speaking")])
+            try? await Task.sleep(for: .milliseconds(600))
+            await expect(degradedFake.calls.isEmpty, "finalsOnly ignores in-progress rows")
+            await degraded.ingest([finalSystemSegment("done speaking")])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(degradedFake.calls == ["done speaking"],
+                         "finalsOnly still translates committed rows")
+            await degraded.stop()
+
+            // After stop(), late ingests are inert — no work on a torn-down session.
+            let stoppedFake = FakeTranslator()
+            let stopped = TranslationQueue(provider: stoppedFake) { _, _ in }
+            await stopped.stop()
+            await stopped.ingest([finalSystemSegment("too late")])
+            try? await Task.sleep(for: translationSettleDelay)
+            await expect(stoppedFake.calls.isEmpty, "a stopped queue does no work")
+        }
+    }
+
+    static func runTranslationPersistenceSuite() async {
+        await suite("SessionStore translation round-trip") {
+            let markdown = """
+            # Transcript
+
+            **Other** [10:00:01] We should ship on Friday.
+            > pt-BR — Devemos lançar na sexta-feira.
+
+            **Me** [10:00:09] I disagree.
+
+            **Other** [10:00:12] Why?
+            > pt-BR — Por quê?
+            """
+
+            let segments = SessionStore.parseTranscriptMarkdown(markdown)
+            await expect(segments.count == 3, "three speaker lines parse, translations don't add rows")
+            await expect(segments.first?.text == "We should ship on Friday.", "source text preserved")
+            await expect(segments.first?.translatedText == "Devemos lançar na sexta-feira.",
+                         "translation attaches to the line above it")
+            await expect(segments[1].translatedText == nil,
+                         "an untranslated line keeps a nil translation")
+            await expect(segments[2].translatedText == "Por quê?", "later translations attach correctly")
+
+            // The resume path must not feed both languages to the model.
+            let stripped = SessionStore.strippingTranslations(markdown)
+            await expect(!stripped.contains("Devemos lançar"), "translations are stripped for AI context")
+            await expect(!stripped.contains("Por quê?"), "every translation line is stripped")
+            await expect(stripped.contains("We should ship on Friday."), "source lines survive stripping")
+            await expect(stripped.contains("I disagree."), "untranslated lines survive stripping")
+
+            // A file written by an older build (no translation lines) still loads.
+            let legacy = """
+            # Transcript
+
+            **Other** [10:00:01] We should ship on Friday.
+
+            **Me** [10:00:09] I disagree.
+            """
+            let legacySegments = SessionStore.parseTranscriptMarkdown(legacy)
+            await expect(legacySegments.count == 2, "pre-translation transcripts parse unchanged")
+            await expect(legacySegments.allSatisfy { $0.translatedText == nil },
+                         "no translations invented for legacy files")
         }
     }
 

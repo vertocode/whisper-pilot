@@ -223,7 +223,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.isReleasedWhenClosed = false
             window.center()
             window.level = .popUpMenu
-            window.contentView = NSHostingView(rootView: SettingsView(store: coordinator.settings))
+            window.contentView = NSHostingView(rootView: SettingsView(
+                store: coordinator.settings,
+                // Lets the Translation tab's enable toggle take effect on a
+                // session that's already listening, instead of waiting for the
+                // next ▶.
+                onTranslationConfigurationChanged: { [weak coordinator] in
+                    coordinator?.translationSettingsChanged()
+                }
+            ))
             settingsWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)

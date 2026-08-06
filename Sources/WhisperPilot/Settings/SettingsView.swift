@@ -2,6 +2,10 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var store: SettingsStore
+    /// Invoked when the translation enable toggle or target changes, so a live
+    /// session can react without a restart. Defaulted so previews and any
+    /// non-app construction site stay simple.
+    var onTranslationConfigurationChanged: () -> Void = {}
     @State private var geminiAPIKeyDraft: String = ""
     @State private var geminiAPIKeySaved: Bool = false
     @State private var anthropicAPIKeyDraft: String = ""
@@ -18,14 +22,20 @@ struct SettingsView: View {
                 aiBehaviorTab.tabItem { Label("AI Behavior", systemImage: "sparkles") }
                 providerTab.tabItem { Label("AI Provider", systemImage: "brain") }
                 captureTab.tabItem { Label("Capture", systemImage: "waveform") }
+                TranslationSettingsTab(
+                    store: store,
+                    onConfigurationChanged: onTranslationConfigurationChanged
+                )
+                .tabItem { Label("Translation", systemImage: "character.bubble") }
                 overlayTab.tabItem { Label("Overlay", systemImage: "rectangle.on.rectangle") }
                 shortcutsTab.tabItem { Label("Shortcuts", systemImage: "keyboard") }
             }
         }
-        // Sized so all six tabs fit on a single row — narrower windows collapse the
+        // Sized so all tabs fit on a single row — narrower windows collapse the
         // trailing tabs behind a `>>` overflow chevron, which hides the AI Provider /
-        // Capture / Overlay panes behind an extra click.
-        .frame(minWidth: 820, idealWidth: 880, minHeight: 480, idealHeight: 520)
+        // Capture / Translation / Overlay panes behind an extra click. Widened when
+        // the Translation tab was added.
+        .frame(minWidth: 900, idealWidth: 960, minHeight: 480, idealHeight: 520)
         .padding(WP.Space.md)
         .onAppear {
             geminiAPIKeyDraft = store.geminiAPIKey ?? ""
@@ -497,8 +507,9 @@ struct SettingsView: View {
 }
 
 /// Inline helper text used under controls in Settings tabs. One source of truth so every
-/// hint has matching size/color/wrapping behavior.
-private struct FormHint: View {
+/// hint has matching size/color/wrapping behavior. Internal (not private) so tabs living
+/// in their own files — `TranslationSettingsTab` — read identically to the ones here.
+struct FormHint: View {
     let text: String
     init(_ text: String) { self.text = text }
 

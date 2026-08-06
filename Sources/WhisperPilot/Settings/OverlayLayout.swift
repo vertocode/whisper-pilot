@@ -153,6 +153,58 @@ enum OverlayLayoutMode: String, CaseIterable, Codable, Sendable, Identifiable {
     }
 }
 
+/// How the source transcript and its translation are arranged in a transcript
+/// row when live translation is on.
+enum TranslationLayout: String, CaseIterable, Codable, Sendable, Identifiable {
+    /// Side by side when the lane is wide enough, stacked when it isn't.
+    case auto
+    /// Always two columns, however narrow the lane gets.
+    case sideBySide
+    /// Always source on top, translation beneath.
+    case stacked
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .auto: return "Auto"
+        case .sideBySide: return "Side by side"
+        case .stacked: return "Stacked"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .auto: return "Side by side when the overlay is wide enough, stacked when it's narrow. Recommended."
+        case .sideBySide: return "Always two columns. In a narrow overlay each column gets very little room."
+        case .stacked: return "Always source on top, translation underneath. Full width for both."
+        }
+    }
+
+    /// Minimum text-region width (points) at which `.auto` chooses two columns.
+    ///
+    /// Derived from the shipped presets: the default Sidebar layout is a third
+    /// of the screen, which leaves roughly 428 pt for text after the channel
+    /// chip — about 34 characters per column once split, and translations run
+    /// 15-25% longer than English so the translated side wraps even harder.
+    /// Standard and Focus are half-screen, leaving ~680 pt, which splits
+    /// comfortably. This threshold sits between the two.
+    static let sideBySideMinimumWidth: CGFloat = 440
+
+    /// Fraction of the row given to the *source* text when side by side. Under
+    /// half because the translation is reliably the longer of the two.
+    static let sourceWidthFraction: CGFloat = 0.45
+
+    func resolved(forTextWidth width: CGFloat) -> TranslationLayout {
+        switch self {
+        case .auto:
+            return width >= Self.sideBySideMinimumWidth ? .sideBySide : .stacked
+        case .sideBySide, .stacked:
+            return self
+        }
+    }
+}
+
 /// Hex <-> SwiftUI/AppKit color helpers for the overlay text-color setting. Kept
 /// tiny and dependency-free — only `#RRGGBB` is supported, which is all the
 /// settings palette needs.
@@ -191,6 +243,25 @@ extension EnvironmentValues {
     var overlayTextColor: Color? {
         get { self[OverlayTextColorKey.self] }
         set { self[OverlayTextColorKey.self] = newValue }
+    }
+}
+
+/// Environment channel for the active translation layout. `nil` means "don't
+/// render translations at all" — either the feature is off or no target is
+/// configured. Threaded from `OverlayView` so `TranscriptRow` doesn't need a
+/// `SettingsStore` dependency, matching how text color and compact density are
+/// already passed down.
+///
+/// Note this is the *user's* setting, still possibly `.auto`; the row resolves
+/// it against the measured lane width.
+private struct TranslationLayoutKey: EnvironmentKey {
+    static let defaultValue: TranslationLayout? = nil
+}
+
+extension EnvironmentValues {
+    var translationLayout: TranslationLayout? {
+        get { self[TranslationLayoutKey.self] }
+        set { self[TranslationLayoutKey.self] = newValue }
     }
 }
 

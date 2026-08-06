@@ -1,9 +1,26 @@
 import SwiftUI
 
+/// Carries the lane's rendered width up from a zero-cost background reader.
+/// Used to decide side-by-side vs stacked without wrapping rows in
+/// `GeometryReader`s, which inside a `LazyVStack` would fight the intrinsic
+/// height every row needs.
+private struct LaneWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct TranscriptLane: View {
     /// Upper bound on rows rendered in the lane. Long sessions accumulate
     /// thousands of segments; the view only ever shows the recent window.
     static let maxRenderedSegments = 150
+
+    /// Horizontal budget a row spends before its text starts: the channel chip's
+    /// `minWidth` plus the `HStack` spacing next to it. Subtracted from the
+    /// measured lane width so the layout decision is made on the width text
+    /// actually gets, not the width the lane occupies.
+    private static let chipGutter: CGFloat = 44 + WP.Space.sm
 
     let segments: [TranscriptSegment]
     /// When true, only the header row is rendered (chevron flips to indicate
@@ -19,6 +36,10 @@ struct TranscriptLane: View {
     /// Invoked when the user taps the chevron in the header. The owner toggles
     /// the bound state; this lane just renders accordingly.
     var onToggleCollapse: (() -> Void)? = nil
+
+    /// Latest measured lane width. Only meaningful once a layout pass has run;
+    /// starts at zero, which resolves `.auto` to stacked until measured.
+    @State private var laneWidth: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
@@ -83,12 +104,27 @@ struct TranscriptLane: View {
                                 .padding(.horizontal, WP.Space.md - 2)
                         }
                         ForEach(segments.suffix(Self.maxRenderedSegments)) { segment in
-                            TranscriptRow(segment: segment)
-                                .id(segment.id)
+                            TranscriptRow(
+                                segment: segment,
+                                textWidth: max(0, laneWidth - Self.chipGutter)
+                            )
+                            .id(segment.id)
                         }
                     }
                 }
             }
+        }
+        // Zero-cost width probe: a clear background never affects layout, so
+        // measuring here can't perturb the row heights it informs.
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: LaneWidthKey.self, value: geo.size.width)
+            }
+        )
+        .onPreferenceChange(LaneWidthKey.self) { width in
+            // Ignore sub-point jitter from the divider drag so a resize doesn't
+            // thrash `.auto` back and forth across the threshold.
+            if abs(width - laneWidth) > 1 { laneWidth = width }
         }
     }
 }
@@ -122,10 +158,17 @@ struct CollapseToggle: View {
 
 private struct TranscriptRow: View {
     let segment: TranscriptSegment
+    /// Width available to text after the channel chip, measured by the lane.
+    /// Drives `.auto`'s side-by-side / stacked choice and the 45/55 split.
+    /// Zero until the first layout pass, which resolves to stacked — the safe
+    /// direction, since stacked is readable at any width.
+    var textWidth: CGFloat = 0
     /// User-chosen overlay text color (nil = system default). Only applied to
     /// finalized lines; in-progress (volatile) text stays muted secondary so the
     /// user can tell committed text from a hypothesis being refined.
     @Environment(\.overlayTextColor) private var overlayTextColor
+    /// nil = translations not rendered (feature off, or nothing configured).
+    @Environment(\.translationLayout) private var translationLayout
 
     var body: some View {
         HStack(alignment: .top, spacing: WP.Space.sm) {
@@ -133,13 +176,59 @@ private struct TranscriptRow: View {
                 .font(WP.TextStyle.tag)
                 .chip(.channel(color), horizontalPadding: 6, verticalPadding: 2)
                 .frame(minWidth: 44, alignment: .leading)
-            Text(segment.text)
-                .font(WP.TextStyle.body)
-                .foregroundStyle(segment.isFinal ? AnyShapeStyle(overlayTextColor ?? .primary) : AnyShapeStyle(.secondary))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-                .padding(.top, 1)
+            content
         }
+    }
+
+    /// Rows without a translation — every microphone row, plus any system row
+    /// whose translation hasn't landed yet — render exactly as they did before
+    /// the feature existed. That's what makes "translation off" genuinely free
+    /// rather than merely cheap.
+    @ViewBuilder
+    private var content: some View {
+        if let translated = segment.translatedText,
+           let layout = translationLayout,
+           !translated.isEmpty {
+            switch layout.resolved(forTextWidth: textWidth) {
+            case .sideBySide:
+                HStack(alignment: .top, spacing: WP.Space.sm) {
+                    sourceText
+                        .frame(width: max(60, textWidth * TranslationLayout.sourceWidthFraction),
+                               alignment: .leading)
+                    translationText(translated)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            case .stacked, .auto:
+                VStack(alignment: .leading, spacing: 1) {
+                    sourceText
+                    translationText(translated)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else {
+            sourceText
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var sourceText: some View {
+        Text(segment.text)
+            .font(WP.TextStyle.body)
+            .foregroundStyle(segment.isFinal ? AnyShapeStyle(overlayTextColor ?? .primary) : AnyShapeStyle(.secondary))
+            .textSelection(.enabled)
+            .padding(.top, 1)
+    }
+
+    /// Rendered a step down from the source so a glance can tell which column
+    /// is the original. Kept selectable — copying a translated line out of a
+    /// meeting is a real use.
+    private func translationText(_ translated: String) -> some View {
+        Text(translated)
+            .font(WP.TextStyle.body)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .padding(.top, 1)
     }
 
     private var label: String {
