@@ -191,9 +191,23 @@ enum TranslationLayout: String, CaseIterable, Codable, Sendable, Identifiable {
     /// comfortably. This threshold sits between the two.
     static let sideBySideMinimumWidth: CGFloat = 440
 
-    /// Fraction of the row given to the *source* text when side by side. Under
-    /// half because the translation is reliably the longer of the two.
-    static let sourceWidthFraction: CGFloat = 0.45
+    /// Starting fraction of the row given to the *source* text when side by
+    /// side. Under half because the translation is reliably the longer of the
+    /// two. The user can drag the column divider to change it; this is only the
+    /// value a fresh install starts from and what a double-click restores.
+    static let defaultSourceWidthFraction: CGFloat = 0.45
+
+    /// How far the divider can be dragged before it stops. Past these the drag
+    /// snaps to a single column instead — a 10%-wide column is unreadable, so
+    /// wanting one that narrow really means wanting the other one alone.
+    static let minSourceWidthFraction: CGFloat = 0.2
+    static let maxSourceWidthFraction: CGFloat = 0.8
+
+    /// Drag position beyond which the divider collapses to one column. Sits
+    /// outside the clamp range so reaching it is a deliberate shove to the edge
+    /// rather than something you hit while adjusting.
+    static let collapseToTranslationThreshold: CGFloat = 0.12
+    static let collapseToSourceThreshold: CGFloat = 0.88
 
     func resolved(forTextWidth width: CGFloat) -> TranslationLayout {
         switch self {
@@ -246,22 +260,79 @@ extension EnvironmentValues {
     }
 }
 
-/// Environment channel for the active translation layout. `nil` means "don't
-/// render translations at all" — either the feature is off or no target is
-/// configured. Threaded from `OverlayView` so `TranscriptRow` doesn't need a
-/// `SettingsStore` dependency, matching how text color and compact density are
-/// already passed down.
+/// Which of the two languages the transcript lane is showing. Independent of
+/// `TranslationLayout`: arrangement is *how* two columns sit next to each
+/// other, this is *whether* both are on screen at all.
 ///
-/// Note this is the *user's* setting, still possibly `.auto`; the row resolves
-/// it against the measured lane width.
-private struct TranslationLayoutKey: EnvironmentKey {
-    static let defaultValue: TranslationLayout? = nil
+/// Applies to stacked as well as side-by-side — the question "which language do
+/// I want to read right now" has nothing to do with how they're arranged.
+enum TranslationColumnMode: String, CaseIterable, Codable, Sendable, Identifiable {
+    case both
+    /// Original language only. The translation is still computed — toggling
+    /// back is meant to be instant, and the Translation tab's enable switch is
+    /// the control for actually reclaiming the CPU.
+    case sourceOnly
+    /// Translated text only. Rows whose translation hasn't landed yet fall back
+    /// to showing the source, dimmed, so a line never silently disappears.
+    case translationOnly
+
+    var id: String { rawValue }
+
+    var showsSource: Bool { self != .translationOnly }
+    var showsTranslation: Bool { self != .sourceOnly }
+
+    /// Result of clicking one language's visibility chip.
+    ///
+    /// Two invariants, both of which the alternatives violate: every click
+    /// changes something (no dead buttons), and no click can leave the lane
+    /// empty. Clicking a hidden language shows it. Clicking a visible one hides
+    /// it — except when it's the last one visible, where "hide" is impossible
+    /// and the click is read as "show me more" and restores both. That beats a
+    /// silent no-op (looks broken) and beats swapping to the other language
+    /// alone (you asked to hide one thing and a different thing appeared).
+    func toggling(source: Bool) -> TranslationColumnMode {
+        if source {
+            guard showsSource else { return .both }
+            return showsTranslation ? .translationOnly : .both
+        }
+        guard showsTranslation else { return .both }
+        return showsSource ? .sourceOnly : .both
+    }
+}
+
+/// Everything `TranscriptRow` needs to render translations, bundled so the
+/// overlay threads one environment value instead of four. `nil` in the
+/// environment means "don't render translations at all" — the feature is off or
+/// no target is configured.
+///
+/// Threaded from `OverlayView` so rows don't take a `SettingsStore` dependency,
+/// matching how text color and compact density are already passed down.
+struct TranslationDisplay: Equatable {
+    /// The user's setting, possibly still `.auto`; rows resolve it against the
+    /// measured lane width.
+    var layout: TranslationLayout
+    var columnMode: TranslationColumnMode
+    /// Live column split, already clamped to the drag range.
+    var sourceFraction: CGFloat
+    /// Short uppercase language codes ("EN", "PT") for the header chips.
+    var sourceLabel: String
+    var targetLabel: String
+
+    /// True when a draggable column divider makes sense: two columns actually
+    /// side by side, with both languages showing.
+    func showsDivider(forTextWidth width: CGFloat) -> Bool {
+        columnMode == .both && layout.resolved(forTextWidth: width) == .sideBySide
+    }
+}
+
+private struct TranslationDisplayKey: EnvironmentKey {
+    static let defaultValue: TranslationDisplay? = nil
 }
 
 extension EnvironmentValues {
-    var translationLayout: TranslationLayout? {
-        get { self[TranslationLayoutKey.self] }
-        set { self[TranslationLayoutKey.self] = newValue }
+    var translationDisplay: TranslationDisplay? {
+        get { self[TranslationDisplayKey.self] }
+        set { self[TranslationDisplayKey.self] = newValue }
     }
 }
 

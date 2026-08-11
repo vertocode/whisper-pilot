@@ -20,7 +20,11 @@ struct TranscriptLane: View {
     /// `minWidth` plus the `HStack` spacing next to it. Subtracted from the
     /// measured lane width so the layout decision is made on the width text
     /// actually gets, not the width the lane occupies.
-    private static let chipGutter: CGFloat = 44 + WP.Space.sm
+    ///
+    /// Internal because `OverlayView` positions the draggable column divider
+    /// from the same number — if these two ever disagree, the divider sits
+    /// somewhere other than the seam it's supposed to be dragging.
+    static let chipGutter: CGFloat = 44 + WP.Space.sm
 
     let segments: [TranscriptSegment]
     /// When true, only the header row is rendered (chevron flips to indicate
@@ -36,10 +40,15 @@ struct TranscriptLane: View {
     /// Invoked when the user taps the chevron in the header. The owner toggles
     /// the bound state; this lane just renders accordingly.
     var onToggleCollapse: (() -> Void)? = nil
+    /// Set by the owner when the language-visibility chips should be offered in
+    /// the header. Nil on the content-only instance, which has no header.
+    var onSetColumnMode: ((TranslationColumnMode) -> Void)? = nil
 
     /// Latest measured lane width. Only meaningful once a layout pass has run;
     /// starts at zero, which resolves `.auto` to stacked until measured.
     @State private var laneWidth: CGFloat = 0
+
+    @Environment(\.translationDisplay) private var translationDisplay
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
@@ -58,6 +67,9 @@ struct TranscriptLane: View {
                     .contentShape(Rectangle())
                     .onTapGesture { onToggleCollapse?() }
                     Spacer()
+                    if let display = translationDisplay, let onSetColumnMode {
+                        LanguageVisibilityChips(display: display, onSetColumnMode: onSetColumnMode)
+                    }
                     if !segments.isEmpty {
                         Text("\(segments.count) line\(segments.count == 1 ? "" : "s")")
                             .font(.system(size: 10, weight: .medium))
@@ -156,6 +168,56 @@ struct CollapseToggle: View {
     }
 }
 
+/// Two language codes in the transcript header, each toggling its own column.
+/// Reads like a chart legend: lit = showing, dimmed = hidden. Switching off the
+/// last visible language shows the other one alone rather than emptying the
+/// lane, so the control can't reach a useless state.
+private struct LanguageVisibilityChips: View {
+    let display: TranslationDisplay
+    let onSetColumnMode: (TranslationColumnMode) -> Void
+
+    var body: some View {
+        HStack(spacing: 3) {
+            chip(label: display.sourceLabel, isOn: display.columnMode.showsSource, isSource: true)
+            chip(label: display.targetLabel, isOn: display.columnMode.showsTranslation, isSource: false)
+        }
+    }
+
+    private func chip(label: String, isOn: Bool, isSource: Bool) -> some View {
+        Button {
+            onSetColumnMode(display.columnMode.toggling(source: isSource))
+        } label: {
+            Text(label)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(isOn ? AnyShapeStyle(isSource ? Color.blue : Color.teal) : AnyShapeStyle(.tertiary))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule().fill(isOn ? (isSource ? Color.blue : Color.teal).opacity(0.14) : Color.clear)
+                )
+                .overlay(
+                    Capsule().strokeBorder(
+                        isOn ? (isSource ? Color.blue : Color.teal).opacity(0.28) : Color.secondary.opacity(0.2),
+                        lineWidth: 0.5
+                    )
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(helpText(label: label, isOn: isOn, isSource: isSource))
+    }
+
+    /// Describes the actual outcome rather than a generic "toggle", because the
+    /// last-visible-language case restores both instead of hiding anything.
+    private func helpText(label: String, isOn: Bool, isSource: Bool) -> String {
+        let other = isSource ? display.targetLabel : display.sourceLabel
+        switch display.columnMode.toggling(source: isSource) {
+        case .both: return "Show \(label) and \(other)"
+        case .sourceOnly, .translationOnly: return "Hide \(label) — show only \(other)"
+        }
+    }
+}
+
 private struct TranscriptRow: View {
     let segment: TranscriptSegment
     /// Width available to text after the channel chip, measured by the lane.
@@ -168,7 +230,7 @@ private struct TranscriptRow: View {
     /// user can tell committed text from a hypothesis being refined.
     @Environment(\.overlayTextColor) private var overlayTextColor
     /// nil = translations not rendered (feature off, or nothing configured).
-    @Environment(\.translationLayout) private var translationLayout
+    @Environment(\.translationDisplay) private var translationDisplay
 
     var body: some View {
         HStack(alignment: .top, spacing: WP.Space.sm) {
@@ -187,28 +249,54 @@ private struct TranscriptRow: View {
     @ViewBuilder
     private var content: some View {
         if let translated = segment.translatedText,
-           let layout = translationLayout,
+           let display = translationDisplay,
            !translated.isEmpty {
-            switch layout.resolved(forTextWidth: textWidth) {
-            case .sideBySide:
-                HStack(alignment: .top, spacing: WP.Space.sm) {
-                    sourceText
-                        .frame(width: max(60, textWidth * TranslationLayout.sourceWidthFraction),
-                               alignment: .leading)
-                    translationText(translated)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            case .stacked, .auto:
-                VStack(alignment: .leading, spacing: 1) {
-                    sourceText
-                    translationText(translated)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            switch display.columnMode {
+            case .sourceOnly:
+                sourceText
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            case .translationOnly:
+                translationText(translated)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            case .both:
+                bothColumns(translated, display: display)
             }
+        } else if let display = translationDisplay,
+                  display.columnMode == .translationOnly,
+                  segment.channel == .system {
+            // Showing translations only, but this line hasn't been translated
+            // yet (or at all — rows that predate the feature being switched on
+            // are never backfilled). Render the source dimmed rather than an
+            // empty row: a caption that vanishes is worse than one that's
+            // briefly in the wrong language.
+            sourceText
+                .opacity(0.45)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             sourceText
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func bothColumns(_ translated: String, display: TranslationDisplay) -> some View {
+        switch display.layout.resolved(forTextWidth: textWidth) {
+        case .sideBySide:
+            HStack(alignment: .top, spacing: WP.Space.sm) {
+                sourceText
+                    // Floor of 60pt so a hard drag can't reduce a column to an
+                    // unreadable sliver even if the clamp is ever widened.
+                    .frame(width: max(60, textWidth * display.sourceFraction), alignment: .leading)
+                translationText(translated)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .stacked, .auto:
+            VStack(alignment: .leading, spacing: 1) {
+                sourceText
+                translationText(translated)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

@@ -59,6 +59,10 @@ struct OverlayView: View {
     /// Fraction captured at the start of a drag gesture so we can compute the new
     /// fraction relative to the drag origin instead of accumulating per-frame deltas.
     @State private var dragStartFraction: CGFloat?
+    /// Column split captured when a divider drag begins, so the new fraction is
+    /// computed against the drag origin rather than accumulating per-frame
+    /// deltas. Mirrors `dragStartFraction` for the horizontal pane split.
+    @State private var columnDragStartFraction: Double?
     @State private var chatCollapsed: Bool = false
     @State private var transcriptCollapsed: Bool = false
 
@@ -101,18 +105,33 @@ struct OverlayView: View {
         // settings dependency.
         .environment(\.overlayTextColor, settings.overlayTextColor)
         .environment(\.overlayCompact, compact)
-        .environment(\.translationLayout, activeTranslationLayout)
+        .environment(\.translationDisplay, translationDisplay)
     }
 
     /// Whether to render the overlay chrome at its denser, smaller spacing.
     private var compact: Bool { settings.overlayCompactChrome }
 
-    /// The layout to render translations with, or nil to not render them at
-    /// all. Turning the feature off hides the translated column but does not
-    /// discard translations already computed — flipping it back on brings them
-    /// straight back, since the text still lives on each segment.
-    private var activeTranslationLayout: TranslationLayout? {
-        settings.translationIsConfigured ? settings.translationLayout : nil
+    /// How translations should render, or nil to not render them at all.
+    /// Turning the feature off hides the translated column but does not discard
+    /// translations already computed — flipping it back on brings them straight
+    /// back, since the text still lives on each segment.
+    private var translationDisplay: TranslationDisplay? {
+        guard settings.translationIsConfigured else { return nil }
+        return TranslationDisplay(
+            layout: settings.translationLayout,
+            columnMode: settings.translationColumnMode,
+            sourceFraction: CGFloat(settings.translationSourceWidthFraction),
+            sourceLabel: Self.languageChipLabel(settings.localeIdentifier),
+            targetLabel: Self.languageChipLabel(settings.translationTargetIdentifier)
+        )
+    }
+
+    /// "en-US" → "EN", "pt-BR" → "PT". Just the language subtag: the header has
+    /// room for two or three characters, and the region rarely disambiguates
+    /// anything the user cares about at a glance.
+    static func languageChipLabel(_ identifier: String) -> String {
+        let base = identifier.split(separator: "-").first.map(String.init) ?? identifier
+        return base.isEmpty ? "?" : base.uppercased()
     }
 
     // MARK: - Header
@@ -575,7 +594,8 @@ struct OverlayView: View {
                     segments: state.transcript,
                     isCollapsed: false,
                     showContent: false,
-                    onToggleCollapse: { transcriptCollapsed.toggle() }
+                    onToggleCollapse: { transcriptCollapsed.toggle() },
+                    onSetColumnMode: { settings.translationColumnMode = $0 }
                 )
                 .padding(compact ? WP.Space.sm : WP.Space.md)
                 .background(Color(NSColor.windowBackgroundColor))
@@ -595,6 +615,12 @@ struct OverlayView: View {
                         }
                         .padding(compact ? WP.Space.sm : WP.Space.md)
                     }
+                    // Column divider rides on top of the scroll view rather
+                    // than inside it, so it stays put while transcript lines
+                    // scroll under it — the way a real column separator reads.
+                    // Rows still size themselves individually; this only edits
+                    // the shared fraction they all read.
+                    .overlay(alignment: .topLeading) { translationColumnDivider }
                     // Keyed on the whole segment (not just its id) so the pane
                     // also follows a growing in-progress hypothesis: a long
                     // sentence wraps to more lines under the same id, and
@@ -605,6 +631,79 @@ struct OverlayView: View {
                             proxy.scrollTo(last, anchor: .bottom)
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Draggable seam between the original and translated columns.
+    ///
+    /// The columns aren't real columns — every transcript row splits its own
+    /// width independently, which is what keeps a line and its translation
+    /// vertically aligned even when they wrap to different heights. So this
+    /// divider is a single full-height rule floating over the scroll view,
+    /// positioned from the same numbers the rows use, and dragging it only
+    /// edits the shared fraction they all read.
+    ///
+    /// Shoving it past either edge collapses to one language rather than
+    /// leaving a column too narrow to read; a double-click restores the
+    /// default split.
+    @ViewBuilder
+    private var translationColumnDivider: some View {
+        if let display = translationDisplay {
+            GeometryReader { geo in
+                let pad = compact ? WP.Space.sm : WP.Space.md
+                let textWidth = max(0, geo.size.width - pad * 2 - TranscriptLane.chipGutter)
+                if display.showsDivider(forTextWidth: textWidth) {
+                    // Centre of the inter-column gap: past the chip gutter, past
+                    // the source column, then half the spacing between them.
+                    let seam = pad + TranscriptLane.chipGutter
+                        + textWidth * display.sourceFraction + WP.Space.sm / 2
+                    Rectangle()
+                        .fill(Color.clear)
+                        .frame(width: 11)
+                        .overlay(Rectangle().fill(.separator.opacity(0.55)).frame(width: 1))
+                        .contentShape(Rectangle())
+                        // Same AppKit conflict the pane divider hits: without
+                        // this the window starts moving under the drag.
+                        .background(WindowDragBlocker())
+                        .onHover { hovering in
+                            if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                        }
+                        .gesture(
+                            DragGesture()
+                                .onChanged { value in
+                                    guard textWidth > 0 else { return }
+                                    if columnDragStartFraction == nil {
+                                        columnDragStartFraction = settings.translationSourceWidthFraction
+                                    }
+                                    guard let start = columnDragStartFraction else { return }
+                                    let proposed = start + Double(value.translation.width / textWidth)
+                                    settings.translationSourceWidthFraction =
+                                        SettingsStore.clampSourceFraction(proposed)
+                                }
+                                .onEnded { value in
+                                    defer { columnDragStartFraction = nil }
+                                    guard textWidth > 0, let start = columnDragStartFraction else { return }
+                                    // Decide collapse from the *unclamped*
+                                    // position: the clamp stops the divider at
+                                    // 0.2/0.8, so asking whether it crossed a
+                                    // threshold has to look at where the user
+                                    // actually dragged to.
+                                    let proposed = start + Double(value.translation.width / textWidth)
+                                    if proposed < Double(TranslationLayout.collapseToTranslationThreshold) {
+                                        settings.translationColumnMode = .translationOnly
+                                    } else if proposed > Double(TranslationLayout.collapseToSourceThreshold) {
+                                        settings.translationColumnMode = .sourceOnly
+                                    }
+                                }
+                        )
+                        .onTapGesture(count: 2) {
+                            settings.translationSourceWidthFraction =
+                                Double(TranslationLayout.defaultSourceWidthFraction)
+                        }
+                        .offset(x: seam - 5.5)
+                        .help("Drag to resize the two languages · drag to an edge to show one · double-click to reset")
                 }
             }
         }

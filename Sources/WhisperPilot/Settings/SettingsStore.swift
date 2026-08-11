@@ -42,6 +42,8 @@ final class SettingsStore: ObservableObject {
         static let translationEnabled = "translation.enabled"
         static let translationTarget = "translation.target"
         static let translationLayout = "translation.layout"
+        static let translationColumnMode = "translation.columnMode"
+        static let translationSourceWidthFraction = "translation.sourceWidthFraction"
         static let safetyValveEnabled = "performance.safetyValveEnabled"
         static let safetyValveCPUPercent = "performance.safetyValveCPUPercent"
         static let safetyValveMemoryMB = "performance.safetyValveMemoryMB"
@@ -342,6 +344,32 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(translationLayout.rawValue, forKey: Keys.translationLayout) }
     }
 
+    /// Which language(s) the transcript lane shows. Toggled from the chips in
+    /// the transcript header, or by shoving the column divider to either edge.
+    /// Applies live — pure view state.
+    @Published var translationColumnMode: TranslationColumnMode {
+        didSet { defaults.set(translationColumnMode.rawValue, forKey: Keys.translationColumnMode) }
+    }
+
+    /// Share of the row's text width given to the original language when the two
+    /// sit side by side. Driven by dragging the column divider; clamped on write
+    /// so a stored value can never render a column too narrow to read.
+    @Published var translationSourceWidthFraction: Double {
+        didSet {
+            let clamped = Self.clampSourceFraction(translationSourceWidthFraction)
+            if clamped != translationSourceWidthFraction {
+                translationSourceWidthFraction = clamped
+                return
+            }
+            defaults.set(translationSourceWidthFraction, forKey: Keys.translationSourceWidthFraction)
+        }
+    }
+
+    static func clampSourceFraction(_ value: Double) -> Double {
+        min(max(value, Double(TranslationLayout.minSourceWidthFraction)),
+            Double(TranslationLayout.maxSourceWidthFraction))
+    }
+
     /// True when translation is switched on, a target is chosen, and that target
     /// is actually a different language from what we're transcribing. The
     /// same-language case (transcribing `en-US`, targeting `en-GB`) would spend
@@ -586,6 +614,11 @@ final class SettingsStore: ObservableObject {
         self.translationEnabled = defaults.object(forKey: Keys.translationEnabled) as? Bool ?? false
         self.translationTargetIdentifier = defaults.string(forKey: Keys.translationTarget) ?? ""
         self.translationLayout = TranslationLayout(rawValue: defaults.string(forKey: Keys.translationLayout) ?? "") ?? .auto
+        self.translationColumnMode = TranslationColumnMode(rawValue: defaults.string(forKey: Keys.translationColumnMode) ?? "") ?? .both
+        self.translationSourceWidthFraction = Self.clampSourceFraction(
+            defaults.object(forKey: Keys.translationSourceWidthFraction) as? Double
+                ?? Double(TranslationLayout.defaultSourceWidthFraction)
+        )
         self.safetyValveEnabled = defaults.object(forKey: Keys.safetyValveEnabled) as? Bool ?? true
         self.safetyValveCPUPercent = defaults.object(forKey: Keys.safetyValveCPUPercent) as? Double ?? 70
         self.safetyValveMemoryMB = defaults.object(forKey: Keys.safetyValveMemoryMB) as? Int ?? 1500

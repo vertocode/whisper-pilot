@@ -1402,8 +1402,65 @@ struct SmokeTestRunner {
                          "explicit side-by-side ignores the threshold")
             await expect(TranslationLayout.stacked.resolved(forTextWidth: 2000) == .stacked,
                          "explicit stacked ignores the threshold")
-            await expect(TranslationLayout.sourceWidthFraction < 0.5,
-                         "source gets less than half — translations run longer than English")
+            await expect(TranslationLayout.defaultSourceWidthFraction < 0.5,
+                         "source starts with less than half — translations run longer than English")
+
+            // Drag clamping: a stored or dragged value can never render a
+            // column too narrow to read.
+            await expect(SettingsStore.clampSourceFraction(0.5) == 0.5, "mid-range fraction passes through")
+            await expect(SettingsStore.clampSourceFraction(0.01) == Double(TranslationLayout.minSourceWidthFraction),
+                         "an extreme drag left clamps to the minimum")
+            await expect(SettingsStore.clampSourceFraction(9.9) == Double(TranslationLayout.maxSourceWidthFraction),
+                         "an extreme drag right clamps to the maximum")
+            await expect(TranslationLayout.collapseToTranslationThreshold < TranslationLayout.minSourceWidthFraction,
+                         "collapse threshold sits outside the clamp, so it takes a deliberate shove")
+            await expect(TranslationLayout.collapseToSourceThreshold > TranslationLayout.maxSourceWidthFraction,
+                         "same on the other edge")
+        }
+
+        await suite("TranslationColumnMode") {
+            await expect(TranslationColumnMode.both.showsSource && TranslationColumnMode.both.showsTranslation,
+                         "both shows both")
+            await expect(TranslationColumnMode.sourceOnly.showsSource
+                            && !TranslationColumnMode.sourceOnly.showsTranslation,
+                         "sourceOnly hides the translation")
+            await expect(!TranslationColumnMode.translationOnly.showsSource
+                            && TranslationColumnMode.translationOnly.showsTranslation,
+                         "translationOnly hides the source")
+
+            // Toggling a visible language off leaves the other one showing.
+            await expect(TranslationColumnMode.both.toggling(source: true) == .translationOnly,
+                         "hiding the source from both leaves the translation")
+            await expect(TranslationColumnMode.both.toggling(source: false) == .sourceOnly,
+                         "hiding the translation from both leaves the source")
+
+            // Toggling the *last* visible language brings the other one back
+            // rather than emptying the lane — the control can't reach a state
+            // where nothing is readable.
+            await expect(TranslationColumnMode.translationOnly.toggling(source: true) == .both,
+                         "re-enabling the hidden source restores both")
+            await expect(TranslationColumnMode.sourceOnly.toggling(source: false) == .both,
+                         "re-enabling the hidden translation restores both")
+            await expect(TranslationColumnMode.translationOnly.toggling(source: false) == .both,
+                         "switching off the only visible language never blanks the lane")
+            await expect(TranslationColumnMode.sourceOnly.toggling(source: true) == .both,
+                         "same in the other direction")
+
+            // The divider is only meaningful with two real columns.
+            let wide = TranslationDisplay(layout: .auto, columnMode: .both, sourceFraction: 0.45,
+                                          sourceLabel: "EN", targetLabel: "PT")
+            await expect(wide.showsDivider(forTextWidth: 680), "divider shows for two side-by-side columns")
+            await expect(!wide.showsDivider(forTextWidth: 300), "no divider when auto resolves to stacked")
+            var single = wide
+            single.columnMode = .translationOnly
+            await expect(!single.showsDivider(forTextWidth: 680), "no divider when only one language shows")
+            var stacked = wide
+            stacked.layout = .stacked
+            await expect(!stacked.showsDivider(forTextWidth: 680), "no divider in stacked layout")
+
+            await expect(OverlayView.languageChipLabel("pt-BR") == "PT", "chip label drops the region")
+            await expect(OverlayView.languageChipLabel("en") == "EN", "bare language code works")
+            await expect(OverlayView.languageChipLabel("") == "?", "empty identifier gets a placeholder")
 
             await expect(TranslationSupport.isSameLanguage("en-US", "en-GB"),
                          "same language, different region counts as same")
