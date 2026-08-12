@@ -27,6 +27,16 @@ struct TranslationSettingsTab: View {
         Form {
             Section("Live translation") {
                 Toggle("Show a translated transcript", isOn: $store.translationEnabled)
+                    .disabled(!TranslationSupport.isAvailable)
+                if !TranslationSupport.isAvailable {
+                    // Repeated up here as well as in the status row below: this
+                    // is the first control the user reaches, and switching it
+                    // on used to appear to work while doing nothing at all.
+                    statusLabel(
+                        icon: "exclamationmark.triangle", tint: .orange,
+                        text: "Live translation needs macOS 15 or later — this Mac is running macOS \(Self.runningSystemVersion). Everything else in Whisper Pilot works as normal."
+                    )
+                }
                 FormHint("Adds a second column to the live transcript with everything the other side says, translated on-device. Your own microphone lines aren't translated — you already know what you said, and skipping them halves the work.\n\nWhen this is off, no translation session is created at all: the transcription pipeline runs exactly as it did before the feature existed.")
             }
 
@@ -70,7 +80,14 @@ struct TranslationSettingsTab: View {
     private var statusRow: some View {
         switch availability {
         case nil:
-            if store.translationTargetIdentifier.isEmpty {
+            if targets.isEmpty {
+                // Reachable only on macOS 15+, since older systems resolve to
+                // `.unavailableOnThisSystem` above. So the OS *should* have
+                // reported languages and didn't — say that plainly instead of
+                // asking the user to pick from an empty list.
+                statusLabel(icon: "exclamationmark.triangle", tint: .orange,
+                            text: "macOS didn't report any translation languages on this Mac. Check System Settings → General → Language & Region.")
+            } else if store.translationTargetIdentifier.isEmpty {
                 statusLabel(icon: "questionmark.circle", tint: .secondary,
                             text: "Pick a language to see whether it's ready to use.")
             } else if isCheckingAvailability {
@@ -85,7 +102,7 @@ struct TranslationSettingsTab: View {
             VStack(alignment: .leading, spacing: WP.Space.sm) {
                 statusLabel(icon: "arrow.down.circle", tint: .orange,
                             text: "Language pack not downloaded yet.")
-                if #available(macOS 26.0, *) {
+                if #available(macOS 15.0, *) {
                     TranslationDownloadButton(
                         source: store.localeIdentifier,
                         target: store.translationTargetIdentifier,
@@ -101,7 +118,7 @@ struct TranslationSettingsTab: View {
 
         case .unavailableOnThisSystem:
             statusLabel(icon: "exclamationmark.triangle", tint: .orange,
-                        text: "Live translation needs macOS 26 or later. Everything else in Whisper Pilot works as normal.")
+                        text: "Live translation needs macOS 15 or later — this Mac is running macOS \(Self.runningSystemVersion). Everything else in Whisper Pilot works as normal.")
         }
     }
 
@@ -126,6 +143,15 @@ struct TranslationSettingsTab: View {
     }
 
     private func refreshAvailability() async {
+        // System capability is checked BEFORE the "has the user picked a
+        // target" guard. Getting this order wrong is what made an unsupported
+        // Mac show "Pick a language to see whether it's ready to use" next to a
+        // disabled picker — advice the UI made impossible to follow, with the
+        // real reason unreachable because it needed a target already selected.
+        guard TranslationSupport.isAvailable else {
+            availability = .unavailableOnThisSystem
+            return
+        }
         guard !store.translationTargetIdentifier.isEmpty else {
             availability = nil
             return
@@ -142,13 +168,23 @@ struct TranslationSettingsTab: View {
         guard !identifier.isEmpty else { return "—" }
         return Locale.current.localizedString(forIdentifier: identifier) ?? identifier
     }
+
+    /// "15.6" / "26.5.1". Named in the unsupported message so the user can see
+    /// *why* the tab is inert without going to look it up — the difference
+    /// between "this app is broken" and "this Mac is a version behind".
+    static var runningSystemVersion: String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return v.patchVersion == 0
+            ? "\(v.majorVersion).\(v.minorVersion)"
+            : "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+    }
 }
 
 /// The only place in the app that can raise the system language-pack download
 /// sheet. Setting a non-nil configuration is what starts `.translationTask`;
 /// the sheet appears inside `prepareTranslation()` and blocks until the user
 /// accepts or cancels.
-@available(macOS 26.0, *)
+@available(macOS 15.0, *)
 private struct TranslationDownloadButton: View {
     let source: String
     let target: String

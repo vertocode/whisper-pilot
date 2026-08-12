@@ -53,6 +53,13 @@ struct OverlayActions {
     /// User picked a layout mode from the overlay's in-session menu. Applies the
     /// preset (size/position/appearance) immediately via the settings store.
     var setLayoutMode: (OverlayLayoutMode) -> Void
+    /// Delivers a `TranslationSession` produced by the overlay's SwiftUI
+    /// `.translationTask` host on macOS 15.0-25.x, where no non-view init
+    /// exists. Typed as `AnyObject` so this struct — reachable from code that
+    /// still deploys to macOS 14 — needs no availability annotation; the
+    /// coordinator does the gated downcast. Passing nil means the host's task
+    /// ended and the session is no longer valid.
+    var adoptTranslationSession: (AnyObject?) -> Void = { _ in }
 }
 
 /// Translucent floating window. We use a real `NSWindow` (not `NSPanel`) so window managers

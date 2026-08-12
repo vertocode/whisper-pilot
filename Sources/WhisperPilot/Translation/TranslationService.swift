@@ -13,10 +13,15 @@ enum TranslationAvailability: Sendable, Equatable {
     case downloadRequired
     /// Apple doesn't ship this pair at all. Nothing the user can do.
     case unsupported
-    /// macOS is older than 26.0, so the API this app relies on doesn't exist.
-    /// See `TranslationSupport.isAvailable` for why the floor is 26 and not 15.
+    /// macOS is older than 15.0, where Apple's `Translation` framework doesn't
+    /// exist at all.
     case unavailableOnThisSystem
 }
+
+/// Minimum macOS version that can translate. The runtime path differs above and
+/// below 26.0 (see `AppleTranslationService` vs `SequoiaTranslationService`),
+/// but both are the same feature at slightly different speeds.
+let translationMinimumMajorVersion = 15
 
 /// Engine-agnostic seam for the translation backend, mirroring how
 /// `TranscriptionProvider` and `AIProvider` keep their concrete types out of
@@ -39,22 +44,28 @@ protocol TranslationProviding: AnyObject, Sendable {
 /// Mac do en → pt-BR?" *before* any session exists, and on systems where the
 /// session type itself is unavailable.
 enum TranslationSupport {
-    /// The feature floor is macOS 26.0, not the framework's own 15.0. Reasons,
-    /// all verified against the SDK:
+    /// Whether this Mac can translate at all. macOS 15.0 is the floor —
+    /// `Translation` doesn't exist below it.
     ///
-    /// - `TranslationSession(installedSource:target:)` — the only way to own a
-    ///   session from an actor rather than a SwiftUI view — is 26.0+.
-    /// - `session.cancel()`, `session.isReady`, and `TranslationError
-    ///   .notInstalled` are all 26.0+, and the download UX needs them.
-    /// - `Strategy.lowLatency`, which is the entire point of a live-caption
-    ///   feature, is 26.4+.
+    /// The runtime path splits at 26.0, because
+    /// `TranslationSession(installedSource:target:)` — the only way to own a
+    /// session from an actor rather than a SwiftUI view — is 26.0+, as are
+    /// `cancel()`, `isReady`, and `TranslationError.notInstalled`. On 15.0-25.x
+    /// the session has to come from a `.translationTask` modifier and be handed
+    /// in (`SequoiaTranslationService`).
     ///
-    /// On 15.0–25.x the session can only be obtained through the SwiftUI
-    /// `.translationTask` modifier, which would mean hoisting a service into a
-    /// view and shipping a degraded version of the feature besides. Not worth
-    /// two code paths — see docs/ARCHITECTURE.md on wiring living in one place.
+    /// Everything *else* the feature needs is 15.0+ already: `LanguageAvailability`,
+    /// `status(from:to:)`, `supportedLanguages`, `translate(_:)`, and
+    /// `prepareTranslation()`. So the Settings tab, the availability checks, and
+    /// the language-pack download button work identically on both paths.
+    ///
+    /// The only user-visible difference is speed. `Strategy.lowLatency` is
+    /// 26.4+; below it the engine runs its default (high-fidelity) strategy.
+    /// Measured en → pt-BR: ~39 ms per line with `.lowLatency`, ~91 ms without.
+    /// Both sit far under the 400 ms stability debounce, so the gap doesn't
+    /// reach the user.
     static var isAvailable: Bool {
-        if #available(macOS 26.0, *) { return true }
+        if #available(macOS 15.0, *) { return true }
         return false
     }
 
@@ -78,7 +89,7 @@ enum TranslationSupport {
 
     /// Asks the framework whether a pair is installed / downloadable / absent.
     static func availability(from source: String, to target: String) async -> TranslationAvailability {
-        guard #available(macOS 26.0, *) else { return .unavailableOnThisSystem }
+        guard #available(macOS 15.0, *) else { return .unavailableOnThisSystem }
         guard let src = language(from: source), let dst = language(from: target) else {
             return .unsupported
         }
@@ -99,7 +110,7 @@ enum TranslationSupport {
     /// Returns `[(identifier, localizedName)]` — the identifier is what gets
     /// persisted in `SettingsStore.translationTargetIdentifier`.
     static func supportedTargets() async -> [(identifier: String, name: String)] {
-        guard #available(macOS 26.0, *) else { return [] }
+        guard #available(macOS 15.0, *) else { return [] }
         let languages = await LanguageAvailability().supportedLanguages
         var seen = Set<String>()
         var result: [(identifier: String, name: String)] = []
@@ -170,5 +181,87 @@ final class AppleTranslationService: TranslationProviding, @unchecked Sendable {
         // Failure here is not interesting — if the pack vanished between the
         // availability check and now, the first real translation reports it.
         _ = try? await session.translate("Hello.")
+    }
+}
+
+/// macOS 15.0-25.x backend.
+///
+/// Identical to `AppleTranslationService` in what it does, different only in how
+/// it gets a session. Below macOS 26 there is no `installedSource:` init, so the
+/// session can only come from SwiftUI's `.translationTask` modifier. A tiny
+/// zero-size host view in the overlay owns that modifier and hands the session
+/// here via `adopt(_:)`.
+///
+/// That inverts the usual dependency — a view feeding a service — which is why
+/// the 26.0 path exists and is preferred where available. It's confined to this
+/// type plus the host view; `TranslationQueue` and the coordinator can't tell
+/// the two apart.
+///
+/// An actor rather than a lock-guarded class because translations can be issued
+/// before the view has handed the session over (the queue starts with the
+/// session, the view mounts on the next render). Callers await adoption instead
+/// of failing, so the opening lines of a meeting aren't silently dropped.
+@available(macOS 15.0, *)
+actor SequoiaTranslationService: TranslationProviding {
+    private var session: TranslationSession?
+    private var waiters: [CheckedContinuation<TranslationSession?, Never>] = []
+    private var isRelinquished = false
+
+    /// Called by the host view when SwiftUI produces a session. Wakes anything
+    /// that was queued waiting for one.
+    func adopt(_ newSession: TranslationSession) {
+        session = newSession
+        isRelinquished = false
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume(returning: newSession) }
+    }
+
+    /// Called when the host view's task ends (configuration cleared, overlay
+    /// gone). Any waiter is released with nil so it fails fast instead of
+    /// hanging on a session that will never arrive.
+    func relinquish() {
+        session = nil
+        isRelinquished = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume(returning: nil) }
+    }
+
+    func translate(_ text: String) async throws -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        guard let active = await activeSession() else {
+            throw TranslationServiceError.sessionUnavailable
+        }
+        return try await active.translate(trimmed).targetText
+    }
+
+    func prewarm() async {
+        guard let active = await activeSession() else { return }
+        _ = try? await active.translate("Hello.")
+    }
+
+    private func activeSession() async -> TranslationSession? {
+        if let session { return session }
+        if isRelinquished { return nil }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+/// Errors this layer raises on its own behalf, as opposed to `TranslationError`
+/// coming out of the framework.
+enum TranslationServiceError: LocalizedError {
+    /// The Sequoia host view never delivered a session, or it was torn down
+    /// while a translation was queued behind it.
+    case sessionUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .sessionUnavailable:
+            return "No translation session is active."
+        }
     }
 }

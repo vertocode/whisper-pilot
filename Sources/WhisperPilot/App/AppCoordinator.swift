@@ -5,6 +5,7 @@ import Foundation
 import ImageIO
 import os
 import OSLog
+import Translation
 import ScreenCaptureKit
 import Speech
 import UniformTypeIdentifiers
@@ -104,6 +105,11 @@ final class AppCoordinator {
     /// enqueueing, no session, no CPU, and `TranscriptSegment.translatedText`
     /// stays nil so the lane renders exactly as it did before the feature.
     private var translationQueue: TranslationQueue?
+    /// The macOS 15.0-25.x service awaiting a session from the overlay's
+    /// SwiftUI host. Held as the un-gated protocol type because a stored
+    /// property can't carry an availability annotation; `adoptTranslationSession`
+    /// does the downcast inside a version check. Always nil on macOS 26+.
+    private var pendingSequoiaTranslationService: (any TranslationProviding)?
 
     private var resourceGovernor = ResourceGovernor()
     private var resourceSampler: ResourceSampling = ResourceSampler()
@@ -539,7 +545,7 @@ final class AppCoordinator {
     private func startTranslationIfNeeded() async {
         guard translationQueue == nil else { return }
         guard settings.translationIsConfigured else { return }
-        guard #available(macOS 26.0, *) else { return }
+        guard #available(macOS 15.0, *) else { return }
 
         let sourceIdentifier = settings.localeIdentifier
         let targetIdentifier = settings.translationTargetIdentifier
@@ -560,7 +566,24 @@ final class AppCoordinator {
             let target = TranslationSupport.language(from: targetIdentifier)
         else { return }
 
-        let service = AppleTranslationService(source: source, target: target)
+        // Two ways to get a session, same feature either side. On 26+ the
+        // service builds its own and owns it. Below that, no non-view init
+        // exists, so we publish the pair and the overlay's `.translationTask`
+        // host hands a session back through `adoptTranslationSession`.
+        let service: any TranslationProviding
+        if #available(macOS 26.0, *) {
+            service = AppleTranslationService(source: source, target: target)
+            overlayState.sequoiaTranslationPair = nil
+        } else {
+            let sequoia = SequoiaTranslationService()
+            service = sequoia
+            pendingSequoiaTranslationService = sequoia
+            // Publishing the pair is what mounts the host and starts the
+            // modifier. Translations issued before it lands are queued inside
+            // the service rather than dropped.
+            overlayState.sequoiaTranslationPair = TranslationLanguagePair(
+                source: sourceIdentifier, target: targetIdentifier)
+        }
         let buffer = transcriptBuffer
         let queue = TranslationQueue(provider: service) { [weak self] id, translated in
             await buffer.setTranslation(id: id, translated)
@@ -585,9 +608,43 @@ final class AppCoordinator {
     }
 
     private func stopTranslation() async {
+        // Clearing the pair cancels the overlay's `.translationTask`, which
+        // releases the session. Done first so nothing new can be issued against
+        // a session that's going away.
+        overlayState.sequoiaTranslationPair = nil
+        // Release before dropping the reference. A translation issued before
+        // the host delivered a session is parked on a `CheckedContinuation`
+        // inside the service; discarding the service without resuming it leaks
+        // that continuation, which Swift reports at runtime. Stopping during
+        // startup — quick ▶ then ⏹ — is exactly when this happens.
+        if #available(macOS 15.0, *),
+           let sequoia = pendingSequoiaTranslationService as? SequoiaTranslationService {
+            await sequoia.relinquish()
+        }
+        pendingSequoiaTranslationService = nil
         guard let queue = translationQueue else { return }
         translationQueue = nil
         await queue.stop()
+    }
+
+    /// Receives the `TranslationSession` produced by the overlay's SwiftUI host
+    /// on macOS 15.0-25.x. `nil` means the host's task ended and the session is
+    /// no longer usable.
+    ///
+    /// Takes `AnyObject?` because `OverlayActions` is reachable from code that
+    /// still deploys to macOS 14 and can't name the type; the availability
+    /// check and downcast live here.
+    func adoptTranslationSession(_ object: AnyObject?) {
+        guard #available(macOS 15.0, *) else { return }
+        guard let service = pendingSequoiaTranslationService as? SequoiaTranslationService else { return }
+        guard let session = object as? TranslationSession else {
+            Task { await service.relinquish() }
+            return
+        }
+        // No prewarm here: `startTranslationIfNeeded` already called
+        // `queue.prewarm()`, and on this path that call is parked inside the
+        // service waiting for exactly this session. Adopting releases it.
+        Task { await service.adopt(session) }
     }
 
     /// Reacts to the enable toggle being flipped during a live session. The

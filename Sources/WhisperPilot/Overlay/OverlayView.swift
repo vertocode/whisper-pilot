@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Translation
 import UniformTypeIdentifiers
 
 /// Renders the brand logo with two layered fallbacks:
@@ -36,6 +37,44 @@ struct BrandLogo: View {
             return image
         }
         return nil
+    }
+}
+
+/// Owns the `.translationTask` modifier on macOS 15.0-25.x, where it is the
+/// only way to obtain a `TranslationSession`.
+///
+/// The session is valid *only while the modifier's action closure is running*,
+/// so the closure hands the session out and then parks until cancelled. SwiftUI
+/// cancels it when the configuration changes or the view goes away, which is
+/// exactly when the session should be released.
+@available(macOS 15.0, *)
+private struct SequoiaTranslationSessionHost: View {
+    let pair: TranslationLanguagePair?
+    let onSession: (AnyObject?) -> Void
+
+    private var configuration: TranslationSession.Configuration? {
+        guard let pair,
+              let source = TranslationSupport.language(from: pair.source),
+              let target = TranslationSupport.language(from: pair.target)
+        else { return nil }
+        return TranslationSession.Configuration(source: source, target: target)
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .translationTask(configuration) { session in
+                onSession(session)
+                // Park. Returning here would end the task and invalidate the
+                // session the coordinator is still holding. Cancellation is the
+                // intended exit, and `Task.sleep` throwing on cancel is what
+                // breaks the loop.
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(60))
+                }
+                onSession(nil)
+            }
     }
 }
 
@@ -106,6 +145,26 @@ struct OverlayView: View {
         .environment(\.overlayTextColor, settings.overlayTextColor)
         .environment(\.overlayCompact, compact)
         .environment(\.translationDisplay, translationDisplay)
+        .background(sequoiaTranslationHost)
+    }
+
+    /// Invisible host for the pre-macOS-26 translation session.
+    ///
+    /// Below 26 a `TranslationSession` can only be produced by SwiftUI's
+    /// `.translationTask`, so something in the view tree has to own it. This is
+    /// deliberately parked on the overlay's root: it must outlive every
+    /// transcript row, and the overlay is the longest-lived view the feature
+    /// has. Renders nothing and takes no space.
+    ///
+    /// On macOS 26+ the coordinator never publishes a pair, so this stays inert.
+    @ViewBuilder
+    private var sequoiaTranslationHost: some View {
+        if #available(macOS 15.0, *) {
+            SequoiaTranslationSessionHost(
+                pair: state.sequoiaTranslationPair,
+                onSession: actions.adoptTranslationSession
+            )
+        }
     }
 
     /// Whether to render the overlay chrome at its denser, smaller spacing.

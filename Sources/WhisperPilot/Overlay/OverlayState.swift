@@ -71,6 +71,13 @@ nonisolated func wpError(_ message: String) {
     Task { @MainActor in LogBuffer.shared.append(.error, message) }
 }
 
+/// A source → target language pair for the pre-macOS-26 translation path,
+/// carried as identifiers so no availability annotation is needed.
+struct TranslationLanguagePair: Equatable, Sendable {
+    let source: String
+    let target: String
+}
+
 enum OverlayStatus: Equatable, Sendable {
     case idle
     /// Pipeline is spinning up — permissions probed, audio capture being created, recognizer
@@ -210,6 +217,17 @@ final class OverlayState: ObservableObject {
     /// reaching VAD/transcription. Capture itself keeps running so the resume is instant.
     @Published var isMicrophoneMuted: Bool = false
     @Published var isSystemAudioMuted: Bool = false
+
+    /// Non-nil while a macOS 15.0-25.x translation session should be live.
+    ///
+    /// Below macOS 26 a `TranslationSession` can only be produced by SwiftUI's
+    /// `.translationTask`, so the overlay hosts a zero-size view bound to this
+    /// pair and hands the resulting session back to the coordinator. Plain
+    /// strings rather than the framework's `Locale.Language` so this property
+    /// needs no availability annotation — the app still deploys to macOS 14.
+    ///
+    /// Always nil on macOS 26+, where the session is built directly by an actor.
+    @Published var sequoiaTranslationPair: TranslationLanguagePair? = nil
 
     /// Latest resource reading published by the safety-valve monitor (~1.3 Hz) for the
     /// live Diagnostics readout. `nil` while not listening — the monitor only samples

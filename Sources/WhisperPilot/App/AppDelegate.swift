@@ -113,6 +113,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setLayoutMode: { [weak self] mode in
                 print("[WP] action.setLayoutMode fired (\(mode.rawValue))")
                 self?.coordinator.settings.applyOverlayLayoutMode(mode)
+            },
+            adoptTranslationSession: { [weak self] session in
+                self?.coordinator.adoptTranslationSession(session)
             }
         )
 
