@@ -496,24 +496,46 @@ final class SettingsStore: ObservableObject {
     /// filter `AIModelRegistry.all` down to the rows the user can actually
     /// use. Reading the keychain is cheap-but-not-free; callers that need
     /// this multiple times in a tight loop should snapshot the result.
+    /// Uses existence checks rather than reads. Every caller here only needs to
+    /// know *whether* a vendor is configured, and reading the secret to answer
+    /// that costs the user an authorization dialog per vendor on builds macOS
+    /// doesn't recognize — which is every ad-hoc-signed build.
     var availableVendors: Set<AIVendor> {
         var s: Set<AIVendor> = []
-        if let k = geminiAPIKey, !k.isEmpty { s.insert(.gemini) }
-        if let k = anthropicAPIKey, !k.isEmpty { s.insert(.anthropic) }
+        if hasGeminiAPIKey { s.insert(.gemini) }
+        if hasAnthropicAPIKey { s.insert(.anthropic) }
         return s
+    }
+
+    /// Existence of a configured key, answered without decrypting it. Served
+    /// from the value cache when the secret has already been read for a real
+    /// reason, so a later AI call doesn't re-query.
+    var hasGeminiAPIKey: Bool {
+        if case .loaded(let v) = cachedGeminiAPIKey { return !(v ?? "").isEmpty }
+        return KeychainHelper.exists(Keys.geminiAPIKey)
+    }
+
+    var hasAnthropicAPIKey: Bool {
+        if case .loaded(let v) = cachedAnthropicAPIKey { return !(v ?? "").isEmpty }
+        return KeychainHelper.exists(Keys.anthropicAPIKey)
     }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        // Seed the keychain caches once at boot so the dozens of
-        // `settings.geminiAPIKey` / `.anthropicAPIKey` reads later in the
-        // launch path (eager provider build, refreshDerivedState wiring,
-        // every prompt-related codepath) are served from memory instead of
-        // hitting `SecItemCopyMatching` each time.
-        let geminiKeyAtBoot = KeychainHelper.get(Keys.geminiAPIKey)
-        let anthropicKeyAtBoot = KeychainHelper.get(Keys.anthropicAPIKey)
-        self.cachedGeminiAPIKey = .loaded(geminiKeyAtBoot)
-        self.cachedAnthropicAPIKey = .loaded(anthropicKeyAtBoot)
+        // Deliberately NOT seeding the key caches here.
+        //
+        // Eagerly reading both vendors' secrets at launch cost the user one
+        // macOS authorization dialog per configured vendor before they had even
+        // done anything — and on an ad-hoc-signed build "Always Allow" doesn't
+        // stick, because the item's ACL is bound to a code signature that
+        // changes with every build. The caches below fill lazily on the first
+        // read that genuinely needs a secret (an actual AI call), so opening the
+        // app and browsing sessions now prompts zero times.
+        //
+        // The `Cached` indirection still collapses the many later reads in the
+        // launch path down to one `SecItemCopyMatching`.
+        let geminiConfiguredAtBoot = KeychainHelper.exists(Keys.geminiAPIKey)
+        let anthropicConfiguredAtBoot = KeychainHelper.exists(Keys.anthropicAPIKey)
 
         // Resolve the active model in priority order:
         //   1. New unified key set by post-v0.1.11 builds.
@@ -532,8 +554,8 @@ final class SettingsStore: ObservableObject {
             defaults.set(id, forKey: Keys.activeModel)
         } else {
             var vendors: Set<AIVendor> = []
-            if let k = geminiKeyAtBoot, !k.isEmpty { vendors.insert(.gemini) }
-            if let k = anthropicKeyAtBoot, !k.isEmpty { vendors.insert(.anthropic) }
+            if geminiConfiguredAtBoot { vendors.insert(.gemini) }
+            if anthropicConfiguredAtBoot { vendors.insert(.anthropic) }
             let fallback = AIModelRegistry.defaultModel(availableVendors: vendors)
             self.activeModel = fallback.id
             defaults.set(fallback.id, forKey: Keys.activeModel)

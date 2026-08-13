@@ -128,6 +128,12 @@ enum ChatMessageAction: String, Sendable {
     /// trips the soft brake; the user taps it to drop the mic side entirely
     /// (capture keeps running so the mic toggle re-enables it instantly).
     case shedMicrophoneForSession
+    /// Copy the `xattr` command that clears the quarantine flag to the
+    /// clipboard. Posted by the App Translocation check at launch — the app
+    /// can't clear the flag itself (the translocated mount is read-only and the
+    /// real path isn't reachable), so the most it can do is hand the user the
+    /// exact command.
+    case copyQuarantineFixCommand
 }
 
 struct ChatMessage: Identifiable, Equatable, Sendable {

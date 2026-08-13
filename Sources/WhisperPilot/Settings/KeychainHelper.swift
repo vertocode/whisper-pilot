@@ -16,6 +16,33 @@ enum KeychainHelper {
         }
     }
 
+    /// Whether a value is stored, WITHOUT reading it.
+    ///
+    /// This distinction matters a lot on an ad-hoc-signed build. macOS asks the
+    /// user to authorize keychain access when an app that isn't on an item's
+    /// ACL tries to read the item's *data*; an attributes-only query discloses
+    /// no secret and so doesn't raise that prompt. Callers that only need to
+    /// know "is a key configured" — the model pickers, the launch-time default-
+    /// model choice — must use this instead of `get`, or simply opening the app
+    /// costs the user one authorization dialog per configured vendor.
+    static func exists(_ key: String) -> Bool {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key,
+            // The point of the whole function: attributes, never data.
+            kSecReturnData: false,
+            kSecReturnAttributes: true,
+            kSecMatchLimit: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            wpError("Keychain existence check for \(key) failed: OSStatus \(status)")
+        }
+        return status == errSecSuccess
+    }
+
     static func get(_ key: String) -> String? {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,

@@ -25,6 +25,7 @@ struct SmokeTestRunner {
         await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
         await runSessionStoreParsingSuite()
+        await runInstallDiagnosticsSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
         await runTranslationQueueSuite()
@@ -1389,6 +1390,44 @@ struct SmokeTestRunner {
     /// Long enough for a finals path (no debounce) to complete, short enough to
     /// keep the suite quick.
     static let translationSettleDelay: Duration = .milliseconds(150)
+
+    static func runInstallDiagnosticsSuite() async {
+        await suite("InstallDiagnostics (App Translocation)") {
+            // Real translocation paths, as macOS produces them.
+            await expect(InstallDiagnostics.isTranslocatedPath(
+                "/private/var/folders/9x/abc123/T/AppTranslocation/1B2C3D4E-5F6A/d/WhisperPilot.app"),
+                         "a genuine translocation mount is detected")
+            await expect(InstallDiagnostics.isTranslocatedPath(
+                "/var/folders/zz/x/AppTranslocation/DEADBEEF/d/WhisperPilot.app"),
+                         "detected regardless of the /private prefix")
+
+            // Normal installs must never trip this — a false positive would tell
+            // a correctly-installed user to run a command that does nothing, and
+            // train them to ignore the app's warnings.
+            await expect(!InstallDiagnostics.isTranslocatedPath("/Applications/WhisperPilot.app"),
+                         "a normal /Applications install is not translocated")
+            await expect(!InstallDiagnostics.isTranslocatedPath(
+                "/Users/someone/Applications/WhisperPilot.app"),
+                         "a per-user Applications install is not translocated")
+            await expect(!InstallDiagnostics.isTranslocatedPath(
+                "/Users/someone/Downloads/WhisperPilot.app"),
+                         "sitting in Downloads is not itself translocation — only the mount is")
+            await expect(!InstallDiagnostics.isTranslocatedPath(
+                "/Users/someone/Projects/AppTranslocationNotes/WhisperPilot.app"),
+                         "a folder merely named like the marker doesn't match")
+            await expect(!InstallDiagnostics.isTranslocatedPath(""),
+                         "an empty path is not translocated")
+
+            // The remedy text has to name a real path and a runnable command,
+            // since users copy it verbatim into a terminal.
+            await expect(InstallDiagnostics.remedyCommand.contains("xattr -dr com.apple.quarantine"),
+                         "remedy clears the quarantine attribute recursively")
+            await expect(InstallDiagnostics.remedyCommand.contains(InstallDiagnostics.recommendedInstallPath),
+                         "remedy targets the documented install path")
+            await expect(InstallDiagnostics.translocationMessage.contains(InstallDiagnostics.remedyCommand),
+                         "the note shows the command even if the user doesn't press Copy")
+        }
+    }
 
     static func runTranslationLayoutSuite() async {
         await suite("TranslationLayout") {

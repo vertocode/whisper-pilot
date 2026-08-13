@@ -184,6 +184,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }
             }
+        case .copyQuarantineFixCommand:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(InstallDiagnostics.remedyCommand, forType: .string)
+            coordinator.overlayState.appendSystemNote(
+                "📋 Copied. Quit Whisper Pilot, make sure it's in your Applications folder, paste the command into Terminal, then reopen the app.",
+                category: .general
+            )
         case .shedMicrophoneForSession:
             // Session-scoped: mute the mic channel so the recognizer stops being
             // fed. No setting is persisted — the user can re-enable via the mic

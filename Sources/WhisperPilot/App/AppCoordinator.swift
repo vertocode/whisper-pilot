@@ -297,10 +297,32 @@ final class AppCoordinator {
 
     func bootstrap() async {
         log.info("Bootstrap")
+        // Checked before the permissions snapshot, because when this fires it
+        // is the *reason* the permissions look wrong: a translocated bundle
+        // gets a fresh randomized path each launch, so TCC never recognizes it
+        // and every grant appears to have been revoked.
+        reportInstallLocationIfProblematic()
         await permissions.refresh()
         overlayState.permissionStatus = permissions.snapshot
         overlayState.status = .idle
         log.info("Permissions snapshot: mic=\(String(describing: self.permissions.snapshot.microphone), privacy: .public), screen=\(String(describing: self.permissions.snapshot.screenRecording), privacy: .public)")
+    }
+
+    /// Surfaces App Translocation as a first-class diagnostic instead of
+    /// letting it present as "this app keeps losing its permissions".
+    ///
+    /// Posted as a `.general` note so it sits above both lanes — it's about the
+    /// install, not about audio or the AI. Also written to the log so it shows
+    /// up in a bug report even if the user never opens the overlay.
+    private func reportInstallLocationIfProblematic() {
+        guard InstallDiagnostics.isTranslocated else { return }
+        wpWarn("[Install] Running from an App Translocation mount (\(InstallDiagnostics.currentBundlePath)) — TCC permissions cannot persist across launches until the quarantine flag is cleared.")
+        overlayState.appendSystemNote(
+            InstallDiagnostics.translocationMessage,
+            category: .general,
+            actionLabel: "Copy fix command",
+            actionKind: .copyQuarantineFixCommand
+        )
     }
 
     func shutdown() async {
@@ -472,7 +494,10 @@ final class AppCoordinator {
         }
         self.transcriber = transcriber
 
-        if let key = settings.geminiAPIKey, !key.isEmpty {
+        // Presence check, not a read: pressing ▶ shouldn't cost a keychain
+        // authorization dialog just to decide whether to show a note. The
+        // secret itself is read later, only if an AI call actually happens.
+        if settings.hasGeminiAPIKey {
             // Key present — make sure no stale "transcription-only" note is hanging
             // around from an earlier run in this session.
             dismissTranscriptionOnlyNote()
