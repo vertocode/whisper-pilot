@@ -16,6 +16,14 @@
   <a href="#requirements"><img alt="macOS" src="https://img.shields.io/badge/macOS-14%2B-lightgrey"></a>
 </p>
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=uyq04wOmE9w">
+    <img src="Resources/Branding/demo-thumbnail.jpg" alt="Watch the Whisper Pilot demo" width="900" />
+  </a>
+  <br>
+  <a href="https://www.youtube.com/watch?v=uyq04wOmE9w"><strong>▶ Watch the demo on YouTube</strong></a>
+</p>
+
 ---
 
 Whisper Pilot listens to anything your Mac can hear — meetings, podcasts, tutorials, your own voice — transcribes it on-device, and streams answers from your favorite LLM into a translucent floating overlay. Bring your own key. No backend. No telemetry. No signup.
