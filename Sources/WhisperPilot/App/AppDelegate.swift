@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// re-bound when the user picks a new combo.
     private var answerScreenHotKey: GlobalHotKey?
     private var settingsCancellables: Set<AnyCancellable> = []
+    private var terminationReplySent = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -174,15 +175,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // click ▶ themselves — bouncing nothing would surface a confusing
             // "Starting…" state.
             Task { [coordinator] in
-                if await coordinator.isRunning {
+                if coordinator.isRunning {
                     await coordinator.restartListening()
                 }
-                await MainActor.run {
-                    coordinator.overlayState.appendSystemNote(
-                        "ℹ️ ScreenCaptureKit enabled for system audio. macOS will ask for Screen Recording permission on the next Play if it hasn't already.",
-                        category: .transcript
-                    )
-                }
+                coordinator.overlayState.appendSystemNote(
+                    "ℹ️ ScreenCaptureKit enabled for system audio. macOS will ask for Screen Recording permission on the next Play if it hasn't already.",
+                    category: .transcript
+                )
             }
         case .copyQuarantineFixCommand:
             NSPasteboard.general.clearContents()
@@ -206,16 +205,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// timeout guards against a hung shutdown keeping the app alive forever.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         Task { @MainActor [coordinator] in
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await coordinator.shutdown() }
-                group.addTask { try? await Task.sleep(nanoseconds: 5_000_000_000) }
-                await group.next()
-                group.cancelAll()
-            }
-            // Mark a clean shutdown so the next launch doesn't false-alarm
-            // "previous run ended unexpectedly". Runs only after the flushes
-            // above have completed (or timed out).
+            await coordinator.shutdown()
+            guard !terminationReplySent else { return }
+            terminationReplySent = true
             CrashLogger.shared.markCleanShutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !terminationReplySent else { return }
+            terminationReplySent = true
+            wpWarn("Shutdown timed out after 5 seconds; terminating without a clean-shutdown marker")
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

@@ -19,11 +19,9 @@ The folder name is `<slug>-<timestamp>` where the slug is derived from the displ
 Appended live, one block per finalized transcript segment. Each block carries the channel (`ME` / `OTHER`), timestamp, and the recognized text:
 
 ```markdown
-## OTHER · 14:02:11
-Welcome to the call. Do you have a minute to discuss the proposal?
+**Other** [14:02:11] Welcome to the call. Do you have a minute to discuss the proposal?
 
-## ME · 14:02:18
-Yes, I had a chance to read through it last night.
+**Me** [14:02:18] Yes, I had a chance to read through it last night.
 ```
 
 Only **finalized** segments land here — partial hypotheses produced by the speech recognizer are kept in memory and overwritten in place; only the final text is persisted.
@@ -33,12 +31,18 @@ Only **finalized** segments land here — partial hypotheses produced by the spe
 Appended live, one heading per AI turn (user prompts and assistant responses). The role and timestamp head each block:
 
 ```markdown
-## You · 14:03:00
+## You [14:03:00]
+
 What was the timeline they mentioned?
 
-## Assistant · 14:03:01
+## Assistant [14:03:01]
+
 They mentioned needing the proposal by end of Q3 — September 30.
 ```
+
+Newer sessions may include an invisible HTML comment beneath a turn heading to preserve
+its UI origin (for example, an auto-detected question). Older files without this metadata
+remain fully supported, and the comment does not appear in rendered Markdown.
 
 System notes (the contextual messages the overlay shows, e.g. *"Microphone permission was not granted"*) are deliberately **not** persisted — they're UI affordances, not part of the conversation.
 
@@ -48,7 +52,7 @@ Display name + created/last-used timestamps. Not strictly required — if it's m
 
 ## Lifecycle
 
-- **Created** when you click *Start new* in the Sessions window. The folder is created lazily on first transcript write, so an empty session doesn't litter disk.
+- **Created** when you click *Start new* in the Sessions window. Transcript, chat, and metadata files are seeded immediately so the folder is ready to inspect or resume.
 - **Resumed** when you click *Resume* on an existing row. The app reads `transcript.md` and `chat.md` and seeds them into the [ConversationContext](ARCHITECTURE.md) so the next AI prompt has the prior content as context.
 - **Deleted** from the Sessions window's overflow menu. The entire folder is moved to the Trash so you can recover from accidents.
 - **Exported** from the overlay's `…` menu → *Export transcript…* (⌘E). Writes a copy of the active session's `transcript.md` to a path you pick. The original on-disk file is untouched.

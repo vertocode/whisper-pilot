@@ -42,7 +42,12 @@ actor SessionStore {
     let baseURL: URL
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "SessionStore")
 
-    init() {
+    init(baseURL overrideBaseURL: URL? = nil) {
+        if let overrideBaseURL {
+            self.baseURL = overrideBaseURL
+            try? FileManager.default.createDirectory(at: overrideBaseURL, withIntermediateDirectories: true)
+            return
+        }
         let bundleId = Bundle.main.bundleIdentifier ?? "com.whisperpilot.app"
         let appSupport: URL
         if let url = try? FileManager.default.url(
@@ -71,9 +76,17 @@ actor SessionStore {
         for name in names {
             let folder = baseURL.appendingPathComponent(name)
             let metaURL = folder.appendingPathComponent("metadata.json")
-            guard let data = try? Data(contentsOf: metaURL),
-                  var meta = try? makeDecoder().decode(SessionMeta.self, from: data) else {
-                continue
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            var meta: SessionMeta
+            if let data = try? Data(contentsOf: metaURL),
+               let decoded = try? makeDecoder().decode(SessionMeta.self, from: data) {
+                meta = decoded
+            } else {
+                // Keep intact transcript/chat data reachable even when metadata.json
+                // is missing or was damaged by an older build or manual edit.
+                meta = fallbackMetadata(for: name, folder: folder)
             }
             meta.transcriptLineCount = countTranscriptLines(at: folder)
             meta.chatTurnCount = countChatTurns(at: folder)
@@ -135,7 +148,11 @@ actor SessionStore {
     }
 
     func deleteSession(_ id: SessionID) throws {
-        try FileManager.default.removeItem(at: sessionFolder(for: id))
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(
+            at: sessionFolder(for: id),
+            resultingItemURL: &resultingURL
+        )
     }
 
     /// Minimum interval between `touch()` rewrites of metadata.json per session.
@@ -199,9 +216,16 @@ actor SessionStore {
         touch(id)
     }
 
-    func appendChatTurn(role: String, text: String, at: Date, to id: SessionID) {
+    func appendChatTurn(
+        role: String,
+        text: String,
+        origin: ChatMessage.Origin? = nil,
+        at: Date,
+        to id: SessionID
+    ) {
         let timestamp = Self.timeFormatter.string(from: at)
-        let block = "## \(role) [\(timestamp)]\n\n\(text)\n"
+        let metadata = origin.map { "<!-- whisper-pilot:origin=\($0.rawValue) -->\n\n" } ?? ""
+        let block = "## \(role) [\(timestamp)]\n\n\(metadata)\(text)\n"
         appendToFile(block + "\n", at: sessionFolder(for: id).appendingPathComponent("chat.md"))
         touch(id)
     }
@@ -285,9 +309,8 @@ actor SessionStore {
     }
 
     /// Parses `chat.md` back into `ChatMessage`s so the overlay can rehydrate the chat
-    /// lane on resume. Origin metadata isn't persisted on disk, so loaded turns default
-    /// to `.userPrompt` — that just suppresses the "detected question" / "auto-send"
-    /// badge, which makes sense for historical turns.
+    /// lane on resume. Older files have no origin metadata and safely default to
+    /// `.userPrompt`; newer files preserve origin in an invisible HTML comment.
     func loadChatMessages(_ id: SessionID) -> [ChatMessage] {
         Self.parseChatMarkdown(loadChatMarkdown(id))
     }
@@ -297,6 +320,7 @@ actor SessionStore {
     /// language tag is optional so a hand-edited file without one still loads.
     static let transcriptTranslationRegex = #/^> (?:(?<language>[A-Za-z]{2}(?:-[A-Za-z0-9]{2,4})?) — )?(?<translation>.+)$/#
     private static let chatHeaderRegex = #/^(?<role>You|Assistant|System) \[(?<time>\d{2}:\d{2}:\d{2})\]$/#
+    private static let chatOriginRegex = #/^<!-- whisper-pilot:origin=(?<origin>[A-Za-z]+) -->$/#
 
     /// Internal (not private) so the smoke tests can exercise it, matching
     /// `parseChatMarkdown` below.
@@ -355,7 +379,16 @@ actor SessionStore {
 
         func flush() {
             guard let header = currentHeader else { return }
-            let body = bodyLines.joined(separator: "\n")
+            var origin: ChatMessage.Origin?
+            let contentLines = bodyLines.filter { line in
+                guard let match = line.wholeMatch(of: chatOriginRegex),
+                      let parsed = ChatMessage.Origin(rawValue: String(match.origin)) else {
+                    return true
+                }
+                origin = parsed
+                return false
+            }
+            let body = contentLines.joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !body.isEmpty else { return }
             let timestamp = parseTime(header.time) ?? now
@@ -368,7 +401,7 @@ actor SessionStore {
             messages.append(ChatMessage(
                 id: UUID(),
                 role: role,
-                origin: role == .system ? .system : .userPrompt,
+                origin: origin ?? (role == .system ? .system : .userPrompt),
                 text: body,
                 timestamp: timestamp,
                 isStreaming: false,
@@ -388,6 +421,15 @@ actor SessionStore {
         }
         flush()
         return messages
+    }
+
+    /// Removes app-only HTML metadata before prior chat markdown enters an AI prompt.
+    /// Existing files without metadata pass through unchanged.
+    static func strippingChatMetadata(_ markdown: String) -> String {
+        markdown
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { $0.wholeMatch(of: chatOriginRegex) == nil }
+            .joined(separator: "\n")
     }
 
     /// Combines today's date with a `HH:MM:SS` timestamp. The on-disk format throws away
@@ -410,9 +452,9 @@ actor SessionStore {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(meta)
-        // Atomic: a crash mid-write must not leave a truncated metadata.json —
-        // `listSessions` silently skips folders whose metadata fails to decode,
-        // which would hide the session (and all its intact data) forever.
+        // Atomic: a crash mid-write must not discard the session's display name,
+        // timestamps, or selected model. The list can recover a damaged file,
+        // but only from folder attributes.
         try data.write(to: folder.appendingPathComponent("metadata.json"), options: .atomic)
     }
 
@@ -422,22 +464,40 @@ actor SessionStore {
         return decoder
     }
 
+    private func fallbackMetadata(for folderName: String, folder: URL) -> SessionMeta {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: folder.path)
+        let createdAt = (attributes?[.creationDate] as? Date)
+            ?? (attributes?[.modificationDate] as? Date)
+            ?? Date.distantPast
+        let lastUsedAt = (attributes?[.modificationDate] as? Date) ?? createdAt
+        return SessionMeta(
+            folderName: folderName,
+            displayName: folderName,
+            createdAt: createdAt,
+            lastUsedAt: lastUsedAt
+        )
+    }
+
     private func appendToFile(_ text: String, at url: URL) {
         let manager = FileManager.default
         if !manager.fileExists(atPath: url.path) {
-            try? text.write(to: url, atomically: true, encoding: .utf8)
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                log.error("Create-and-append failed for \(url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
             return
         }
-        if let handle = try? FileHandle(forWritingTo: url) {
+        do {
+            let handle = try FileHandle(forWritingTo: url)
             defer { try? handle.close() }
-            do {
-                try handle.seekToEnd()
-                if let data = text.data(using: .utf8) {
-                    try handle.write(contentsOf: data)
-                }
-            } catch {
-                log.error("Append failed: \(String(describing: error), privacy: .public)")
+            try handle.seekToEnd()
+            if let data = text.data(using: .utf8) {
+                try handle.write(contentsOf: data)
+                try handle.synchronize()
             }
+        } catch {
+            log.error("Append failed for \(url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 

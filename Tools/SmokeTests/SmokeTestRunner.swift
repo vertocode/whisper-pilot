@@ -25,6 +25,7 @@ struct SmokeTestRunner {
         await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
         await runSessionStoreParsingSuite()
+        await runSessionStorePersistenceSuite()
         await runInstallDiagnosticsSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
@@ -995,12 +996,92 @@ struct SmokeTestRunner {
                          "assistant body keeps its own markdown headings")
             await expect(messages[2].role == .system, "third turn parses as system")
 
+            let withOrigin = """
+            ## You [10:01:00]
+
+            <!-- whisper-pilot:origin=detectedQuestion -->
+
+            Why did latency increase?
+
+            ## Assistant [10:01:01]
+
+            <!-- whisper-pilot:origin=detectedQuestion -->
+
+            Queue depth increased.
+            """
+            let originated = SessionStore.parseChatMarkdown(withOrigin)
+            await expect(originated.count == 2, "origin metadata does not create extra turns")
+            await expect(originated.allSatisfy { $0.origin == .detectedQuestion },
+                         "detected-question origin round-trips for question and answer")
+            await expect(originated.first?.text == "Why did latency increase?",
+                         "origin metadata is removed from displayed text")
+            await expect(!SessionStore.strippingChatMetadata(withOrigin).contains("whisper-pilot:origin"),
+                         "origin metadata is removed from resumed AI context")
+
             // Malformed header stays in the previous body rather than being dropped.
             let sloppy = "## Assistant [09:00:00]\n\nline one\n## Not A Header\nline two\n"
             let parsed = SessionStore.parseChatMarkdown(sloppy)
             await expect(parsed.count == 1, "non-header ## line must not start a new turn")
             await expect(parsed.first?.text.contains("line two") == true,
                          "content after a non-header ## line is preserved")
+        }
+    }
+
+    static func runSessionStorePersistenceSuite() async {
+        await suite("SessionStore chat persistence") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+
+            do {
+                let session = try await store.createSession(name: "Persistence regression")
+                await store.appendChatTurn(
+                    role: "You",
+                    text: "What should we ship?",
+                    origin: .detectedQuestion,
+                    at: Date(),
+                    to: session.id
+                )
+                await store.appendChatTurn(
+                    role: "Assistant",
+                    text: "Ship the stable build.",
+                    origin: .detectedQuestion,
+                    at: Date(),
+                    to: session.id
+                )
+
+                let firstResume = await store.loadChatMessages(session.id)
+                await expect(firstResume.map(\.text) == ["What should we ship?", "Ship the stable build."],
+                             "auto-detected question and answer reload in order")
+                await expect(firstResume.allSatisfy { $0.origin == .detectedQuestion },
+                             "auto-detected question and answer restore origin")
+
+                let secondResume = await store.loadChatMessages(session.id)
+                await expect(secondResume.count == 2,
+                             "repeated resume does not duplicate persisted turns")
+            } catch {
+                await expect(false, "session persistence setup failed: \(error.localizedDescription)")
+            }
+        }
+
+        await suite("SessionStore metadata recovery") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+            do {
+                let session = try await store.createSession(name: "Recover me")
+                try Data("{broken".utf8).write(
+                    to: root.appendingPathComponent(session.folderName).appendingPathComponent("metadata.json")
+                )
+                let sessions = await store.listSessions()
+                await expect(sessions.count == 1, "corrupt metadata does not hide session data")
+                await expect(sessions.first?.folderName == session.folderName,
+                             "recovered session keeps original folder identity")
+            } catch {
+                await expect(false, "metadata recovery setup failed: \(error.localizedDescription)")
+            }
         }
     }
 

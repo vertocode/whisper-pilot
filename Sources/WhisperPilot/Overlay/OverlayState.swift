@@ -106,7 +106,7 @@ enum OverlayStatus: Equatable, Sendable {
         case .streaming: return "Speaking"
         case .needsPermission(.microphone): return "Microphone permission needed"
         case .needsPermission(.screenRecording): return "Screen Recording permission needed"
-        case .needsAPIKey: return "Add a Gemini API key in Settings"
+        case .needsAPIKey: return "Add an API key in Settings"
         case .error(let message): return message
         }
     }

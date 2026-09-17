@@ -42,8 +42,12 @@ final class SessionsViewModel: ObservableObject {
     }
 
     func delete(_ meta: SessionMeta) async {
-        try? await SessionStore.shared.deleteSession(meta.id)
-        await refresh()
+        do {
+            try await SessionStore.shared.deleteSession(meta.id)
+            await refresh()
+        } catch {
+            errorMessage = "Couldn’t move \(meta.displayName) to Trash: \(error.localizedDescription)"
+        }
     }
 
     func rename(_ meta: SessionMeta, to newName: String) async {

@@ -382,6 +382,7 @@ final class AppCoordinator {
         isStartingUp = true
         defer { isStartingUp = false }
         sessionGeneration += 1
+        let startupGeneration = sessionGeneration
         wpInfo("[Coordinator] ▶ startListening")
         // Fresh AsyncStream instances per session — see the property declarations
         // for why. Doing this here (rather than at `stopListening` time) keeps the
@@ -406,6 +407,10 @@ final class AppCoordinator {
         // "Starting…" spinner with no signal at all.
         startStartupWatchdog()
         await permissions.refresh()
+        guard startupGeneration == sessionGeneration else {
+            await abortStartupCapture()
+            return
+        }
         overlayState.permissionStatus = permissions.snapshot
 
         // Surface what audio devices the OS is presenting before we start capture, so the
@@ -431,10 +436,19 @@ final class AppCoordinator {
             let pt = ProcessAudioCapture()
             do {
                 try await pt.start()
+                guard startupGeneration == sessionGeneration else {
+                    pt.stop()
+                    await abortStartupCapture()
+                    return
+                }
                 processTapFrames = pt.frames
                 processTapStop = { pt.stop() }
                 wpInfo("[Coordinator] ✓ Using Core Audio Process Tap (audio-only, no screen recording)")
             } catch {
+                guard startupGeneration == sessionGeneration else {
+                    await abortStartupCapture()
+                    return
+                }
                 wpWarn("Process Tap unavailable (\(error.localizedDescription)); falling back to ScreenCaptureKit")
             }
         } else if settings.forceScreenCaptureKitForSystemAudio {
@@ -446,6 +460,10 @@ final class AppCoordinator {
             let priorScreenRecording = permissions.snapshot.screenRecording
             do {
                 _ = try await SCShareableContent.current
+                guard startupGeneration == sessionGeneration else {
+                    await abortStartupCapture()
+                    return
+                }
                 permissions.markScreenRecordingGranted()
                 overlayState.permissionStatus = permissions.snapshot
                 wpInfo("[Coordinator] ✓ Screen Recording probe passed (SCK fallback)")
@@ -453,10 +471,18 @@ final class AppCoordinator {
                     wpInfo("Screen Recording permission detected on this run")
                 }
             } catch {
+                guard startupGeneration == sessionGeneration else {
+                    await abortStartupCapture()
+                    return
+                }
                 wpError("Screen Recording probe failed: \(error.localizedDescription)")
                 overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.", category: .general)
                 overlayState.status = .needsPermission(.screenRecording)
                 await permissions.requestScreenRecording()
+                guard startupGeneration == sessionGeneration else {
+                    await abortStartupCapture()
+                    return
+                }
                 await abortStartupCapture()
                 return
             }
@@ -465,6 +491,10 @@ final class AppCoordinator {
         if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
             wpInfo("[Coordinator] microphone requested, not authorized — prompting")
             await permissions.requestMicrophone()
+            guard startupGeneration == sessionGeneration else {
+                await abortStartupCapture()
+                return
+            }
             if permissions.snapshot.microphone == .granted {
                 wpInfo("Microphone permission granted; continuing pipeline")
                 // fall through to start the pipeline so the user doesn't have to click Play again
@@ -486,9 +516,18 @@ final class AppCoordinator {
         do {
             transcriber = try await makeStartedTranscriber()
         } catch {
+            guard startupGeneration == sessionGeneration else {
+                await abortStartupCapture()
+                return
+            }
             wpError("Transcriber start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             dismissStartupNotes()
+            await abortStartupCapture()
+            return
+        }
+        guard startupGeneration == sessionGeneration else {
+            transcriber.stop()
             await abortStartupCapture()
             return
         }
@@ -497,7 +536,7 @@ final class AppCoordinator {
         // Presence check, not a read: pressing ▶ shouldn't cost a keychain
         // authorization dialog just to decide whether to show a note. The
         // secret itself is read later, only if an AI call actually happens.
-        if settings.hasGeminiAPIKey {
+        if aiProvider != nil {
             // Key present — make sure no stale "transcription-only" note is hanging
             // around from an earlier run in this session.
             dismissTranscriptionOnlyNote()
@@ -505,9 +544,9 @@ final class AppCoordinator {
             // Append exactly once per session. Without this guard, a stop+start cycle
             // (or returning to the same session via the back button) would stack a
             // second identical note on top of the first.
-            wpInfo("[Coordinator] no Gemini key — transcription-only mode")
+            wpInfo("[Coordinator] no API key for active model — transcription-only mode")
             transcriptionOnlyNoteID = overlayState.appendSystemNote(
-                "ℹ️ Transcription is running. Add a Gemini API key in Settings to enable AI suggestions.",
+                "ℹ️ Transcription is running. Add an API key for the selected model in Settings to enable AI suggestions.",
                 category: .general
             )
         }
@@ -515,16 +554,34 @@ final class AppCoordinator {
         do {
             if processTapFrames == nil {
                 try await systemCapture.start()
+                guard startupGeneration == sessionGeneration else {
+                    transcriber.stop()
+                    self.transcriber = nil
+                    await abortStartupCapture()
+                    return
+                }
                 wpInfo("[Coordinator] systemCapture.start OK (SCK)")
             }
             if settings.captureMicrophone {
                 micCapture.preferredDeviceUID = settings.microphoneDeviceUID
                 try await micCapture.start()
+                guard startupGeneration == sessionGeneration else {
+                    transcriber.stop()
+                    self.transcriber = nil
+                    await abortStartupCapture()
+                    return
+                }
                 wpInfo("[Coordinator] micCapture.start OK")
             } else {
                 wpInfo("[Coordinator] microphone capture disabled in settings")
             }
         } catch {
+            guard startupGeneration == sessionGeneration else {
+                transcriber.stop()
+                self.transcriber = nil
+                await abortStartupCapture()
+                return
+            }
             wpError("Pipeline start failed: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             dismissStartupNotes()
@@ -1059,12 +1116,8 @@ final class AppCoordinator {
     }
 
     /// Releases whatever audio capture an aborted `startListening` already
-    /// started. Every early-return failure path after the capture setup must
-    /// call this: `stopListening` no-ops while `isRunning` is still false, so
-    /// an early return would otherwise leave the ProcessTap running forever —
-    /// and the next start would overwrite `processTapStop`, orphaning the old
-    /// tap for good. All the individual stops are idempotent no-ops for
-    /// capture that never started.
+    /// started. Every early-return failure path after capture setup calls this;
+    /// individual stops are idempotent for capture that never started.
     private func abortStartupCapture() async {
         if let stop = processTapStop {
             stop()
@@ -1076,7 +1129,14 @@ final class AppCoordinator {
     }
 
     func stopListening() async {
-        guard isRunning || transcriber != nil else { return }
+        let hasActivePipeline = isRunning || isStartingUp || transcriber != nil || processTapStop != nil
+        guard hasActivePipeline else {
+            // Context can be edited before Play or after Stop. Quitting while idle
+            // must still drain its debounce instead of dropping the last keystrokes.
+            await flushPendingContextSave()
+            await flushPendingTranscriptLines()
+            return
+        }
         sessionGeneration += 1
         log.info("⏹ stopListening")
         for task in consumerTasks { task.cancel() }
@@ -1126,7 +1186,11 @@ final class AppCoordinator {
     }
 
     func toggleListening() async {
-        if isRunning { await stopListening() } else { await startListening() }
+        if isRunning || isStartingUp {
+            await stopListening()
+        } else {
+            await startListening()
+        }
     }
 
     /// Stop + start on behalf of an automatic recovery path (silent-tap watchdog,
@@ -1215,7 +1279,8 @@ final class AppCoordinator {
             // double the prior-transcript tokens, for zero information gain
             // (the models are already fluent in the target language).
             let transcriptForAI = SessionStore.strippingTranslations(transcript)
-            await context.seedFromMarkdown(transcript: transcriptForAI, chat: chat)
+            let chatForAI = SessionStore.strippingChatMetadata(chat)
+            await context.seedFromMarkdown(transcript: transcriptForAI, chat: chatForAI)
         }
 
         // Apply the session's stored model selection. On resume we honor the
@@ -1273,16 +1338,22 @@ final class AppCoordinator {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
             return
         }
         let displayedText = withScreenshot ? "\(text) 📸" : text
         overlayState.appendUserMessage(displayedText)
-        persistChatTurn(role: "You", text: text + (withScreenshot ? "\n_(screenshot attached)_" : ""))
         let history = chatHistorySnapshot(excludingLast: true)
+        let sessionID = currentSession?.id
 
         Task { [weak self] in
             guard let self else { return }
+            await self.persistChatTurn(
+                role: "You",
+                text: text + (withScreenshot ? "\n_(screenshot attached)_" : ""),
+                origin: .userPrompt,
+                to: sessionID
+            )
             await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             var prompt = PromptBuilder.buildUserQuery(
@@ -1302,7 +1373,7 @@ final class AppCoordinator {
                     wpWarn("Screenshot capture failed; falling back to text-only")
                 }
             }
-            await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .userPrompt, sessionID: sessionID)
         }
     }
 
@@ -1314,7 +1385,7 @@ final class AppCoordinator {
     /// invocation, like the composer.
     func requestHelpAI() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1324,8 +1395,15 @@ final class AppCoordinator {
         overlayState.status = .thinking
         wpInfo("[Coordinator] Help AI requested")
         let history = chatHistorySnapshot(excludingLast: false)
+        let sessionID = currentSession?.id
         Task { [weak self] in
             guard let self else { return }
+            await self.persistChatTurn(
+                role: "You",
+                text: "Scanning recent transcript for a question…",
+                origin: .helpAI,
+                to: sessionID
+            )
             await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             let prompt = PromptBuilder.buildHelpAI(
@@ -1333,7 +1411,7 @@ final class AppCoordinator {
                 history: self.filteredHistory(history),
                 style: self.settings.responseStyle
             )
-            await self.runCompletion(prompt: prompt, ai: ai, origin: .helpAI)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .helpAI, sessionID: sessionID)
         }
     }
 
@@ -1342,7 +1420,7 @@ final class AppCoordinator {
     /// current, then call the model with the dedicated summary prompt.
     func requestSummary() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1352,15 +1430,22 @@ final class AppCoordinator {
         overlayState.status = .thinking
         wpInfo("[Coordinator] Summary requested")
         let history = chatHistorySnapshot(excludingLast: false)
+        let sessionID = currentSession?.id
         Task { [weak self] in
             guard let self else { return }
+            await self.persistChatTurn(
+                role: "You",
+                text: "Summarizing the meeting so far…",
+                origin: .summary,
+                to: sessionID
+            )
             await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             let prompt = PromptBuilder.buildSummary(
                 context: self.filteredSnapshot(snapshot),
                 history: self.filteredHistory(history)
             )
-            await self.runCompletion(prompt: prompt, ai: ai, origin: .summary)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .summary, sessionID: sessionID)
         }
     }
 
@@ -1370,7 +1455,7 @@ final class AppCoordinator {
     /// definitive answer instead of a hedged "maybe…" reply.
     func requestActionItems() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add a Gemini API key in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1380,15 +1465,22 @@ final class AppCoordinator {
         overlayState.status = .thinking
         wpInfo("[Coordinator] Action items requested")
         let history = chatHistorySnapshot(excludingLast: false)
+        let sessionID = currentSession?.id
         Task { [weak self] in
             guard let self else { return }
+            await self.persistChatTurn(
+                role: "You",
+                text: "Extracting action items from the transcript…",
+                origin: .actionItems,
+                to: sessionID
+            )
             await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             let prompt = PromptBuilder.buildActionItems(
                 context: self.filteredSnapshot(snapshot),
                 history: self.filteredHistory(history)
             )
-            await self.runCompletion(prompt: prompt, ai: ai, origin: .actionItems)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .actionItems, sessionID: sessionID)
         }
     }
 
@@ -1411,8 +1503,15 @@ final class AppCoordinator {
         overlayState.status = .thinking
         wpInfo("[Coordinator] Answer-screen requested")
         let history = chatHistorySnapshot(excludingLast: false)
+        let sessionID = currentSession?.id
         Task { [weak self] in
             guard let self else { return }
+            await self.persistChatTurn(
+                role: "You",
+                text: "Reading your screen…",
+                origin: .answerScreen,
+                to: sessionID
+            )
             await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
             var prompt = PromptBuilder.buildAnswerScreen(
@@ -1431,7 +1530,7 @@ final class AppCoordinator {
             }
             prompt.imageJPEGBase64 = imageData.base64EncodedString()
             wpInfo("Answer-screen screenshot captured (\(imageData.count) bytes)")
-            await self.runCompletion(prompt: prompt, ai: ai, origin: .answerScreen)
+            await self.runCompletion(prompt: prompt, ai: ai, origin: .answerScreen, sessionID: sessionID)
         }
     }
 
@@ -1513,11 +1612,20 @@ final class AppCoordinator {
         return data as Data
     }
 
-    private func persistChatTurn(role: String, text: String) {
-        guard let sessionID = currentSession?.id else { return }
-        Task {
-            await SessionStore.shared.appendChatTurn(role: role, text: text, at: Date(), to: sessionID)
-        }
+    private func persistChatTurn(
+        role: String,
+        text: String,
+        origin: ChatMessage.Origin,
+        to sessionID: SessionID?
+    ) async {
+        guard let sessionID else { return }
+        await SessionStore.shared.appendChatTurn(
+            role: role,
+            text: text,
+            origin: origin,
+            at: Date(),
+            to: sessionID
+        )
     }
 
     /// Snapshots the recent assistant↔user chat as `[ChatTurn]` for prompt context. Drops
@@ -2144,7 +2252,7 @@ final class AppCoordinator {
                     continue
                 }
                 guard let liveAI = self.aiProvider else {
-                    wpInfo("[Coordinator] trigger fired but no Gemini key — skipping")
+                    wpInfo("[Coordinator] trigger fired but no API key for active model — skipping")
                     continue
                 }
                 self.log.info("→ Trigger fired, building prompt")
@@ -2152,7 +2260,14 @@ final class AppCoordinator {
                 // the user can see *what* the detector picked up — without this, a fired
                 // trigger only shows up as an unlabeled assistant reply, and a failed call
                 // shows up as nothing at all.
+                let sessionID = self.currentSession?.id
                 self.overlayState.appendAutoTriggerPreamble(origin: .detectedQuestion, text: trigger.text)
+                await self.persistChatTurn(
+                    role: "You",
+                    text: trigger.text,
+                    origin: .detectedQuestion,
+                    to: sessionID
+                )
                 self.overlayState.status = .thinking
                 await self.absorbPendingTranscripts()
             let snapshot = await self.context.snapshotWithPrior()
@@ -2164,7 +2279,12 @@ final class AppCoordinator {
                     question: trigger.text,
                     style: style
                 )
-                await self.runCompletion(prompt: prompt, ai: liveAI, origin: .detectedQuestion)
+                await self.runCompletion(
+                    prompt: prompt,
+                    ai: liveAI,
+                    origin: .detectedQuestion,
+                    sessionID: sessionID
+                )
             }
         })
     }
@@ -2232,7 +2352,13 @@ final class AppCoordinator {
         }
     }
 
-    private func runCompletion(prompt: Prompt, ai: AIProvider, origin: ChatMessage.Origin, hasAttemptedFallback: Bool = false) async {
+    private func runCompletion(
+        prompt: Prompt,
+        ai: AIProvider,
+        origin: ChatMessage.Origin,
+        sessionID: SessionID?,
+        hasAttemptedFallback: Bool = false
+    ) async {
         // Reserve the assistant bubble + register the task BEFORE starting the stream
         // so concurrent completions each have their own slot in `inFlightCompletions`
         // and their own message ID. Multiple completions can stream in parallel —
@@ -2270,7 +2396,12 @@ final class AppCoordinator {
                 }
                 if let finalText = self.overlayState.messages.first(where: { $0.id == messageId })?.text,
                    !finalText.isEmpty {
-                    self.persistChatTurn(role: "Assistant", text: finalText)
+                    await self.persistChatTurn(
+                        role: "Assistant",
+                        text: finalText,
+                        origin: origin,
+                        to: sessionID
+                    )
                 }
             } catch is CancellationError {
                 self.overlayState.finishAssistant(id: messageId)
@@ -2291,7 +2422,13 @@ final class AppCoordinator {
                     // the outer cleanup-on-exit below to fire twice for one logical
                     // request.
                     self.inFlightCompletions[messageId] = nil
-                    await self.runCompletion(prompt: prompt, ai: newAI, origin: origin, hasAttemptedFallback: true)
+                    await self.runCompletion(
+                        prompt: prompt,
+                        ai: newAI,
+                        origin: origin,
+                        sessionID: sessionID,
+                        hasAttemptedFallback: true
+                    )
                     return
                 }
                 let message = error.localizedDescription

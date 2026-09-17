@@ -233,9 +233,9 @@ struct OverlayView: View {
 
             Button(action: actions.toggleListening) {
                 if state.status == .starting {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.75)
+                    Image(systemName: "stop.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(Color.red)
                         .frame(width: 22, height: 22)
                 } else {
                     Image(systemName: state.status.isActive ? "stop.circle.fill" : "play.circle.fill")
@@ -245,7 +245,6 @@ struct OverlayView: View {
                 }
             }
             .buttonStyle(.plain)
-            .disabled(state.status == .starting)
             .help(playButtonHelp)
 
             ChannelMuteButton(
@@ -337,7 +336,7 @@ struct OverlayView: View {
 
     private var playButtonHelp: String {
         switch state.status {
-        case .starting: return "Starting…"
+        case .starting: return "Cancel startup"
         case .listening, .thinking, .streaming: return "Stop listening"
         default: return "Start listening"
         }
@@ -495,9 +494,10 @@ struct OverlayView: View {
     @ViewBuilder
     private var bodyPanes: some View {
         if !settings.overlayShowTranscript {
-            // Transcript pane hidden by the layout setting — the AI conversation
-            // owns the whole body. Used by Interview / Compact modes.
-            chatPane
+            // Interview / Compact have one job: keep the live answer readable.
+            // With no second pane, collapsing AI only creates dead space, so the
+            // sole pane stays expanded and drops the redundant Hide control.
+            chatPane(allowsCollapse: false)
                 .frame(maxHeight: .infinity)
         } else {
             splitPanes
@@ -513,7 +513,7 @@ struct OverlayView: View {
                 let fraction = clampFraction(chatFraction, available: available)
                 let chatHeight = available * fraction
                 VStack(spacing: 0) {
-                    chatPane
+                    chatPane()
                         .frame(height: chatHeight)
                     splitDivider(available: available, draggable: true)
                     transcriptPane
@@ -522,21 +522,21 @@ struct OverlayView: View {
             }
         case (true, false):
             VStack(spacing: 0) {
-                chatPane
+                chatPane()
                 splitDivider(available: 0, draggable: false)
                 transcriptPane
                     .frame(maxHeight: .infinity)
             }
         case (false, true):
             VStack(spacing: 0) {
-                chatPane
+                chatPane()
                     .frame(maxHeight: .infinity)
                 splitDivider(available: 0, draggable: false)
                 transcriptPane
             }
         case (true, true):
             VStack(spacing: 0) {
-                chatPane
+                chatPane()
                 splitDivider(available: 0, draggable: false)
                 transcriptPane
                 Spacer(minLength: 0)
@@ -567,8 +567,10 @@ struct OverlayView: View {
     /// header — no ScrollView, so a single-row pane doesn't show empty space
     /// with scroll indicators.
     @ViewBuilder
-    private var chatPane: some View {
-        if chatCollapsed {
+    private func chatPane(allowsCollapse: Bool = true) -> some View {
+        let isCollapsed = allowsCollapse && chatCollapsed
+        let collapseAction: (() -> Void)? = allowsCollapse ? { chatCollapsed.toggle() } : nil
+        if isCollapsed {
             ChatLane(
                 messages: aiMessages,
                 isAIPaused: state.isAIPaused,
@@ -580,7 +582,7 @@ struct OverlayView: View {
                 availableVendors: settings.availableVendors,
                 onSelectModel: actions.selectModel,
                 isCollapsed: true,
-                onToggleCollapse: { chatCollapsed.toggle() }
+                onToggleCollapse: collapseAction
             )
             .padding(compact ? WP.Space.sm : WP.Space.md)
         } else {
@@ -597,7 +599,7 @@ struct OverlayView: View {
                     onSelectModel: actions.selectModel,
                     isCollapsed: false,
                     showContent: false,
-                    onToggleCollapse: { chatCollapsed.toggle() }
+                    onToggleCollapse: collapseAction
                 )
                 .padding(compact ? WP.Space.sm : WP.Space.md)
                 .background(Color(NSColor.windowBackgroundColor))
@@ -858,7 +860,7 @@ struct OverlayView: View {
     private var composer: some View {
         VStack(alignment: .leading, spacing: compact ? WP.Space.xs : WP.Space.sm) {
             HStack(alignment: .bottom, spacing: WP.Space.sm) {
-                TextField("Ask the AI — uses live transcript and chat history as context", text: $state.composerText, axis: .vertical)
+                TextField(compact ? "Ask AI…" : "Ask the AI — uses live transcript and chat history as context", text: $state.composerText, axis: .vertical)
                     .lineLimit(1...(compact ? 2 : 4))
                     .textFieldStyle(.plain)
                     .font(WP.TextStyle.body)
@@ -891,9 +893,11 @@ struct OverlayView: View {
                     HStack(spacing: WP.Space.xs) {
                         Image(systemName: includeScreenshot ? "eye.fill" : "eye")
                             .font(.system(size: 10))
-                        Text("See my screen")
-                            .font(WP.TextStyle.micro)
-                        if includeScreenshot {
+                        if !compact {
+                            Text("See my screen")
+                                .font(WP.TextStyle.micro)
+                        }
+                        if includeScreenshot && !compact {
                             Text("· attached")
                                 .font(WP.TextStyle.tag)
                         }
@@ -981,7 +985,9 @@ struct OverlayView: View {
                 // Unobtrusive contribute link in the composer row. Compact form
                 // because the row already holds two pill-buttons and an arrow
                 // submit — adding a full label here would crowd the layout.
-                SupportLink(style: .compact)
+                if !compact {
+                    SupportLink(style: .compact)
+                }
             }
         }
         .padding(.horizontal, WP.Space.md)
@@ -1006,7 +1012,7 @@ struct OverlayView: View {
         switch state.status {
         case .needsAPIKey:
             return BannerSpec(
-                message: "Add your Gemini API key in Settings to start receiving suggestions.",
+                message: "Add an API key for the selected model in Settings to start receiving suggestions.",
                 button: BannerButton(title: "Open Settings", action: actions.openSettings)
             )
         case .needsPermission(.microphone):
@@ -1169,6 +1175,8 @@ private struct ChatLane: View {
     /// When false, suppresses message content so only the header row renders.
     var showContent: Bool = true
     var onToggleCollapse: (() -> Void)? = nil
+    @Environment(\.overlayCompact) private var overlayCompact
+    @State private var showSessionOptions = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: WP.Space.sm) {
@@ -1187,13 +1195,54 @@ private struct ChatLane: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { onToggleCollapse?() }
-                    ModelSelector(
-                        activeModel: activeModel,
-                        availableVendors: availableVendors,
-                        onSelect: onSelectModel
-                    )
+                    if !overlayCompact {
+                        ModelSelector(
+                            activeModel: activeModel,
+                            availableVendors: availableVendors,
+                            onSelect: onSelectModel
+                        )
+                    }
                     Spacer()
-                    AIToggleButton(isPaused: isAIPaused, action: onToggleAI)
+                    AIToggleButton(isPaused: isAIPaused, compact: overlayCompact, action: onToggleAI)
+                    if overlayCompact {
+                        Button {
+                            showSessionOptions.toggle()
+                        } label: {
+                            ZStack(alignment: .topTrailing) {
+                                Image(systemName: "slider.horizontal.3")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 24, height: 22)
+                                if !sessionContext.isEmpty {
+                                    Circle()
+                                        .fill(Color.accentColor)
+                                        .frame(width: 6, height: 6)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Session options")
+                        .popover(isPresented: $showSessionOptions, arrowEdge: .top) {
+                            VStack(alignment: .leading, spacing: WP.Space.md) {
+                                Text("Session options")
+                                    .font(.headline)
+                                HStack {
+                                    Text("AI model")
+                                        .font(WP.TextStyle.bodyEmphasized)
+                                    Spacer()
+                                    ModelSelector(
+                                        activeModel: activeModel,
+                                        availableVendors: availableVendors,
+                                        onSelect: onSelectModel
+                                    )
+                                }
+                                ContextDropdown(context: $sessionContext, title: "Session context")
+                            }
+                            .padding(WP.Space.lg)
+                            .frame(width: 340)
+                        }
+                    }
                     if let onToggleCollapse {
                         CollapseToggle(isCollapsed: isCollapsed, action: onToggleCollapse)
                             .help(isCollapsed ? "Show AI conversation" : "Hide AI conversation")
@@ -1202,7 +1251,9 @@ private struct ChatLane: View {
             }
 
             if !isCollapsed && showContent {
-                ContextDropdown(context: $sessionContext)
+                if !overlayCompact {
+                    ContextDropdown(context: $sessionContext)
+                }
 
                 if messages.isEmpty {
                     EmptyStatePill(
@@ -1345,6 +1396,7 @@ private struct ModelSelector: View {
 
 private struct AIToggleButton: View {
     let isPaused: Bool
+    var compact: Bool = false
     let action: () -> Void
 
     var body: some View {
@@ -1352,10 +1404,16 @@ private struct AIToggleButton: View {
             HStack(spacing: WP.Space.xs + 1) {
                 Image(systemName: isPaused ? "pause.fill" : "play.fill")
                     .font(.system(size: 9, weight: .bold))
-                Text(isPaused ? "Paused" : "Active")
-                    .font(WP.TextStyle.tag)
+                if !compact {
+                    Text(isPaused ? "Paused" : "Active")
+                        .font(WP.TextStyle.tag)
+                }
             }
-            .chip(isPaused ? .warning : .success)
+            .chip(
+                isPaused ? .warning : .success,
+                horizontalPadding: compact ? 6 : 7,
+                verticalPadding: compact ? 4 : 3
+            )
         }
         .buttonStyle(.plain)
         .help(isPaused
