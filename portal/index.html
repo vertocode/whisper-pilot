@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Whisper Pilot is a local-first AI copilot for live conversations on your Mac."
+    />
+    <meta name="theme-color" content="#f5f7fb" />
+    <title>Whisper Pilot — Hear it. Ask it. Stay present.</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body data-page="home">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Whisper Pilot home">
+        <img
+          class="brand-logo"
+          src="https://raw.githubusercontent.com/vertocode/whisper-pilot/main/Resources/Branding/whisper-logo-nobg.png"
+          alt=""
+        />
+        <span>Whisper Pilot</span>
+      </a>
+      <nav aria-label="Main navigation">
+        <a href="/versions/">Versions</a>
+        <a href="https://github.com/vertocode/whisper-pilot" target="_blank" rel="noreferrer">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="status"><span></span> Built for macOS</p>
+          <h1>Hear it.<br />Ask it.<br />Stay present.</h1>
+          <p class="lede">
+            Local transcription and live AI answers in one quiet overlay. No meeting bot, no account,
+            no audio uploads.
+          </p>
+          <div class="hero-actions">
+            <a
+              class="button button-primary"
+              data-latest-download
+              href="https://github.com/vertocode/whisper-pilot/releases/latest"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14" />
+              </svg>
+              <span>Download latest DMG</span>
+            </a>
+            <a class="button button-quiet" href="/versions/">See all versions</a>
+          </div>
+          <p class="release-meta" data-latest-meta aria-live="polite">Loading latest release…</p>
+        </div>
+
+        <div class="signal-stage" aria-label="Whisper Pilot live transcription preview">
+          <div class="signal-toolbar">
+            <span class="listening-dot"></span>
+            <span>Listening locally</span>
+            <span class="signal-time">00:42</span>
+          </div>
+          <div class="waveform" aria-hidden="true">
+            <i style="--h: 22%; --d: 0"></i><i style="--h: 42%; --d: 1"></i>
+            <i style="--h: 72%; --d: 2"></i><i style="--h: 38%; --d: 3"></i>
+            <i style="--h: 88%; --d: 4"></i><i style="--h: 58%; --d: 5"></i>
+            <i style="--h: 32%; --d: 6"></i><i style="--h: 76%; --d: 7"></i>
+            <i style="--h: 48%; --d: 8"></i><i style="--h: 92%; --d: 9"></i>
+            <i style="--h: 62%; --d: 10"></i><i style="--h: 28%; --d: 11"></i>
+            <i style="--h: 54%; --d: 12"></i><i style="--h: 80%; --d: 13"></i>
+            <i style="--h: 36%; --d: 14"></i><i style="--h: 64%; --d: 15"></i>
+            <i style="--h: 44%; --d: 16"></i><i style="--h: 24%; --d: 17"></i>
+          </div>
+          <div class="transcript">
+            <p>“Can we ship this without sending meeting audio to a server?”</p>
+            <div class="answer">
+              <span aria-hidden="true">✦</span>
+              <p>Yes. Whisper Pilot transcribes on-device. Only questions you send reach your chosen AI provider.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="facts" aria-label="Product facts">
+        <p><strong>On-device</strong><span>Audio transcription</span></p>
+        <p><strong>Bring your own key</strong><span>No subscription</span></p>
+        <p><strong>macOS 14+</strong><span>Apple Silicon recommended</span></p>
+      </section>
+
+      <section class="demo-section">
+        <div class="demo-copy">
+          <h2>See it stay out of your way.</h2>
+          <p>Watch Whisper Pilot follow a live conversation, transcribe locally, and surface an answer without breaking focus.</p>
+          <span class="demo-hint">Press play to watch here.</span>
+        </div>
+        <div class="demo-video">
+          <iframe
+            src="https://www.youtube-nocookie.com/embed/uyq04wOmE9w"
+            title="Whisper Pilot demo"
+            loading="lazy"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            referrerpolicy="strict-origin-when-cross-origin"
+            allowfullscreen
+          ></iframe>
+        </div>
+      </section>
+
+      <section class="install-section">
+        <div>
+          <h2>From download to listening in minutes.</h2>
+          <p>Whisper Pilot is currently in alpha. Releases are unsigned, so macOS needs one manual approval on first launch.</p>
+        </div>
+        <ol class="install-steps">
+          <li><span>1</span><div><strong>Download</strong><p>Open the DMG and drag Whisper Pilot into Applications.</p></div></li>
+          <li><span>2</span><div><strong>Allow</strong><p>Approve the app once in Privacy &amp; Security.</p></div></li>
+          <li><span>3</span><div><strong>Listen</strong><p>Add your AI API key, then start a session.</p></div></li>
+        </ol>
+      </section>
+    </main>
+
+    <footer>
+      <p>Open source. MIT licensed.</p>
+      <a href="https://github.com/vertocode/whisper-pilot/issues" target="_blank" rel="noreferrer">Report an issue</a>
+    </footer>
+  </body>
+</html>

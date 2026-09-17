@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Download current and previous Whisper Pilot releases for macOS." />
+    <meta name="theme-color" content="#f5f7fb" />
+    <title>Versions — Whisper Pilot</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body data-page="versions">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Whisper Pilot home">
+        <img
+          class="brand-logo"
+          src="https://raw.githubusercontent.com/vertocode/whisper-pilot/main/Resources/Branding/whisper-logo-nobg.png"
+          alt=""
+        />
+        <span>Whisper Pilot</span>
+      </a>
+      <nav aria-label="Main navigation">
+        <a aria-current="page" href="/versions/">Versions</a>
+        <a href="https://github.com/vertocode/whisper-pilot" target="_blank" rel="noreferrer">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main" class="versions-main">
+      <header class="versions-heading">
+        <a class="back-link" href="/">← Back home</a>
+        <h1>Every version,<br />ready to download.</h1>
+        <p>Choose latest build or return to release you know. Each download comes directly from GitHub Releases.</p>
+      </header>
+
+      <section class="release-ledger" aria-labelledby="release-list-title">
+        <div class="ledger-heading">
+          <h2 id="release-list-title">macOS releases</h2>
+          <span data-release-count></span>
+        </div>
+        <div class="release-list" data-release-list aria-live="polite" aria-busy="true">
+          <div class="loading-row"><span></span>Loading releases…</div>
+        </div>
+        <div class="release-error" data-release-error hidden>
+          <p>Release list could not load.</p>
+          <a href="https://github.com/vertocode/whisper-pilot/releases">Open releases on GitHub</a>
+        </div>
+      </section>
+
+      <aside class="gatekeeper-note">
+        <strong>First launch</strong>
+        <p>Current builds are unsigned. After opening app, go to System Settings → Privacy &amp; Security → Open Anyway.</p>
+        <a href="https://github.com/vertocode/whisper-pilot#allow-the-app-through-gatekeeper" target="_blank" rel="noreferrer">Full install guide</a>
+      </aside>
+    </main>
+
+    <footer>
+      <p>Open source. MIT licensed.</p>
+      <a href="https://github.com/vertocode/whisper-pilot/issues" target="_blank" rel="noreferrer">Report an issue</a>
+    </footer>
+  </body>
+</html>
