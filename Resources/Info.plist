@@ -29,6 +29,8 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
 	</dict>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Whisper Pilot hears the audio playing on your Mac (Zoom, Meet, Teams, a browser) so it can transcribe the other side of your conversations. Audio only. Nothing is saved except the text transcript.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Whisper Pilot is open source under the MIT license.</string>
 	<key>NSMicrophoneUsageDescription</key>

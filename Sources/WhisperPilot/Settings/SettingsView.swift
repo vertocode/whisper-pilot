@@ -6,6 +6,8 @@ struct SettingsView: View {
     /// session can react without a restart. Defaulted so previews and any
     /// non-app construction site stay simple.
     var onTranslationConfigurationChanged: () -> Void = {}
+    /// Reopens onboarding, the only place permissions are requested.
+    var onOpenSetup: () -> Void = {}
     @State private var geminiAPIKeyDraft: String = ""
     @State private var geminiAPIKeySaved: Bool = false
     @State private var anthropicAPIKeyDraft: String = ""
@@ -38,13 +40,21 @@ struct SettingsView: View {
         .frame(minWidth: 900, idealWidth: 960, minHeight: 480, idealHeight: 520)
         .padding(WP.Space.md)
         .onAppear {
-            geminiAPIKeyDraft = store.geminiAPIKey ?? ""
-            geminiAPIKeySaved = !geminiAPIKeyDraft.isEmpty
-            anthropicAPIKeyDraft = store.anthropicAPIKey ?? ""
-            anthropicAPIKeySaved = !anthropicAPIKeyDraft.isEmpty
+            loadKeyDrafts()
             inputDevices = MicrophoneCapture.listInputDevices()
             screens = ScreenEnumerator.connectedScreens()
         }
+        .onChange(of: store.keychainAccess) { _, _ in loadKeyDrafts() }
+    }
+
+    /// Reads the in-memory copy only. Opening Settings must never make macOS
+    /// ask about the Keychain, so a locked key shows as "saved" with an empty
+    /// field until the user presses "Allow Keychain access".
+    private func loadKeyDrafts() {
+        geminiAPIKeyDraft = store.geminiAPIKey ?? ""
+        geminiAPIKeySaved = store.hasGeminiAPIKey
+        anthropicAPIKeyDraft = store.anthropicAPIKey ?? ""
+        anthropicAPIKeySaved = store.hasAnthropicAPIKey
     }
 
     // MARK: - Header
@@ -218,6 +228,7 @@ struct SettingsView: View {
                     draft: $geminiAPIKeyDraft,
                     saved: $geminiAPIKeySaved,
                     vendorDocsURL: "https://aistudio.google.com/app/apikey",
+                    isSaved: { store.hasGeminiAPIKey },
                     onSave: { store.geminiAPIKey = geminiAPIKeyDraft },
                     onRemove: { store.geminiAPIKey = nil }
                 )
@@ -229,6 +240,7 @@ struct SettingsView: View {
                     draft: $anthropicAPIKeyDraft,
                     saved: $anthropicAPIKeySaved,
                     vendorDocsURL: "https://console.anthropic.com/settings/keys",
+                    isSaved: { store.hasAnthropicAPIKey },
                     onSave: { store.anthropicAPIKey = anthropicAPIKeyDraft },
                     onRemove: { store.anthropicAPIKey = nil }
                 )
@@ -236,6 +248,20 @@ struct SettingsView: View {
             }
 
             Section {
+                if store.keychainAccess == .needsUnlock || store.keychainAccess == .denied {
+                    VStack(alignment: .leading, spacing: WP.Space.xs) {
+                        HStack(alignment: .top, spacing: WP.Space.xs) {
+                            Image(systemName: "key.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                            Text("Your API key is saved in the macOS Keychain. Whisper Pilot reads it to send your requests to the AI provider, and macOS needs your OK first. Choose Always Allow.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Button("Allow Keychain access") { Task { await store.unlockStoredKeys() } }
+                    }
+                }
                 if let keychainError = store.keychainErrorMessage {
                     HStack(alignment: .top, spacing: WP.Space.xs) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -305,15 +331,18 @@ struct SettingsView: View {
         draft: Binding<String>,
         saved: Binding<Bool>,
         vendorDocsURL: String,
+        isSaved: @escaping () -> Bool,
         onSave: @escaping () -> Void,
         onRemove: @escaping () -> Void
     ) -> some View {
-        SecureField("API key", text: draft)
+        SecureField(saved.wrappedValue && draft.wrappedValue.isEmpty ? "Saved in Keychain. Type to replace it." : "API key", text: draft)
             .textFieldStyle(.roundedBorder)
         HStack(spacing: WP.Space.sm) {
             Button(saved.wrappedValue ? "Update key" : "Save key") {
                 onSave()
-                saved.wrappedValue = !draft.wrappedValue.isEmpty
+                // Trust the store, not the button press: a refused or failed
+                // Keychain write must not look like a saved key.
+                saved.wrappedValue = isSaved()
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
@@ -322,8 +351,8 @@ struct SettingsView: View {
             if saved.wrappedValue {
                 Button("Remove") {
                     onRemove()
-                    draft.wrappedValue = ""
-                    saved.wrappedValue = false
+                    saved.wrappedValue = isSaved()
+                    if !saved.wrappedValue { draft.wrappedValue = "" }
                 }
             }
 
@@ -344,6 +373,10 @@ struct SettingsView: View {
 
     private var captureTab: some View {
         Form {
+            Section("Permissions") {
+                Button("Permissions & setup…", action: onOpenSetup)
+                FormHint("Microphone, Speech Recognition, system audio, Screen Recording and Keychain access are all requested in one place, with the reason for each. Open it to check or fix any of them.")
+            }
             Section {
                 Toggle("Capture microphone", isOn: $store.captureMicrophone)
                 FormHint("System audio (everything macOS plays — Teams, Meet, Slack, browser) is always captured. Microphone is optional and lets the assistant attribute who said what.")

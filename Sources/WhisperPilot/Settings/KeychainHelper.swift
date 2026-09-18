@@ -4,15 +4,60 @@ import Security
 enum KeychainHelper {
     static let service = "com.whisperpilot.app"
 
-    /// Stores (or deletes, when nil/empty) the value. Returns false when the
-    /// Keychain rejected the write — callers must surface that, because a
-    /// silently dropped API key looks like "AI just doesn't work" to the user.
-    @discardableResult
-    static func set(_ value: String?, forKey key: String) -> Bool {
+    /// Outcome of a Keychain read. `denied` is kept apart from `failed` because
+    /// the user can fix it (they clicked "Deny", or macOS needs their approval)
+    /// while a generic failure usually points at a locked or damaged keychain.
+    enum ReadResult: Equatable {
+        case value(String)
+        case notFound
+        case denied
+        case failed(OSStatus)
+    }
+
+    /// Stores (or deletes, when nil/empty) the value. Returns `errSecSuccess`
+    /// on success; anything else is the Keychain's reason for rejecting the
+    /// write — callers must surface that, because a silently dropped API key
+    /// looks like "AI just doesn't work" to the user.
+    static func set(_ value: String?, forKey key: String) -> OSStatus {
         if let value, !value.isEmpty {
             return store(value, forKey: key)
         } else {
             return delete(forKey: key)
+        }
+    }
+
+    /// Identity of the running binary (its code-signature hash). An ad-hoc
+    /// signed build gets a new hash on every update, and macOS ties Keychain
+    /// approval to that hash — so "did the user already approve *this* build"
+    /// is exactly "does the stored hash equal this one". "unknown" never
+    /// matches anything, so an unsigned or unreadable binary always re-asks.
+    static let buildIdentity: String = {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return unknownBuildIdentity }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return unknownBuildIdentity }
+        var info: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(staticCode, flags, &info) == errSecSuccess,
+              let dict = info as? [String: Any],
+              let hash = dict[kSecCodeInfoUnique as String] as? Data else { return unknownBuildIdentity }
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }()
+
+    static let unknownBuildIdentity = "unknown"
+
+    /// Plain-English reason for a Keychain failure, for messages shown to the user.
+    static func describe(_ status: OSStatus) -> String {
+        switch status {
+        case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
+            return "macOS did not allow access to the Keychain item"
+        case errSecNoSuchKeychain, errSecNotAvailable:
+            return "the login Keychain is not available (is it locked?)"
+        case errSecReadOnly, errSecReadOnlyAttr:
+            return "the Keychain is read-only"
+        default:
+            let text = SecCopyErrorMessageString(status, nil) as String? ?? "unknown error"
+            return "\(text) (code \(status))"
         }
     }
 
@@ -43,7 +88,11 @@ enum KeychainHelper {
         return status == errSecSuccess
     }
 
-    static func get(_ key: String) -> String? {
+    /// Reads the secret itself. This is the call that can make macOS show its
+    /// "wants to use your confidential information" dialog, so it must only run
+    /// at a moment the user can see and understand (onboarding or an explicit
+    /// "Allow Keychain access" button) — never from a screen that merely opens.
+    static func read(_ key: String) -> ReadResult {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -53,20 +102,29 @@ enum KeychainHelper {
         ]
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status != errSecSuccess && status != errSecItemNotFound {
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data, let string = String(data: data, encoding: .utf8) else {
+                wpError("Keychain read for \(key) returned data that is not UTF-8")
+                return .failed(errSecDecode)
+            }
+            return .value(string)
+        case errSecItemNotFound:
+            return .notFound
+        case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
+            wpWarn("Keychain read for \(key) was denied: OSStatus \(status)")
+            return .denied
+        default:
             wpError("Keychain read for \(key) failed: OSStatus \(status)")
+            return .failed(status)
         }
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let string = String(data: data, encoding: .utf8) else { return nil }
-        return string
     }
 
     /// Update-first, add-on-missing. The old delete-then-add pattern was
     /// non-atomic (a crash in between lost the key) and ignored both statuses,
     /// so a failed save was indistinguishable from a successful one.
-    private static func store(_ value: String, forKey key: String) -> Bool {
-        guard let data = value.data(using: .utf8) else { return false }
+    private static func store(_ value: String, forKey key: String) -> OSStatus {
+        guard let data = value.data(using: .utf8) else { return errSecParam }
         let baseQuery: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -83,24 +141,23 @@ enum KeychainHelper {
             attributes[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlock
             status = SecItemAdd(attributes as CFDictionary, nil)
         }
-        guard status == errSecSuccess else {
+        if status != errSecSuccess {
             wpError("Keychain save for \(key) failed: OSStatus \(status)")
-            return false
         }
-        return true
+        return status
     }
 
-    private static func delete(forKey key: String) -> Bool {
+    private static func delete(forKey key: String) -> OSStatus {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: key
         ]
         let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
+        if status == errSecItemNotFound { return errSecSuccess }
+        if status != errSecSuccess {
             wpError("Keychain delete for \(key) failed: OSStatus \(status)")
-            return false
         }
-        return true
+        return status
     }
 }

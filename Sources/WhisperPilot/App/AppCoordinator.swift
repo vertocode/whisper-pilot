@@ -155,6 +155,7 @@ final class AppCoordinator {
     /// resumes within the debounce window.
     private var pendingBoundaryTasks: [AudioChannel: Task<Void, Never>] = [:]
     private var settingsObserver: AnyCancellable?
+    private var permissionsObserver: AnyCancellable?
     private var pausedObserver: AnyCancellable?
     /// Per-channel mute flags mirrored off the main actor. The mixer-output
     /// consumer is a detached task that checks mute state once per audio frame;
@@ -202,6 +203,9 @@ final class AppCoordinator {
     /// while audio capture is mid-setup, which would leave duplicate captures running.
     private var isStartingUp = false
     private(set) var currentSession: SessionMeta?
+    /// Reopens onboarding. Set by `AppDelegate`; the coordinator calls it when
+    /// something needs a permission, instead of asking macOS itself.
+    var requestSetup: (() -> Void)?
 
     init() {
         // Wire up the AI provider eagerly if the active model's vendor has a
@@ -214,6 +218,15 @@ final class AppCoordinator {
 
         settingsObserver = settings.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in self?.refreshDerivedState() }
+        }
+
+        // Onboarding can grant a permission while a "needs permission" banner is
+        // up; follow the permission state so the banner clears on its own.
+        permissionsObserver = permissions.$snapshot.dropFirst().sink { [weak self] snapshot in
+            DispatchQueue.main.async { [weak self] in
+                self?.overlayState.permissionStatus = snapshot
+                self?.refreshDerivedState()
+            }
         }
 
         pausedObserver = overlayState.$isAIPaused
@@ -362,8 +375,9 @@ final class AppCoordinator {
             switch overlayState.status {
             case .needsAPIKey:
                 if provider != nil { overlayState.status = .idle }
-            case .needsPermission(.microphone):
-                if !settings.captureMicrophone || permissions.snapshot.microphone == .granted {
+            case .needsPermission(let kind):
+                let granted = permissions.status(of: kind) == .granted
+                if granted || (kind == .microphone && !settings.captureMicrophone) {
                     overlayState.status = .idle
                 }
             default:
@@ -413,6 +427,26 @@ final class AppCoordinator {
         }
         overlayState.permissionStatus = permissions.snapshot
 
+        // Every macOS permission is requested once, in onboarding. Pressing Play
+        // must never open a system dialog, so a missing permission stops here and
+        // points the user at Setup instead.
+        if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
+            wpWarn("[Coordinator] microphone not allowed — stopping before capture starts")
+            await blockStartup(
+                for: .microphone,
+                note: "⚠️ Microphone access isn't allowed. Open Setup to allow it, or turn off microphone capture in Settings → Capture."
+            )
+            return
+        }
+        if !usesParakeetEngine, permissions.snapshot.speechRecognition != .granted {
+            wpWarn("[Coordinator] speech recognition not allowed for a non-English locale — stopping before capture starts")
+            await blockStartup(
+                for: .speechRecognition,
+                note: "⚠️ Speech Recognition isn't allowed, and it is needed to transcribe \(settings.localeIdentifier). Open Setup to allow it."
+            )
+            return
+        }
+
         // Surface what audio devices the OS is presenting before we start capture, so the
         // user can immediately see in Diagnostics whether they're using the device they
         // expected (built-in vs USB vs Bluetooth vs aggregate vs virtual).
@@ -456,8 +490,18 @@ final class AppCoordinator {
         }
 
         if processTapFrames == nil {
-            // SCK fallback path — needs Screen Recording permission.
+            // SCK fallback path — needs Screen Recording permission. If onboarding
+            // never asked for it, probing would raise a brand-new system dialog
+            // during Play, so send the user to Setup instead.
             let priorScreenRecording = permissions.snapshot.screenRecording
+            if priorScreenRecording != .granted, !permissions.hasAskedForScreenRecording {
+                wpWarn("[Coordinator] Screen Recording needed for the ScreenCaptureKit path but never requested — stopping")
+                await blockStartup(
+                    for: .screenRecording,
+                    note: "⚠️ Hearing system audio on this Mac needs Screen Recording (audio only, no video is saved). Open Setup to allow it."
+                )
+                return
+            }
             do {
                 _ = try await SCShareableContent.current
                 guard startupGeneration == sessionGeneration else {
@@ -476,31 +520,8 @@ final class AppCoordinator {
                     return
                 }
                 wpError("Screen Recording probe failed: \(error.localizedDescription)")
-                overlayState.appendSystemNote("⚠️ Screen Recording permission not granted — opening System Settings.", category: .general)
+                overlayState.appendSystemNote("⚠️ Screen Recording isn't allowed. Turn on Whisper Pilot in System Settings → Privacy & Security → Screen & System Audio Recording. macOS may ask you to quit and reopen Whisper Pilot afterwards.", category: .general)
                 overlayState.status = .needsPermission(.screenRecording)
-                await permissions.requestScreenRecording()
-                guard startupGeneration == sessionGeneration else {
-                    await abortStartupCapture()
-                    return
-                }
-                await abortStartupCapture()
-                return
-            }
-        }
-
-        if settings.captureMicrophone, permissions.snapshot.microphone != .granted {
-            wpInfo("[Coordinator] microphone requested, not authorized — prompting")
-            await permissions.requestMicrophone()
-            guard startupGeneration == sessionGeneration else {
-                await abortStartupCapture()
-                return
-            }
-            if permissions.snapshot.microphone == .granted {
-                wpInfo("Microphone permission granted; continuing pipeline")
-                // fall through to start the pipeline so the user doesn't have to click Play again
-            } else {
-                overlayState.appendSystemNote("⚠️ Microphone permission was not granted. Either disable microphone capture in Settings or grant access via System Settings → Privacy & Security → Microphone.", category: .general)
-                overlayState.status = .needsPermission(.microphone)
                 await abortStartupCapture()
                 return
             }
@@ -545,8 +566,11 @@ final class AppCoordinator {
             // (or returning to the same session via the back button) would stack a
             // second identical note on top of the first.
             wpInfo("[Coordinator] no API key for active model — transcription-only mode")
+            let keyLocked = settings.keychainAccess == .needsUnlock || settings.keychainAccess == .denied
             transcriptionOnlyNoteID = overlayState.appendSystemNote(
-                "ℹ️ Transcription is running. Add an API key for the selected model in Settings to enable AI suggestions.",
+                keyLocked
+                    ? "ℹ️ Transcription is running. Your API key is saved, but macOS hasn't let Whisper Pilot open it. Go to Settings → AI Provider and press “Allow Keychain access” to enable AI suggestions."
+                    : "ℹ️ Transcription is running. Add an API key for the selected model in Settings to enable AI suggestions.",
                 category: .general
             )
         }
@@ -1338,7 +1362,7 @@ final class AppCoordinator {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
             return
         }
         let displayedText = withScreenshot ? "\(text) 📸" : text
@@ -1385,7 +1409,7 @@ final class AppCoordinator {
     /// invocation, like the composer.
     func requestHelpAI() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1420,7 +1444,7 @@ final class AppCoordinator {
     /// current, then call the model with the dedicated summary prompt.
     func requestSummary() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1455,7 +1479,7 @@ final class AppCoordinator {
     /// definitive answer instead of a hedged "maybe…" reply.
     func requestActionItems() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add an API key for the selected model in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1493,7 +1517,7 @@ final class AppCoordinator {
     /// Recording permission (same as the composer's "See my screen").
     func answerScreen() {
         guard let ai = aiProvider else {
-            overlayState.appendSystemNote("⚠️ Add an API key in Settings to use the AI.", category: .ai)
+            overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
             return
         }
         overlayState.appendAutoTriggerPreamble(
@@ -1547,6 +1571,14 @@ final class AppCoordinator {
     /// we don't ship 4K frames to the model, and JPEG-encodes at quality 0.7. Returns nil
     /// if Screen Recording permission isn't granted or no display is shareable.
     private func captureScreenJPEG(maxWidth: Int = 1280, quality: CGFloat = 0.7) async -> Data? {
+        // Screen Recording is requested in onboarding. If it never was, capturing
+        // here would raise a surprise system dialog, so send the user to Setup.
+        await permissions.refresh()
+        if permissions.snapshot.screenRecording != .granted, !permissions.hasAskedForScreenRecording {
+            overlayState.appendSystemNote("⚠️ Answer screen needs Screen Recording, which hasn't been allowed yet. Open Setup to allow it (no video is saved).", category: .ai)
+            requestSetup?()
+            return nil
+        }
         do {
             let content = try await SCShareableContent.current
             guard !content.displays.isEmpty else { return nil }
@@ -2456,6 +2488,30 @@ final class AppCoordinator {
             overlayState.status = isRunning ? .listening : .idle
         default:
             break
+        }
+    }
+
+    /// Same test `makeStartedTranscriber` uses to pick Parakeet. Parakeet runs
+    /// on the Neural Engine and needs no Speech Recognition permission.
+    private var usesParakeetEngine: Bool {
+        settings.localeIdentifier.lowercased().hasPrefix("en")
+    }
+
+    /// Stops a Play press that can't proceed for lack of a permission. The
+    /// banner's "Open Setup" button reopens onboarding; nothing here asks macOS.
+    private func blockStartup(for kind: PermissionKind, note: String) async {
+        overlayState.appendSystemNote(note, category: .general)
+        overlayState.status = .needsPermission(kind)
+        await abortStartupCapture()
+    }
+
+    /// Why the AI can't run right now, worded for the person reading it.
+    private var aiUnavailableNote: String {
+        switch settings.keychainAccess {
+        case .needsUnlock, .denied:
+            return "⚠️ Your API key is saved, but macOS hasn't let Whisper Pilot open it. Go to Settings → AI Provider and press “Allow Keychain access”."
+        case .noKeysStored, .ready:
+            return "⚠️ Add an API key for the selected model in Settings to use the AI."
         }
     }
 

@@ -146,16 +146,11 @@ final class SpeechAnalyzerTranscriber: TranscriptionProvider, @unchecked Sendabl
         continuation.finish()
     }
 
+    /// Never asks macOS: Speech Recognition is requested once, in onboarding.
     private func ensureAuthorization() async throws {
-        let status = SFSpeechRecognizer.authorizationStatus()
-        if status == .authorized { return }
-        if status == .denied || status == .restricted {
+        if SFSpeechRecognizer.authorizationStatus() != .authorized {
             throw TranscriberError.notAuthorized
         }
-        let granted: Bool = await withCheckedContinuation { c in
-            SFSpeechRecognizer.requestAuthorization { c.resume(returning: $0 == .authorized) }
-        }
-        if !granted { throw TranscriberError.notAuthorized }
     }
 }
 

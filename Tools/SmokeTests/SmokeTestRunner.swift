@@ -27,6 +27,7 @@ struct SmokeTestRunner {
         await runSessionStoreParsingSuite()
         await runSessionStorePersistenceSuite()
         await runInstallDiagnosticsSuite()
+        await runOnboardingEligibilitySuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
         await runTranslationQueueSuite()
@@ -1507,6 +1508,114 @@ struct SmokeTestRunner {
                          "remedy targets the documented install path")
             await expect(InstallDiagnostics.translocationMessage.contains(InstallDiagnostics.remedyCommand),
                          "the note shows the command even if the user doesn't press Copy")
+        }
+    }
+
+    static func runOnboardingEligibilitySuite() async {
+        let allGranted = PermissionsSnapshot(
+            microphone: .granted, screenRecording: .granted, speechRecognition: .granted, systemAudio: .granted
+        )
+        func missing(
+            mic: Bool = true,
+            forceScreen: Bool = false,
+            tap: Bool = true,
+            _ permissions: PermissionsSnapshot,
+            keychain: KeychainAccess = .noKeysStored
+        ) -> [SetupItem] {
+            OnboardingEligibility.missing(
+                captureMicrophone: mic,
+                requiresScreenRecording: forceScreen,
+                processTapSupported: tap,
+                permissions: permissions,
+                keychain: keychain
+            )
+        }
+
+        await suite("Onboarding eligibility") {
+            await expect(missing(allGranted).isEmpty, "everything granted -> nothing missing")
+
+            let fresh = PermissionsSnapshot()
+            await expect(
+                missing(fresh) == [.microphone, .speechRecognition, .systemAudio],
+                "fresh install needs mic, speech and system audio; screen recording stays optional"
+            )
+            await expect(
+                missing(mic: false, fresh) == [.speechRecognition, .systemAudio],
+                "disabled microphone capture does not require the microphone permission"
+            )
+
+            var noScreen = allGranted
+            noScreen.screenRecording = .unknown
+            await expect(missing(noScreen).isEmpty, "optional Screen Recording is never required on the Process Tap path")
+            await expect(
+                missing(forceScreen: true, noScreen) == [.screenRecording],
+                "ScreenCaptureKit path requires Screen Recording and drops the tap permission"
+            )
+            var noTap = fresh
+            noTap.microphone = .granted
+            noTap.speechRecognition = .granted
+            await expect(
+                missing(tap: false, noTap) == [],
+                "macOS without Process Taps only needs Screen Recording when it is required by the caller"
+            )
+            await expect(
+                missing(allGranted, keychain: .needsUnlock) == [.keychain],
+                "a saved key this build hasn't unlocked is missing"
+            )
+            await expect(
+                missing(allGranted, keychain: .denied).isEmpty,
+                "a denied Keychain is not re-requested automatically"
+            )
+            await expect(
+                missing(allGranted, keychain: .ready).isEmpty && missing(allGranted, keychain: .noKeysStored).isEmpty,
+                "ready or empty Keychain needs nothing"
+            )
+
+            let current = SettingsStore.currentOnboardingVersion
+            func present(_ completed: Int, deferred: Bool = false, _ items: [SetupItem], hasKey: Bool = true) -> Bool {
+                OnboardingEligibility.shouldPresent(
+                    completedVersion: completed, currentVersion: current,
+                    deferredForThisBuild: deferred, missing: items, hasAIKey: hasKey
+                )
+            }
+            await expect(present(0, [.microphone]), "first run with a missing permission shows onboarding")
+            await expect(present(0, []) == false, "first run with everything granted and a key saved skips onboarding")
+            await expect(
+                present(0, [], hasKey: false),
+                "first run with every permission granted but no AI key still shows onboarding, so the key step is never skipped"
+            )
+            await expect(
+                present(current, [], hasKey: false) == false,
+                "finished onboarding does not come back just because there is no key"
+            )
+            await expect(
+                present(current, [.microphone, .systemAudio]) == false,
+                "finished onboarding is not reopened for a permission turned off later"
+            )
+            await expect(present(current, [.keychain]), "an updated build that needs the Keychain approved again reopens onboarding")
+            await expect(present(current, deferred: true, [.keychain]) == false, "\"Set up later\" silences onboarding for this build")
+            await expect(present(0, deferred: true, [.microphone]) == false, "deferred first-run onboarding stays closed until the next build")
+            await expect(present(0, deferred: true, [], hasKey: false) == false, "closing onboarding without a key also stays closed for this build")
+            await expect(present(current - 1, [.systemAudio]), "a newer onboarding version shows once for the items it added")
+
+            var someGranted = PermissionsSnapshot()
+            someGranted.microphone = .granted
+            await expect(
+                OnboardingEligibility.startPoint(completedVersion: 0, missing: [.microphone], permissions: PermissionsSnapshot()) == .welcome,
+                "a brand-new user starts on the welcome screen"
+            )
+            await expect(
+                OnboardingEligibility.startPoint(completedVersion: 0, missing: [.speechRecognition], permissions: someGranted) == .permissions,
+                "someone who already granted something skips the welcome screen (for example after macOS restarts the app)"
+            )
+            await expect(
+                OnboardingEligibility.startPoint(completedVersion: 0, missing: [], permissions: allGranted) == .ai,
+                "everything granted -> only the AI key step is left"
+            )
+            await expect(
+                OnboardingEligibility.startPoint(completedVersion: current, missing: [.keychain], permissions: allGranted) == .permissions,
+                "a returning user goes straight to the permissions screen"
+            )
         }
     }
 

@@ -10,6 +10,8 @@ struct OverlayActions {
     var openSettings: () -> Void
     var hideOverlay: () -> Void
     var openScreenRecordingPrivacy: () -> Void
+    /// Reopens onboarding so the user can allow a missing permission.
+    var openSetup: () -> Void
     var toggleAIPaused: () -> Void
     /// (text, withScreenshot) — when `withScreenshot` is true, the coordinator captures
     /// the current display and ships it as multimodal input.

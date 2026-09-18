@@ -53,6 +53,7 @@ targets:
         LSUIElement: true
         NSMicrophoneUsageDescription: "Whisper Pilot listens to your microphone so you can include your own voice in the conversation transcript. You can disable this in Settings."
         NSSpeechRecognitionUsageDescription: "Whisper Pilot transcribes meetings on-device so it can help you respond in realtime."
+        NSAudioCaptureUsageDescription: "Whisper Pilot hears the audio playing on your Mac (Zoom, Meet, Teams, a browser) so it can transcribe the other side of your conversations. Audio only. Nothing is saved except the text transcript."
         NSScreenCaptureUsageDescription: "Whisper Pilot captures system audio (not video) from your meetings so it can hear what others are saying."
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: false

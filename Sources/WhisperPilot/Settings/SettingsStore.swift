@@ -48,9 +48,40 @@ final class SettingsStore: ObservableObject {
         static let safetyValveCPUPercent = "performance.safetyValveCPUPercent"
         static let safetyValveMemoryMB = "performance.safetyValveMemoryMB"
         static let alwaysTranscribeMic = "performance.alwaysTranscribeMic"
+        static let onboardingCompletedVersion = "onboarding.completedVersion"
+        static let setupDeferredBuild = "onboarding.setupDeferredBuild"
+        static let keychainApprovedBuild = "keychain.approvedBuild"
+        /// One Keychain item holding every API key (JSON). macOS asks for approval
+        /// once per item, so two separate items meant two rounds of password
+        /// prompts. `geminiAPIKey` / `anthropicAPIKey` above are the old
+        /// one-item-per-vendor accounts, read only to migrate into this one.
+        static let apiKeysBundle = "api_keys"
+        static let storedVendors = "keychain.storedVendors"
+        static let legacyKeysMigrated = "keychain.legacyKeysMigrated"
     }
 
+    /// Bump when onboarding starts asking for something new, so people who
+    /// finished an older onboarding see it once more for the new items.
+    nonisolated static let currentOnboardingVersion = 1
+
     private let defaults: UserDefaults
+
+    private(set) var onboardingCompletedVersion: Int
+
+    func completeOnboarding() {
+        onboardingCompletedVersion = Self.currentOnboardingVersion
+        defaults.set(Self.currentOnboardingVersion, forKey: Keys.onboardingCompletedVersion)
+    }
+
+    /// "Set up later" on the permissions screen. Remembered per build so the
+    /// app does not nag on every launch, but comes back after an update.
+    func deferSetupForThisBuild() {
+        defaults.set(KeychainHelper.buildIdentity, forKey: Keys.setupDeferredBuild)
+    }
+
+    var isSetupDeferredForThisBuild: Bool {
+        defaults.string(forKey: Keys.setupDeferredBuild) == KeychainHelper.buildIdentity
+    }
 
     /// Wire id of the currently-selected model. Sourced from
     /// `AIModelRegistry.all` — any id not in the registry falls back to
@@ -427,16 +458,15 @@ final class SettingsStore: ObservableObject {
         Locale(identifier: localeIdentifier)
     }
 
-    /// In-memory cache for API keys. Without this, every `settings.geminiAPIKey`
-    /// access is a fresh `SecItemCopyMatching` call — and we have 5+ call sites
-    /// in `AppCoordinator` alone (eager provider build, `refreshDerivedState`,
-    /// prompt handlers). On an ad-hoc-signed local build, each Keychain hit
-    /// after a rebuild can independently re-prompt the user because the access
-    /// ACL is keyed by code signature. Caching collapses N reads per launch
-    /// down to one. We invalidate the cache when the setter writes.
+    /// In-memory copy of the API keys. Reading a secret from the Keychain can
+    /// make macOS show an approval dialog, so the app does that in exactly two
+    /// places — `unlockStoredKeys()` (onboarding / an explicit button) and, at
+    /// launch, only for a build the user already approved. Everything else
+    /// (Settings, Sessions, the overlay, AI calls) reads this cache and never
+    /// touches the Keychain.
     ///
-    /// Threading: this whole class is `@MainActor`, so the cache vars and
-    /// `Loaded` flags don't need extra synchronization.
+    /// Threading: this whole class is `@MainActor`, so the cache vars don't
+    /// need extra synchronization.
     private enum Cached<Value> {
         case empty
         case loaded(Value?)
@@ -444,51 +474,222 @@ final class SettingsStore: ObservableObject {
     private var cachedGeminiAPIKey: Cached<String> = .empty
     private var cachedAnthropicAPIKey: Cached<String> = .empty
 
-    /// Non-nil when the most recent API-key save was rejected by the Keychain.
-    /// Surfaced in the Settings AI-provider tab — a silently dropped key would
+    /// Non-nil when the last Keychain read or write failed. Surfaced next to
+    /// the API-key fields and in onboarding — a silently dropped key would
     /// otherwise present as "AI features just don't work" with no explanation.
     @Published private(set) var keychainErrorMessage: String? = nil
 
+    @Published private(set) var keychainAccess: KeychainAccess = .noKeysStored
+
+    /// Cache-only: returns nil until the Keychain has been unlocked (or the key
+    /// was saved in this run). Check `keychainAccess` to tell "no key" apart
+    /// from "key exists but is still locked".
     var geminiAPIKey: String? {
         get {
-            switch cachedGeminiAPIKey {
-            case .loaded(let v): return v
-            case .empty:
-                let v = KeychainHelper.get(Keys.geminiAPIKey)
-                cachedGeminiAPIKey = .loaded(v)
-                return v
-            }
+            if case .loaded(let v) = cachedGeminiAPIKey { return v }
+            return nil
         }
-        set {
-            if KeychainHelper.set(newValue, forKey: Keys.geminiAPIKey) {
-                cachedGeminiAPIKey = .loaded(newValue)
-                keychainErrorMessage = nil
-            } else {
-                keychainErrorMessage = "Saving the Gemini API key to the Keychain failed — the key is NOT stored. Try again, or check Keychain Access for a locked/damaged login keychain."
-            }
-            objectWillChange.send()
-        }
+        set { saveKey(newValue, vendor: .gemini) }
     }
 
     var anthropicAPIKey: String? {
         get {
-            switch cachedAnthropicAPIKey {
-            case .loaded(let v): return v
-            case .empty:
-                let v = KeychainHelper.get(Keys.anthropicAPIKey)
-                cachedAnthropicAPIKey = .loaded(v)
-                return v
-            }
+            if case .loaded(let v) = cachedAnthropicAPIKey { return v }
+            return nil
         }
-        set {
-            if KeychainHelper.set(newValue, forKey: Keys.anthropicAPIKey) {
-                cachedAnthropicAPIKey = .loaded(newValue)
-                keychainErrorMessage = nil
-            } else {
-                keychainErrorMessage = "Saving the Claude API key to the Keychain failed — the key is NOT stored. Try again, or check Keychain Access for a locked/damaged login keychain."
-            }
+        set { saveKey(newValue, vendor: .anthropic) }
+    }
+
+    private struct KeyBundle: Codable {
+        var gemini: String?
+        var anthropic: String?
+
+        var vendorIDs: [String] {
+            var ids: [String] = []
+            if !(gemini ?? "").isEmpty { ids.append(AIVendor.gemini.rawValue) }
+            if !(anthropic ?? "").isEmpty { ids.append(AIVendor.anthropic.rawValue) }
+            return ids
+        }
+    }
+
+    private func saveKey(_ newValue: String?, vendor: AIVendor) {
+        let vendorName = vendor.displayName
+        // Writing to an item this build was never approved for would raise the
+        // same macOS dialog, so refuse until it is unlocked.
+        if keychainAccess == .needsUnlock || keychainAccess == .denied {
+            keychainErrorMessage = "Your saved API key isn't unlocked yet — Whisper Pilot has not been allowed to open it. Choose “Allow Keychain access”, then try again."
             objectWillChange.send()
+            return
         }
+        let cleaned = (newValue ?? "").isEmpty ? nil : newValue
+        var bundle = KeyBundle(gemini: geminiAPIKey, anthropic: anthropicAPIKey)
+        switch vendor {
+        case .gemini: bundle.gemini = cleaned
+        case .anthropic: bundle.anthropic = cleaned
+        }
+
+        let status: OSStatus
+        if bundle.vendorIDs.isEmpty {
+            status = KeychainHelper.set(nil, forKey: Keys.apiKeysBundle)
+        } else if let data = try? JSONEncoder().encode(bundle), let json = String(data: data, encoding: .utf8) {
+            status = KeychainHelper.set(json, forKey: Keys.apiKeysBundle)
+        } else {
+            status = errSecParam
+        }
+
+        if status == errSecSuccess {
+            switch vendor {
+            case .gemini: cachedGeminiAPIKey = .loaded(cleaned)
+            case .anthropic: cachedAnthropicAPIKey = .loaded(cleaned)
+            }
+            keychainErrorMessage = nil
+            defaults.set(bundle.vendorIDs, forKey: Keys.storedVendors)
+            // The bundle now holds everything; the old per-vendor items are ignored from here on.
+            defaults.set(true, forKey: Keys.legacyKeysMigrated)
+            if bundle.vendorIDs.isEmpty {
+                keychainAccess = .noKeysStored
+            } else {
+                keychainAccess = .ready
+                defaults.set(KeychainHelper.buildIdentity, forKey: Keys.keychainApprovedBuild)
+            }
+        } else {
+            let action = cleaned == nil ? "Removing" : "Saving"
+            keychainErrorMessage = "\(action) the \(vendorName) API key failed: \(KeychainHelper.describe(status)). Nothing was changed. Try again, or check Keychain Access for a locked or damaged login keychain."
+        }
+        objectWillChange.send()
+    }
+
+    /// Opens the saved keys so the app can use them. This is the ONE call that
+    /// may show the macOS Keychain dialog — call it only from onboarding or a
+    /// button the user pressed, after telling them why. The read runs off the
+    /// main thread because it blocks until the user answers the dialog.
+    @discardableResult
+    func unlockStoredKeys() async -> KeychainAccess {
+        let migrated = defaults.bool(forKey: Keys.legacyKeysMigrated)
+        let outcome = await Task.detached { Self.loadFromKeychain(legacyMigrated: migrated) }.value
+        apply(outcome)
+        return outcome.access
+    }
+
+    private struct LoadOutcome {
+        var bundle: KeyBundle?
+        var access: KeychainAccess
+        var errorMessage: String?
+        var migratedLegacy = false
+    }
+
+    /// Pure Keychain I/O, no app state, so it can run on a background thread.
+    /// Reads the single bundle item; if only the old one-item-per-vendor
+    /// entries exist, reads those (one approval each, once) and rewrites them
+    /// into the bundle.
+    private nonisolated static func loadFromKeychain(legacyMigrated: Bool) -> LoadOutcome {
+        if KeychainHelper.exists(Keys.apiKeysBundle) {
+            switch KeychainHelper.read(Keys.apiKeysBundle) {
+            case .value(let json):
+                guard let bundle = try? JSONDecoder().decode(KeyBundle.self, from: Data(json.utf8)) else {
+                    wpError("Keychain bundle could not be decoded")
+                    return LoadOutcome(access: .denied, errorMessage: "Your saved API keys could not be read (the Keychain entry is damaged). Save the key again in Settings → AI Provider.")
+                }
+                return LoadOutcome(bundle: bundle, access: bundle.vendorIDs.isEmpty ? .noKeysStored : .ready)
+            case .notFound:
+                return LoadOutcome(bundle: KeyBundle(), access: .noKeysStored)
+            case .denied:
+                return LoadOutcome(access: .denied, errorMessage: deniedMessage(for: "saved"))
+            case .failed(let status):
+                return LoadOutcome(access: .denied, errorMessage: failedMessage(for: "saved", status: status))
+            }
+        }
+
+        var bundle = KeyBundle()
+        var readLegacy = false
+        if !legacyMigrated {
+            for (vendor, account) in [(AIVendor.gemini, Keys.geminiAPIKey), (AIVendor.anthropic, Keys.anthropicAPIKey)]
+            where KeychainHelper.exists(account) {
+                switch KeychainHelper.read(account) {
+                case .value(let v):
+                    readLegacy = true
+                    if vendor == .gemini { bundle.gemini = v } else { bundle.anthropic = v }
+                case .notFound:
+                    break
+                case .denied:
+                    return LoadOutcome(access: .denied, errorMessage: deniedMessage(for: vendor.displayName))
+                case .failed(let status):
+                    return LoadOutcome(access: .denied, errorMessage: failedMessage(for: vendor.displayName, status: status))
+                }
+            }
+        }
+        guard readLegacy, !bundle.vendorIDs.isEmpty else {
+            return LoadOutcome(bundle: KeyBundle(), access: .noKeysStored)
+        }
+        var outcome = LoadOutcome(bundle: bundle, access: .ready)
+        if let data = try? JSONEncoder().encode(bundle), let json = String(data: data, encoding: .utf8),
+           KeychainHelper.set(json, forKey: Keys.apiKeysBundle) == errSecSuccess {
+            outcome.migratedLegacy = true
+        } else {
+            // Keys still work for this run; the move is retried next launch.
+            wpWarn("Keychain: could not move API keys into the single bundle item")
+        }
+        return outcome
+    }
+
+    private nonisolated static func deniedMessage(for what: String) -> String {
+        let subject = what == "saved" ? "your saved API keys" : "your \(what) API key"
+        return "macOS did not let Whisper Pilot open \(subject). AI answers stay off until you allow it. Press “Allow Keychain access” and choose Allow or Always Allow."
+    }
+
+    private nonisolated static func failedMessage(for what: String, status: OSStatus) -> String {
+        let subject = what == "saved" ? "your saved API keys" : "your \(what) API key"
+        return "Could not read \(subject) from the Keychain: \(KeychainHelper.describe(status)). Try again, or check Keychain Access for a locked or damaged login keychain."
+    }
+
+    private func apply(_ outcome: LoadOutcome) {
+        if let bundle = outcome.bundle {
+            cachedGeminiAPIKey = .loaded(bundle.gemini)
+            cachedAnthropicAPIKey = .loaded(bundle.anthropic)
+            defaults.set(bundle.vendorIDs, forKey: Keys.storedVendors)
+        }
+        if outcome.migratedLegacy {
+            defaults.set(true, forKey: Keys.legacyKeysMigrated)
+        }
+        keychainErrorMessage = outcome.errorMessage
+        keychainAccess = outcome.access
+        if outcome.access == .ready {
+            defaults.set(KeychainHelper.buildIdentity, forKey: Keys.keychainApprovedBuild)
+        }
+        objectWillChange.send()
+    }
+
+    /// Vendors that have a saved key, answered without opening any secret.
+    /// Uses the list remembered in UserDefaults, plus the old per-vendor items
+    /// (attributes only) until they've been moved into the bundle.
+    private nonisolated static func configuredVendors(defaults: UserDefaults) -> Set<AIVendor> {
+        var vendors = Set((defaults.stringArray(forKey: Keys.storedVendors) ?? []).compactMap(AIVendor.init(rawValue:)))
+        if !defaults.bool(forKey: Keys.legacyKeysMigrated) {
+            if KeychainHelper.exists(Keys.geminiAPIKey) { vendors.insert(.gemini) }
+            if KeychainHelper.exists(Keys.anthropicAPIKey) { vendors.insert(.anthropic) }
+        }
+        if vendors.isEmpty, KeychainHelper.exists(Keys.apiKeysBundle) {
+            // The list was lost (defaults wiped) — assume both until unlocked.
+            vendors = Set(AIVendor.allCases)
+        }
+        return vendors
+    }
+
+    /// Launch-time step. Keys are read here only if the user already approved
+    /// this exact build, which means macOS will not ask again. Otherwise the
+    /// state becomes `.needsUnlock` and onboarding asks, with an explanation.
+    private func restoreKeychainAccess() {
+        guard !Self.configuredVendors(defaults: defaults).isEmpty else {
+            keychainAccess = .noKeysStored
+            return
+        }
+        let build = KeychainHelper.buildIdentity
+        guard build != KeychainHelper.unknownBuildIdentity,
+              defaults.string(forKey: Keys.keychainApprovedBuild) == build else {
+            keychainAccess = .needsUnlock
+            return
+        }
+        apply(Self.loadFromKeychain(legacyMigrated: defaults.bool(forKey: Keys.legacyKeysMigrated)))
     }
 
     /// Which AI vendors have a configured API key right now. Used by the
@@ -512,30 +713,22 @@ final class SettingsStore: ObservableObject {
     /// reason, so a later AI call doesn't re-query.
     var hasGeminiAPIKey: Bool {
         if case .loaded(let v) = cachedGeminiAPIKey { return !(v ?? "").isEmpty }
-        return KeychainHelper.exists(Keys.geminiAPIKey)
+        return Self.configuredVendors(defaults: defaults).contains(.gemini)
     }
 
     var hasAnthropicAPIKey: Bool {
         if case .loaded(let v) = cachedAnthropicAPIKey { return !(v ?? "").isEmpty }
-        return KeychainHelper.exists(Keys.anthropicAPIKey)
+        return Self.configuredVendors(defaults: defaults).contains(.anthropic)
     }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        // Deliberately NOT seeding the key caches here.
-        //
-        // Eagerly reading both vendors' secrets at launch cost the user one
-        // macOS authorization dialog per configured vendor before they had even
-        // done anything — and on an ad-hoc-signed build "Always Allow" doesn't
-        // stick, because the item's ACL is bound to a code signature that
-        // changes with every build. The caches below fill lazily on the first
-        // read that genuinely needs a secret (an actual AI call), so opening the
-        // app and browsing sessions now prompts zero times.
-        //
-        // The `Cached` indirection still collapses the many later reads in the
-        // launch path down to one `SecItemCopyMatching`.
-        let geminiConfiguredAtBoot = KeychainHelper.exists(Keys.geminiAPIKey)
-        let anthropicConfiguredAtBoot = KeychainHelper.exists(Keys.anthropicAPIKey)
+        self.onboardingCompletedVersion = defaults.integer(forKey: Keys.onboardingCompletedVersion)
+        // Existence checks only (attributes, never the secret): the model choice
+        // below needs to know which vendors have a key, and this must not cost
+        // the user a macOS dialog. The secrets themselves are opened at the end
+        // of init, and only for a build the user already approved.
+        let configuredAtBoot = Self.configuredVendors(defaults: defaults)
 
         // Resolve the active model in priority order:
         //   1. New unified key set by post-v0.1.11 builds.
@@ -553,10 +746,7 @@ final class SettingsStore: ObservableObject {
             self.activeModel = id
             defaults.set(id, forKey: Keys.activeModel)
         } else {
-            var vendors: Set<AIVendor> = []
-            if geminiConfiguredAtBoot { vendors.insert(.gemini) }
-            if anthropicConfiguredAtBoot { vendors.insert(.anthropic) }
-            let fallback = AIModelRegistry.defaultModel(availableVendors: vendors)
+            let fallback = AIModelRegistry.defaultModel(availableVendors: configuredAtBoot)
             self.activeModel = fallback.id
             defaults.set(fallback.id, forKey: Keys.activeModel)
         }
@@ -645,5 +835,6 @@ final class SettingsStore: ObservableObject {
         self.safetyValveCPUPercent = defaults.object(forKey: Keys.safetyValveCPUPercent) as? Double ?? 70
         self.safetyValveMemoryMB = defaults.object(forKey: Keys.safetyValveMemoryMB) as? Int ?? 1500
         self.alwaysTranscribeMic = defaults.object(forKey: Keys.alwaysTranscribeMic) as? Bool ?? true
+        restoreKeychainAccess()
     }
 }

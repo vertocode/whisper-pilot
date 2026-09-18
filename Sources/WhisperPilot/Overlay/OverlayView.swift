@@ -1017,13 +1017,23 @@ struct OverlayView: View {
             )
         case .needsPermission(.microphone):
             return BannerSpec(
-                message: "Microphone permission is required. Grant it in System Settings → Privacy & Security → Microphone.",
-                button: nil
+                message: "Microphone access isn't allowed. Open Setup to allow it, or turn off microphone capture in Settings → Capture.",
+                button: BannerButton(title: "Open Setup", action: actions.openSetup)
+            )
+        case .needsPermission(.speechRecognition):
+            return BannerSpec(
+                message: "Speech Recognition isn't allowed. It turns audio into text on this Mac. Open Setup to allow it.",
+                button: BannerButton(title: "Open Setup", action: actions.openSetup)
+            )
+        case .needsPermission(.systemAudio):
+            return BannerSpec(
+                message: "System audio isn't allowed. It's how Whisper Pilot hears the other side of the call. Open Setup to allow it.",
+                button: BannerButton(title: "Open Setup", action: actions.openSetup)
             )
         case .needsPermission(.screenRecording):
             return BannerSpec(
-                message: "Screen Recording permission is required to capture meeting audio. macOS may have recorded a previous denial — open System Settings, remove any 'Whisper Pilot' entries, then run again.",
-                button: BannerButton(title: "Open Privacy Settings", action: actions.openScreenRecordingPrivacy)
+                message: "Screen Recording isn't allowed. It's needed to hear system audio on this Mac (no video is saved). Open Setup to allow it, or open Privacy Settings if you already chose Don't Allow.",
+                button: BannerButton(title: "Open Setup", action: actions.openSetup)
             )
         case .error(let message):
             if message.contains("-3801") || message.contains("declined TCCs") {

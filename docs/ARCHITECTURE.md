@@ -22,7 +22,8 @@ Sources/WhisperPilot/
 ├── AI/              // Provider protocol + Gemini implementation (multimodal-aware)
 ├── Overlay/         // Floating panel window + SwiftUI views (header, chat lane, transcript lane, composer)
 ├── Settings/        // Preferences view, persistent store, Keychain helper
-├── Permissions/     // Microphone + Screen Recording flow
+├── Permissions/     // Microphone, Speech Recognition, system audio, Screen Recording
+├── Onboarding/      // The only place permissions are requested, plus optional AI-provider setup
 ├── Persistence/     // SessionStore — disk-backed sessions with markdown transcripts
 ├── Sessions/        // SessionsWindow — launch screen + resume UI
 └── MenuBar/         // Status item + menu
@@ -31,9 +32,10 @@ Sources/WhisperPilot/
 ## Lifecycle
 
 1. App launches → `WhisperPilotApp` (SwiftUI) → `AppDelegate.applicationDidFinishLaunching`.
-2. `AppDelegate` constructs `AppCoordinator`, the overlay window (hidden), and the **Sessions window** (visible). The user picks or creates a session.
-3. Picking a session calls `coordinator.useSession(_:resumed:)`, which seeds `ConversationContext` (with prior markdown if resumed), and shows the overlay.
-4. The user clicks ▶ Play → `coordinator.startListening()` walks gates: Screen Recording probe, mic permission (if requested), API key presence. Then it starts the transcriber, the system + microphone capture, and wires the pipeline.
+2. `AppDelegate` constructs `AppCoordinator`, the overlay window (hidden), and the Sessions window, then refreshes the permission snapshot.
+3. Onboarding opens first when a first run (or a newer onboarding version) has something missing, or when an updated build needs the Keychain approved again. It asks for everything in one screen, each with its reason: Microphone (only if mic capture is on), Speech Recognition, system audio, Screen Recording (optional on the Process Tap path, required when ScreenCaptureKit is used) and Keychain access. "Set up later" or closing the window is remembered for the current build.
+4. Picking a session calls `coordinator.useSession(_:resumed:)`, which seeds `ConversationContext` (with prior markdown if resumed), and shows the overlay.
+5. The user clicks ▶ Play → `coordinator.startListening()` never opens a system permission dialog: a missing permission stops it with a banner and an "Open Setup" button. Otherwise it starts the transcriber, system + microphone capture, and wires the pipeline. Transcription works without an AI key.
 
 ## Data flow
 
@@ -127,7 +129,7 @@ All three include the recent meeting transcript, the prior assistant↔user chat
 `OverlayView` lays out four lanes that update independently:
 
 - **Header** — logo, status pill (`Idle` / `Listening` / `Thinking` / `Speaking`), live counters (`X audio · Y transcripts`), and the action cluster: ▶ listening toggle, ⏸ AI pause, ⚙ settings, ✕ hide.
-- **Banner** — appears for `.needsAPIKey`, `.needsPermission(...)`, or `.error(...)`. Each banner provides an actionable button (Open Settings / Open Privacy Settings).
+- **Banner** — appears for `.needsAPIKey`, `.needsPermission(...)`, or `.error(...)`. Each banner provides an actionable button (Open Settings / Open Setup / Open Privacy Settings).
 - **Chat lane** — `[ChatMessage]` bubbles with role badges (You / Assistant / System) and origin badges (`from detected question`, `auto-send`).
 - **Transcript lane** — recent transcript segments with channel attribution.
 - **Composer** — text field + 📤 send + 👁 *See my screen* toggle. Toggle resets after each send so attaching a screenshot is always deliberate.
@@ -144,7 +146,11 @@ On resume, the coordinator loads `transcript.md` and `chat.md` as raw markdown a
 
 ### 8. Settings & permissions
 
-`SettingsStore` wraps `UserDefaults`. `KeychainHelper` reads/writes the Gemini API key. `PermissionsManager` walks the user through both system permission grants on first launch and provides a deep link to the Privacy & Security pane for recovery (TCC denials are easy to hit during dev).
+`SettingsStore` wraps `UserDefaults`. `KeychainHelper` reads/writes Gemini and Claude API keys. `PermissionsManager` owns permission checks, requests, and Privacy & Security deep links.
+
+**Permissions are requested in one place, onboarding.** Nothing else may raise a macOS dialog: Play, Settings, Sessions and the overlay only read state. Screen Recording and system audio have no public "am I allowed" API, so the manager remembers its own request. The Keychain is the same: `SettingsStore` reads the secret only in `unlockStoredKeys()` (onboarding, or the "Allow Keychain access" button) and, at launch, only for a build the user already approved (`KeychainHelper.buildIdentity`, the code-signature hash, stored in `keychain.approvedBuild`). Every other access reads the in-memory copy. An updated ad-hoc build has a new hash, so macOS asks again; onboarding reopens once for that, with the reason.
+
+`OnboardingView` explains why each permission is needed, shows a specific message when one is refused (or blocked by a device policy), and lets the user save one AI-provider key to Keychain or defer it. `onboarding.completedVersion` (see `SettingsStore.currentOnboardingVersion`) records what the user finished; bump it when onboarding starts asking for something new.
 
 The Settings window is owned by `AppDelegate`, not by SwiftUI's `Settings { }` scene — the magic `showSettingsWindow:` action selector silently no-ops on accessory / `LSUIElement` apps in recent SDKs, so we manage our own `NSWindow` and skip the routing entirely.
 
@@ -163,7 +169,7 @@ The Settings window is owned by `AppDelegate`, not by SwiftUI's `Settings { }` s
 - **Gemini Flash over Pro by default.** Latency is the dominant UX signal here. Flash's first-token latency on streamed completion is consistently sub-second.
 - **No SwiftData / no Core Data.** The persistence model is markdown files on disk. Plain text outlives any database we'd pick. If we ever need indexing, we'll add it on top of the same files.
 - **`NSWindow` (not `NSPanel`) for the overlay.** Window managers refuse to touch panels and borderless windows. Real `NSWindow` with hidden chrome gives both the borderless look and full window-manager support.
-- **Sessions-first launch screen.** The disk-backed session is the unit of work. Forcing the user to pick or create one removes the ambiguity of "what is this transcript attached to?"
+- **Sessions-first working screen.** After one-time onboarding, the disk-backed session is the unit of work. Forcing the user to pick or create one removes the ambiguity of "what is this transcript attached to?"
 
 ## Extending
 

@@ -1,25 +1,37 @@
 import AppKit
+import Combine
 
 @MainActor
-final class MenuBarController {
+final class MenuBarController: NSObject, NSMenuDelegate {
     private let coordinator: AppCoordinator
     private let overlay: OverlayWindowController
     private let openSettings: () -> Void
     private let openSessions: () -> Void
+    private let openSetup: () -> Void
+    /// True while a permission the app needs is missing. The listening and
+    /// session entries can't work then, so the menu offers "Finish setup" instead.
+    private let needsSetup: () -> Bool
     private let item: NSStatusItem
     private let menu = NSMenu()
+    private var listeningActive = false
+    private var observers: Set<AnyCancellable> = []
 
     init(
         coordinator: AppCoordinator,
         overlay: OverlayWindowController,
         openSettings: @escaping () -> Void,
-        openSessions: @escaping () -> Void
+        openSessions: @escaping () -> Void,
+        openSetup: @escaping () -> Void,
+        needsSetup: @escaping () -> Bool
     ) {
         self.coordinator = coordinator
         self.overlay = overlay
         self.openSettings = openSettings
         self.openSessions = openSessions
+        self.openSetup = openSetup
+        self.needsSetup = needsSetup
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
         configure()
     }
 
@@ -43,24 +55,55 @@ final class MenuBarController {
             button.toolTip = "Whisper Pilot"
         }
 
-        let toggle = NSMenuItem(title: "Start listening", action: #selector(toggleListening), keyEquivalent: "l")
-        toggle.target = self
-        toggle.tag = 1
-        menu.addItem(toggle)
+        menu.delegate = self
+        item.menu = menu
+        rebuildMenu()
 
-        let showOverlay = NSMenuItem(title: "Show overlay", action: #selector(showOverlay), keyEquivalent: "o")
-        showOverlay.target = self
-        menu.addItem(showOverlay)
+        // Rebuild when a permission or the Keychain state changes, so the menu
+        // never offers something that can't work yet (or hides what now can).
+        coordinator.permissions.$snapshot
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.rebuildMenu() } }
+            .store(in: &observers)
+        coordinator.settings.objectWillChange
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.rebuildMenu() } }
+            .store(in: &observers)
 
-        menu.addItem(.separator())
+        let stream = coordinator.overlayState.statusStream
+        Task { [weak self] in
+            for await status in stream {
+                self?.listeningActive = status.isActive
+                self?.updateToggleTitle(running: status.isActive)
+            }
+        }
+    }
 
-        let sessions = NSMenuItem(title: "Sessions…", action: #selector(openSessionsAction), keyEquivalent: "s")
-        sessions.target = self
-        menu.addItem(sessions)
+    private func rebuildMenu() {
+        menu.removeAllItems()
 
-        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettingsAction), keyEquivalent: ",")
-        settings.target = self
-        menu.addItem(settings)
+        if needsSetup() {
+            let setup = NSMenuItem(title: "Finish setup…", action: #selector(openSetupAction), keyEquivalent: "")
+            setup.target = self
+            menu.addItem(setup)
+            menu.addItem(.separator())
+            addSettingsItem()
+        } else {
+            let toggle = NSMenuItem(title: listeningActive ? "Stop listening" : "Start listening", action: #selector(toggleListening), keyEquivalent: "l")
+            toggle.target = self
+            toggle.tag = 1
+            menu.addItem(toggle)
+
+            let showOverlay = NSMenuItem(title: "Show overlay", action: #selector(showOverlay), keyEquivalent: "o")
+            showOverlay.target = self
+            menu.addItem(showOverlay)
+
+            menu.addItem(.separator())
+
+            let sessions = NSMenuItem(title: "Sessions…", action: #selector(openSessionsAction), keyEquivalent: "s")
+            sessions.target = self
+            menu.addItem(sessions)
+
+            addSettingsItem()
+        }
 
         menu.addItem(.separator())
 
@@ -71,21 +114,28 @@ final class MenuBarController {
         let quit = NSMenuItem(title: "Quit Whisper Pilot", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
 
-        item.menu = menu
-
-        let stream = coordinator.overlayState.statusStream
-        Task { [weak self] in
-            for await status in stream {
-                self?.updateToggleTitle(running: status.isActive)
-            }
-        }
+    private func addSettingsItem() {
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettingsAction), keyEquivalent: ",")
+        settings.target = self
+        menu.addItem(settings)
     }
 
     private func updateToggleTitle(running: Bool) {
         if let toggle = menu.item(withTag: 1) {
             toggle.title = running ? "Stop listening" : "Start listening"
         }
+    }
+
+    /// The user may have changed a permission in System Settings while the app
+    /// was in the background, so check again each time the menu opens.
+    func menuWillOpen(_ menu: NSMenu) {
+        Task { await coordinator.permissions.refresh() }
+    }
+
+    @objc private func openSetupAction() {
+        openSetup()
     }
 
     @objc private func toggleListening() {

@@ -1,0 +1,221 @@
+# Whisper Pilot: stabilization audit and handoff
+
+Written 2026-09-18 by a Claude Code session for a **fresh session with no prior context**.
+Read this file top to bottom before touching code. Everything you need to start is here.
+
+## 0. What the owner wants
+
+The owner (Everton, speaks Portuguese; reply to them in Portuguese, write code, comments and UI strings in English) wants **no new features for now**. The goal is to stabilize and improve what already exists so users can **trust** the app. Trust means: it does what it says, it never surprises the user with dialogs or lost data, and its privacy claims are true.
+
+Rules of engagement:
+
+- **Scope: fixes, stability, performance, clearer errors, honest copy.** No new features.
+- **Already declined by the owner, do not re-propose:** Ollama provider, Developer ID signing + Sparkle auto-update, rolling live summary, cost dashboard, CI work. (Signing was discussed again only because they asked how to avoid Keychain prompts; they have not chosen it.)
+- Be strict. If you find another problem on the way, fix it or add it to section 5.
+- Git: conventional commits `type: short description`, single line. **Do not commit or push unless the owner asks.** Never run `jj` (a leftover `.jj` folder may exist; ignore it).
+- Code comments: only when the *why* is non-obvious. Plain English. Never put ticket IDs in code.
+- Do not run experiments that can raise macOS dialogs (Keychain, TCC) on the owner's Mac without asking first. A previous session did and cost the owner 4 extra password prompts.
+- Human-facing text (PR bodies, messages) should be short and conversational, no formal scaffolding.
+
+## 1. Orientation
+
+Whisper Pilot is a macOS 14+ menu-bar (accessory, `LSUIElement`) app. It captures system audio (Core Audio Process Tap, ScreenCaptureKit fallback) and the microphone, transcribes on-device (Parakeet via FluidAudio for English, Apple SpeechAnalyzer/SFSpeech otherwise), shows a floating overlay, and lets the user ask Gemini or Claude about the conversation with their own API key. Sessions are markdown folders under `~/Library/Application Support/<bundle id>/sessions/`.
+
+Read `docs/ARCHITECTURE.md` first (it was updated for onboarding and permissions). Other useful docs: `docs/CONFIGURATION.md`, `docs/SESSIONS.md`, `docs/RELEASE.md`, `plans/performance-safety-valve.md`.
+
+Key files (`Sources/WhisperPilot/`):
+
+| Area | Files |
+|---|---|
+| Orchestration (god object, ~2,700 lines) | `App/AppCoordinator.swift` |
+| App entry, windows, onboarding launch | `App/AppDelegate.swift` (excluded from the SwiftPM target, see below) |
+| Permissions | `Permissions/PermissionsManager.swift` |
+| Onboarding | `Onboarding/OnboardingView.swift`, `OnboardingEligibility.swift`, `OnboardingWindowController.swift` |
+| Settings, secrets | `Settings/SettingsStore.swift`, `KeychainHelper.swift`, `KeychainAccess.swift`, `SettingsView.swift` |
+| AI | `AI/GeminiProvider.swift`, `AnthropicProvider.swift`, `PromptBuilder.swift` |
+| Audio capture | `Audio/ProcessAudioCapture.swift`, `SystemAudioCapture.swift`, `MicrophoneCapture.swift` |
+| Transcription | `Transcription/ParakeetTranscriber.swift`, `SpeechAnalyzerTranscriber.swift`, `AppleSpeechTranscriber.swift` |
+| Persistence | `Persistence/SessionStore.swift` (actor) |
+| Diagnostics | `Diagnostics/CrashLogger.swift` (writes `runtime.log`) |
+| Menu bar | `MenuBar/MenuBarController.swift` |
+
+### Build and test
+
+```bash
+swift build                      # library + smoke runner. Does NOT compile App/AppDelegate.swift or WhisperPilotApp.swift
+swift run SmokeTests             # custom runner (no XCTest available). Currently 288/288 assertions pass
+xcodegen generate                # regenerates WhisperPilot.xcodeproj (gitignored) from Project.yml
+xcodebuild -project WhisperPilot.xcodeproj -scheme WhisperPilot -configuration Debug \
+  -derivedDataPath /tmp/wp-dd PRODUCT_BUNDLE_IDENTIFIER=com.whisperpilot.app.dev build
+```
+
+Always run the `xcodebuild` line after touching `AppDelegate.swift`, because `swift build` does not compile it. Re-run `xcodegen generate` after adding or removing source files. A pre-push hook (`.githooks/pre-push`) runs `swift run SmokeTests`.
+
+### Testing the real app without polluting the installed one
+
+The owner has a released copy in `/Applications/WhisperPilot.app` with the same bundle id `com.whisperpilot.app`. Two apps with one bundle id get mixed up by macOS ("Quit & Reopen" can relaunch the installed one). Build the test copy with the `.dev` bundle id (command above), then:
+
+```bash
+pkill WhisperPilot
+tccutil reset All com.whisperpilot.app.dev      # only affects the .dev copy
+open /tmp/wp-dd/Build/Products/Debug/WhisperPilot.app
+ps -axo pid,command | grep '[W]hisperPilot'    # confirm which copy is running
+```
+
+Note the Keychain service name is hard-coded (`com.whisperpilot.app`), so both copies share the same stored API keys.
+
+## 2. Repo state you inherit
+
+`git status` shows **17 uncommitted entries** (nothing from this work is committed). Two people's work is mixed in there:
+
+1. A Codex session added a first-run onboarding (`Sources/WhisperPilot/Onboarding/`, edits in `AppDelegate`, `PermissionsManager`, `SettingsStore`, `SmokeTestRunner`, `ARCHITECTURE.md`).
+2. A Claude session then reviewed and reworked it. What that session changed:
+   - **All macOS permissions are requested in onboarding only** (Microphone, Speech Recognition, system audio, Screen Recording (optional), Keychain). Play, Settings, Sessions and the overlay never open a system dialog. A missing permission shows an overlay banner with an "Open Setup" button, and `Settings → Capture → Permissions & setup…` reopens onboarding.
+   - **Keychain:** the two API-key items were merged into one item (`api_keys`, JSON) so macOS asks for approval once per item instead of once per key. Old per-vendor items are migrated on first unlock and **left in place** (not deleted, to avoid another prompt). Reading the secret happens only in `SettingsStore.unlockStoredKeys()` (onboarding or the "Allow Keychain access" button) and at launch only for a build the user already approved (`KeychainHelper.buildIdentity` = code-signature hash, stored in `keychain.approvedBuild`). Everything else reads an in-memory cache.
+   - Onboarding rewrite: 5 permission rows each with a reason, "Allow all", "Skip for now", specific error messages, window returns to front after each macOS dialog, resumes at the right step after a relaunch, shows the AI-key step whenever no key exists.
+   - Menu bar shows only "Finish setup…", Settings, About, Quit while a required permission is missing.
+   - `Info.plist` and `Project.yml` gained `NSAudioCaptureUsageDescription`.
+   - Tests: the onboarding eligibility suite now has 15+ assertions.
+
+`swift build`, `swift run SmokeTests` (288/288) and the full `xcodebuild` all pass. **None of the GUI behavior was run by the author of that work** (no display session was driven). See section 4 for the manual QA list. Treat those flows as unverified.
+
+Recommended first action for you: ask the owner whether to commit this work as-is (suggested split: permissions/onboarding, keychain bundle, menu bar) before starting new changes on top, so your fixes are reviewable separately.
+
+## 3. Findings, prioritized
+
+Each item: **what**, **where**, **why it matters**, **suggested fix**, **verification**. Items marked 🔧 need real hardware or a real macOS dialog to verify; do not claim them fixed from a passing build alone.
+
+### P0. Trust, privacy, data loss
+
+**P0-1. The legacy speech path can send audio to Apple's servers, contradicting our privacy claims.** 🔧
+- Where: `Transcription/AppleSpeechTranscriber.swift:209` sets `request.requiresOnDeviceRecognition = false` (the comment above it says Apple's servers are used when the on-device model is unavailable).
+- When it runs: non-English locales on macOS < 26, or English when Parakeet and SpeechAnalyzer both fail (see P0-3).
+- Contradicts: `README.md:106` ("Audio never leaves your device"), `NSSpeechRecognitionUsageDescription` in `Project.yml` and `Resources/Info.plist` ("on-device"), and **the onboarding copy** in `OnboardingView.swift` (`reason(of:)` for Microphone and Speech Recognition says audio is processed on this Mac).
+- Fix, in order of preference: (a) set `requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition` and, when on-device is not supported for the chosen locale, stop with a clear message ("Your language needs Apple's servers. Whisper Pilot won't send audio unless you allow it") instead of silently using the network; (b) if the owner decides to keep the server fallback, make it opt-in and state it in the README and onboarding. The existing comment warns that forcing `true` when the model is not ready produces silent no-output, so check `supportsOnDeviceRecognition` first and surface the failure.
+- Until fixed, soften the onboarding and README wording so it stays true.
+
+**P0-2. Meeting text is written to `runtime.log`, and the README tells users to share that log.**
+- Where: `AppleSpeechTranscriber.swift:376,404,538,577`, `ParakeetTranscriber.swift:220,320`, `SpeechAnalyzerTranscriber.swift:392,418` log final/first transcript text (`FINAL: "…"`). `CrashLogger` mirrors every `wpInfo/wpWarn/wpError` line to `~/Library/Application Support/<bundle id>/runtime.log`. `README.md:80` points users at that file and asks for log excerpts in issues; the app also re-shows the last ~20 lines after an unclean shutdown.
+- Fix: log segment ids, lengths and timing, never text. If content logging is useful for development, gate it behind an explicit debug setting that is off by default. Also `SessionStore.swift:136` logs the session folder path publicly; the folder name contains the user's session title.
+- Verify: run a short session, then `grep -c` the log for words you spoke.
+
+**P0-3. Silent downgrade from Parakeet to Apple engines.** 🔧
+- Where: `AppCoordinator.swift:1712` (`Parakeet start failed … falling back`) only writes to the log. Typical cause: first run offline, the ~600 MB model download fails.
+- Why: the user gets a different (lower accuracy, and per P0-1 possibly server-based) engine with no notice.
+- Fix: post a system note saying which engine is active and why, with the actionable reason ("Couldn't download the speech model: offline. Using Apple's engine for now").
+
+**P0-4. Transcript persistence failures are silent.**
+- Where: `Persistence/SessionStore.swift:481` `appendToFile` catches and only logs; the callers (`AppCoordinator.queueTranscriptPersistence`, `persistPendingTranscriptLine`) never learn about it.
+- Why: disk full, permission changes or a removed folder mean the overlay looks healthy while `transcript.md` stops growing. That is silent data loss in the app's core promise.
+- Fix: return success/failure, count consecutive failures, and show a persistent banner ("Can't save this transcript: <reason>. Your session is not being saved"). Consider a free-space check before starting a session (`volumeAvailableCapacityForImportantUsage`).
+- Verify with a read-only session folder or a tiny disk image.
+
+**P0-5. Partial AI answers are lost from `chat.md` on error or cancel.**
+- Where: `AppCoordinator.runCompletion` (~line 2387). The assistant text is persisted only on the success path; on `CancellationError` or a thrown error the bubble stays in the overlay (with whatever streamed) but nothing reaches `chat.md`.
+- Fix: persist the partial text with a marker (for example "(incomplete)") on those paths so resumed sessions match what the user saw.
+
+### P1. Reliability and error quality
+
+**P1-1. No retry or backoff for transient AI failures.**
+- Where: `GeminiProvider.swift`, `AnthropicProvider.swift` use `URLSession.shared`, one attempt, `timeoutInterval = 60`. Only a Gemini 404 triggers the model-fallback chain (`AppCoordinator.swift:~2550 migrateToFallbackModel`).
+- Fix: one bounded retry with jitter for 429/5xx/connection-lost **only before the first delta arrives**; honor `Retry-After`; consider `waitsForConnectivity`. Deduplicate repeated identical error notes when auto-triggered questions fail in a row.
+
+**P1-2. Error messages recommend a retired model.**
+- Where: `GeminiProvider.swift:303` suggests `gemini-2.0-flash-lite`, `:309` suggests `gemini-2.0-flash`, while `SettingsView.swift:235` says `gemini-2.0-flash` was retired for new keys. Check the names against `AI/AIModel.swift` (`AIModelRegistry`) and make messages refer to models that actually exist there.
+- Also: 400 responses put the raw response body in the message; trim it.
+
+**P1-3. Stream decode errors are swallowed.**
+- Where: `GeminiProvider.stream` (`if let chunk = try? JSONDecoder().decode(...)`), and the same pattern in `AnthropicProvider`. If the API schema shifts, the result is an empty reply that ends "without a finish reason", which downstream reads as a network drop.
+- Fix: log the first decode failure per stream (without content) and, when zero deltas were decoded, report "unexpected response format".
+
+**P1-4. No App Nap protection while listening.** 🔧
+- `grep beginActivity` finds nothing. The app is `LSUIElement`, often fully covered by other windows during a call. Timers, watchdogs and network tasks may be throttled in long meetings.
+- Fix to evaluate: `ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: …)` between start and stop of listening (avoid `idleSystemSleepDisabled` unless the owner wants it). Verify with a 30-60 minute session in the background.
+
+**P1-5. No sleep/wake handling.** 🔧
+- No `NSWorkspace.willSleepNotification` / `didWakeNotification` observers. Device-change rebuilds and SCStream restarts exist, but the lid-close/wake path is untested.
+- Fix: on wake, if listening, verify frames resume within a few seconds and otherwise restart capture, telling the user. Manually test: start listening, close the lid for a minute, reopen.
+
+**P1-6. Shortcut registration failure is invisible.**
+- Where: `Shortcuts/GlobalHotKey.swift:57` logs and returns nil. A user who records a combo already used by another app gets a shortcut that silently does nothing.
+- Fix: surface the failure inline in Settings → Shortcuts.
+
+**P1-7. Launching an already-running app does nothing visible.**
+- No `applicationShouldHandleReopen(_:hasVisibleWindows:)` in `AppDelegate`. For an accessory app, clicking it in Finder/Spotlight, or macOS "Quit & Reopen" landing on a live process, shows nothing, which reads as "the app didn't open".
+- Fix: bring Onboarding (if setup is needed) or Sessions to the front.
+
+**P1-8. No single-instance guard.**
+- Two copies with one bundle id share `UserDefaults`, `runtime.log`, the `clean-shutdown` sentinel and the Keychain item, which produces false "did not shut down cleanly" warnings and confusing state. This already confused the owner while testing.
+- Fix: at launch, if another running instance of the same bundle id exists, activate it and quit.
+
+**P1-9. Permission status is partly a guess.** 🔧
+- `PermissionsManager.requestSystemAudio` (line 141) opens a Process Tap for 2 seconds and then records "granted" regardless of what the user clicked, because macOS has no API to read the system-audio permission. The onboarding row shows a "System Settings" hint for that reason.
+- Screen Recording (line 165): after the user enables it, macOS asks to quit and reopen; the resume logic (`OnboardingEligibility.startPoint`) exists but was never run end to end.
+- Suggested hardening (not a new feature): at the end of onboarding, or on the first Play, validate that frames with non-zero level actually arrive (the diagnostics "System Audio Test" in `AppCoordinator.runSystemAudioTest` already does the measurement) and, if silent, tell the user exactly which permission to check.
+
+**P1-10. Keychain follow-ups.** 🔧
+- Ad-hoc signing means every release has a new signature, so macOS re-asks for Keychain approval once per release (README:70 already explains this for Microphone/Screen Recording but does not mention the Keychain). Update the README and the update-button tooltip (`UpdateChecker.swift`, `.help(...)`).
+- The migrated legacy items (`gemini.api_key`, `anthropic.api_key` under service `com.whisperpilot.app`) remain in the Keychain. Decide with the owner how to clean them without triggering another prompt (for example a one-line note in the README on deleting them in Keychain Access).
+- Not verified: whether one item produces exactly one macOS dialog. The previous behavior was 3-4 password prompts for 2 items.
+- `SettingsStore.init` reads the secrets synchronously on the main thread at launch for an approved build (`restoreKeychainAccess`). If the user later revoked the approval this blocks launch behind a dialog. Consider moving it off the main thread.
+- `SettingsStore.hasGeminiAPIKey`/`availableVendors` are evaluated from SwiftUI bodies and can call `KeychainHelper.exists` (attribute queries) up to 3 times per evaluation until migration completes. Cache the answer.
+- The Settings "Allow Keychain access" button (`SettingsView.swift:262`) has no in-flight guard, so repeated clicks can stack dialogs.
+
+**P1-11. Duplicate notes when Answer Screen is used before Screen Recording was requested.**
+- `AppCoordinator.captureScreenJPEG` now posts a "needs Screen Recording, open Setup" note and returns nil, then the callers (`sendUserPrompt`, `answerScreen`) add their own generic "Couldn't capture screen" note. Keep one message.
+
+### P2. Performance and maintainability
+
+**P2-1. Session list re-reads every transcript.**
+- `SessionStore.listSessions` (line 73) calls `countTranscriptLines` and `countChatTurns` (lines 504, 511), each reading whole files, for every session on every refresh. Cost grows with total history.
+- Fix: store the counts in `metadata.json` and update incrementally, or count lazily/asynchronously.
+
+**P2-2. `runtime.log` only trims at launch** (`CrashLogger.start`, trims >1 MB to the last 256 KB). A long session in one run can grow it without bound. Add size-based rotation while running.
+
+**P2-3. Swift 6 concurrency warnings.** `NSLock.lock()/unlock()` used from async contexts (`AppleSpeechTranscriber.swift:22,49,52`, Parakeet mutexes, `SmokeTestRunner.swift:1440`). Warnings today, errors in Swift 6 language mode. Move to `OSAllocatedUnfairLock.withLock` or an actor.
+
+**P2-4. Deprecated `NSApp.activate(ignoringOtherApps:)`** (6 call sites). Works today; plan the replacement.
+
+**P2-5. Reproducible builds.** `Package.swift` and `Project.yml:14` use `from: 0.15.5` for FluidAudio. For a 0.x package SwiftPM's `from` still accepts later minor versions, and `Package.resolved` is gitignored, so two release builds can pick different FluidAudio versions (the comment says "pinned by minor version", which is not what it does). Use `.upToNextMinor(from:)` / `exact:` and consider committing `Package.resolved`.
+
+**P2-6. Release script does not run tests.** `bin/release` never invokes `swift run SmokeTests` (only the pre-push hook does). Add it as a gate inside the script (this is not CI work).
+
+**P2-7. Size of a few files.** `AppCoordinator.swift` (2,732 lines, ~60 functions, ~33 `Task {` blocks) and `Overlay/OverlayView.swift` (1,714 lines) are hard to reason about. Only split with tests around the seams; not urgent.
+
+**P2-8. Deferred from the July 2026 sweep (need live hardware, behavior-changing).** Do not do these without the owner and a device: replace the fixed 5× system-audio gain with AGC; share one Parakeet encoder across channels; flip `CATapDescription.isPrivate` to true on the process tap; move the transcript consumer off the main actor and fix the `MarkdownMessageView` O(n²) re-parse.
+
+### P3. Test gaps
+
+The smoke runner (`Tools/SmokeTests/SmokeTestRunner.swift`, 28 suites, one 1.8k-line file) covers parsing, buffers, session store, translation queue and onboarding eligibility. It does **not** cover:
+
+- Gemini/Anthropic SSE parsing, finish reasons, mid-stream error events, `promptBlocked` (stub `URLProtocol`, no network needed).
+- Keychain flows: `SettingsStore` unlock/migration/save/remove and the `KeychainAccess` state machine. `KeychainHelper` is a static enum; put it behind a small protocol so tests can inject a fake.
+- `PermissionsManager` status mapping, `MenuBarController` rebuild logic, `AppDelegate.showInitialWindow`.
+- The new `SettingsStore` migration is only compile-checked.
+
+## 4. Manual QA checklist for the onboarding and permissions work (not yet run)
+
+Use the `.dev` build and reset recipe in section 1. Tick each one on a real Mac.
+
+1. Fresh state: onboarding opens by itself, welcome → Access → Answer.
+2. "Allow all" asks Microphone, Speech Recognition, system audio, Screen Recording, Keychain in one go, and the onboarding window is in front again after each dialog and at the end.
+3. Screen Recording: after enabling it in System Settings and choosing Quit & Reopen, the **correct copy** reopens (check with `ps`) and onboarding resumes at the right step with nothing repeated.
+4. Deny each permission once: the red message and the "Open Settings" button appear, the row recovers after enabling it in System Settings and returning to the app.
+5. Keychain with two legacy items present: at most the migration approvals happen, once. Rebuild the app (new signature) and open it: exactly one approval prompt. Then open Settings, Sessions, the overlay and press Play: **no** prompt.
+6. With no API key: the Answer step appears even when every permission is already granted. "Set up later" leaves Settings reachable and the app works transcription-only.
+7. Close the onboarding window with the X on first run: Sessions opens, and the window does not reappear until the next build.
+8. Menu bar: while something required is missing it shows only Finish setup / Settings / About / Quit; after granting, the full menu returns without relaunching. Granting in System Settings while the app is in the background is reflected the next time the menu opens.
+9. Overlay banner "Open Setup" appears when Microphone or Speech Recognition is missing and Play is pressed; it clears after granting.
+10. Answer Screen before Screen Recording was ever requested: one clear message, no dialog.
+
+## 5. Suggested order of work
+
+1. Ask the owner about committing the current work (section 2), then run the QA list (section 4) and fix what breaks.
+2. Trust fixes: P0-1, P0-2, P0-3 (they share files), then P0-4, P0-5.
+3. Cheap reliability wins: P1-2, P1-3, P1-6, P1-7, P1-8, P1-11.
+4. Provider retry (P1-1) with tests from P3.
+5. Hardware-dependent items: P1-4, P1-5, P1-9, P1-10 (verify each on a real device).
+6. Performance and hygiene: P2-1, P2-2, P2-5, P2-6, then P2-3/P2-4.
+7. Update `README.md` (privacy claims, TCC and Keychain explanation) and `docs/ARCHITECTURE.md` when behavior changes.
+
+Keep each fix small and separately committable (when the owner asks). Add a test for every pure-logic fix. Re-run `swift run SmokeTests` and the `xcodebuild` line before saying anything is done, and say plainly which items you could not verify without hardware.

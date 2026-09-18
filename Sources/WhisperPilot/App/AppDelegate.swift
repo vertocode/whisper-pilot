@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sessionsWindow: SessionsWindowController?
     private var sessionsViewModel: SessionsViewModel?
     private var settingsWindow: NSWindow?
+    private var onboardingWindow: OnboardingWindowController?
     /// Global shortcut for "toggle overlay visibility". Held here so it lives as
     /// long as the app does; reassigned whenever the user picks a different
     /// combo in Settings.
@@ -55,6 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openScreenRecordingPrivacy: { [weak self] in
                 print("[WP] action.openScreenRecordingPrivacy fired")
                 self?.coordinator.permissions.openScreenRecordingSettings()
+            },
+            openSetup: { [weak self] in
+                print("[WP] action.openSetup fired")
+                self?.showOnboarding(start: .permissions)
             },
             toggleAIPaused: { [weak self] in
                 print("[WP] action.toggleAIPaused fired")
@@ -147,18 +152,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let sessions = SessionsWindowController(viewModel: vm, globalContext: coordinator.globalContext)
         sessionsWindow = sessions
-        sessions.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        sessions.window?.makeKeyAndOrderFront(nil)
 
         menuBar = MenuBarController(
             coordinator: coordinator,
             overlay: overlay,
             openSettings: { [weak self] in self?.showSettings() },
-            openSessions: { [weak self] in self?.showSessionsWindow() }
+            openSessions: { [weak self] in self?.showSessionsWindow() },
+            openSetup: { [weak self] in self?.showOnboarding(start: .permissions) },
+            needsSetup: { [weak self] in !(self?.missingSetupItems().isEmpty ?? true) }
         )
 
-        Task { await coordinator.bootstrap() }
+        coordinator.requestSetup = { [weak self] in
+            self?.showOnboarding(start: .permissions)
+        }
+
+        Task {
+            await coordinator.bootstrap()
+            showInitialWindow()
+        }
     }
 
     /// Resolve an inline-button action posted from a system note. Today there's
@@ -240,6 +251,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // next ▶.
                 onTranslationConfigurationChanged: { [weak coordinator] in
                     coordinator?.translationSettingsChanged()
+                },
+                onOpenSetup: { [weak self] in
+                    self?.showOnboarding(start: .permissions)
                 }
             ))
             settingsWindow = window
@@ -256,6 +270,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             sessionsWindow?.window?.makeKeyAndOrderFront(nil)
         }
+    }
+
+    private func showInitialWindow() {
+        let settings = coordinator.settings
+        let missing = missingSetupItems()
+        let hasAIKey = !settings.availableVendors.isEmpty
+        let shouldShowOnboarding = OnboardingEligibility.shouldPresent(
+            completedVersion: settings.onboardingCompletedVersion,
+            currentVersion: SettingsStore.currentOnboardingVersion,
+            deferredForThisBuild: settings.isSetupDeferredForThisBuild,
+            missing: missing,
+            hasAIKey: hasAIKey
+        )
+
+        if shouldShowOnboarding {
+            showOnboarding(start: OnboardingEligibility.startPoint(
+                completedVersion: settings.onboardingCompletedVersion,
+                missing: missing,
+                permissions: coordinator.permissions.snapshot
+            ))
+        } else {
+            if missing.isEmpty, hasAIKey, settings.onboardingCompletedVersion < SettingsStore.currentOnboardingVersion {
+                settings.completeOnboarding()
+            }
+            showSessionsWindow()
+        }
+    }
+
+    private func missingSetupItems() -> [SetupItem] {
+        let settings = coordinator.settings
+        return OnboardingEligibility.missing(
+            captureMicrophone: settings.captureMicrophone,
+            requiresScreenRecording: settings.forceScreenCaptureKitForSystemAudio || !PermissionsManager.processTapSupported,
+            processTapSupported: PermissionsManager.processTapSupported,
+            permissions: coordinator.permissions.snapshot,
+            keychain: settings.keychainAccess
+        )
+    }
+
+    /// Opens (or brings forward) the one place where every permission is
+    /// requested. Also reachable from Settings and from overlay banners.
+    func showOnboarding(start: OnboardingStart) {
+        if let existing = onboardingWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = OnboardingWindowController(
+            rootView: OnboardingView(
+                permissions: coordinator.permissions,
+                settings: coordinator.settings,
+                start: start,
+                bringToFront: { [weak self] in
+                    // macOS hands focus back to the previous app a moment after
+                    // its dialog closes, so ask again shortly after as well.
+                    for delay in [0.0, 0.3, 1.0] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            guard let window = self?.onboardingWindow?.window else { return }
+                            NSApp.activate(ignoringOtherApps: true)
+                            window.makeKeyAndOrderFront(nil)
+                            window.orderFrontRegardless()
+                        }
+                    }
+                },
+                onFinish: { [weak self] in
+                    self?.finishOnboarding()
+                }
+            )
+        )
+        // The close button counts as "later": remember it for this build so the
+        // window doesn't come straight back, and never leave the app with no window.
+        controller.onClose = { [weak self] in
+            guard let self else { return }
+            let settings = self.coordinator.settings
+            if !self.missingSetupItems().isEmpty || settings.onboardingCompletedVersion < SettingsStore.currentOnboardingVersion {
+                settings.deferSetupForThisBuild()
+            }
+            self.onboardingWindow = nil
+            self.showSessionsUnlessSessionIsOpen()
+        }
+        onboardingWindow = controller
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Onboarding can be reopened mid-session from an overlay banner; the
+    /// Sessions window should not pop over the session the user is in.
+    private func showSessionsUnlessSessionIsOpen() {
+        guard overlay?.window?.isVisible != true else { return }
+        showSessionsWindow()
+    }
+
+    private func finishOnboarding() {
+        coordinator.settings.completeOnboarding()
+        onboardingWindow?.onClose = nil
+        onboardingWindow?.close()
+        onboardingWindow = nil
+        showSessionsUnlessSessionIsOpen()
     }
 
     /// Read-only export: copies the active session's `transcript.md` to a user-chosen

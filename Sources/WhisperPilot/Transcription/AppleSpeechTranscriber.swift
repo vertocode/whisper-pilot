@@ -88,24 +88,13 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
         continuation.finish()
     }
 
+    /// Never asks macOS: Speech Recognition is requested once, in onboarding.
     private func ensureAuthorization() async throws {
         let status = SFSpeechRecognizer.authorizationStatus()
         log.info("SFSpeechRecognizer current authorization status: \(status.rawValue, privacy: .public)")
         if status == .authorized { return }
-        if status == .denied || status == .restricted {
-            log.error("Speech recognition denied/restricted; user must enable in System Settings")
-            throw TranscriberError.notAuthorized
-        }
-        log.info("Requesting speech recognition authorization…")
-        let granted: Bool = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status == .authorized)
-            }
-        }
-        if !granted {
-            log.error("User denied speech recognition authorization")
-            throw TranscriberError.notAuthorized
-        }
+        log.error("Speech recognition not authorized (status \(status.rawValue, privacy: .public)); user must allow it in Setup or System Settings")
+        throw TranscriberError.notAuthorized
     }
 }
 
@@ -773,7 +762,7 @@ enum TranscriberError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notAuthorized: return "Speech recognition is not authorized."
+        case .notAuthorized: return "Speech Recognition is not allowed. Open Setup from the overlay, or turn on Whisper Pilot in System Settings → Privacy & Security → Speech Recognition."
         case .unavailable(let id): return "Speech recognition is unavailable for \(id)."
         }
     }
