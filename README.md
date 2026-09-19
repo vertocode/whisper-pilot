@@ -46,6 +46,8 @@ Update with `brew upgrade --cask whisper-pilot`. Uninstall with `brew uninstall 
 
 Grab the latest `.dmg` from the [Releases page](https://github.com/vertocode/whisper-pilot/releases) and drag `WhisperPilot.app` into `/Applications`.
 
+If an older Whisper Pilot is still somewhere else on your Mac (for example in Downloads), the newer one asks once whether to move the old one to the Trash. It never removes anything without your click.
+
 ### Allow the app through Gatekeeper
 
 Because Whisper Pilot isn't signed with an Apple Developer ID yet, the first launch (whether installed via Homebrew or the `.dmg`) shows a dialog like *"WhisperPilot can't be opened because Apple cannot check it for malicious software."* This is expected.
