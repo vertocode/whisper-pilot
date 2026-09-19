@@ -133,7 +133,7 @@ actor SessionStore {
             atomically: true,
             encoding: .utf8
         )
-        log.info("Created session at \(folder.path, privacy: .public)")
+        log.info("Created session at \(folder.path, privacy: .private)")
         return meta
     }
 

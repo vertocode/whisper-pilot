@@ -3,7 +3,7 @@ import Foundation
 import OSLog
 import Speech
 
-/// Streaming transcription using Apple's `SFSpeechRecognizer` configured for on-device recognition.
+/// Streaming transcription using Apple's `SFSpeechRecognizer`, always on-device.
 /// Two recognizers run in parallel — one per channel — so segments stay attributed to system vs. mic.
 final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked Sendable {
     let transcripts: AsyncStream<TranscriptUpdate>
@@ -187,13 +187,17 @@ private final class ChannelPipe {
             wpError("Transcriber.\(channel): SFSpeechRecognizer not currently available for \(locale.identifier)")
             throw TranscriberError.unavailable(locale.identifier)
         }
+        guard recognizer.supportsOnDeviceRecognition else {
+            wpError("Transcriber.\(channel): no on-device model for \(locale.identifier); refusing to use Apple's servers")
+            throw TranscriberError.onDeviceUnavailable(locale.identifier)
+        }
         self.channel = channel
         self.recognizer = recognizer
         self.sink = sink
         self.log = log
         self.autoRestart = autoRestart
         self.request = Self.makeRequest()
-        wpInfo("Transcriber.\(channel) ready (locale=\(locale.identifier), onDeviceSupported=\(recognizer.supportsOnDeviceRecognition), requiresOnDevice=false, autoRestart=\(autoRestart))")
+        wpInfo("Transcriber.\(channel) ready (locale=\(locale.identifier), onDeviceSupported=\(recognizer.supportsOnDeviceRecognition), requiresOnDevice=true, autoRestart=\(autoRestart))")
         startTask()
     }
 
@@ -202,11 +206,9 @@ private final class ChannelPipe {
     private static func makeRequest() -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Permissive: prefer on-device, but allow server fallback. Setting this to `true`
-        // when the locale's on-device model isn't fully ready causes the task to silently
-        // produce no output — exactly the symptom we kept hitting. Always-false here means
-        // recognition will use on-device when available, and Apple's servers when not.
-        request.requiresOnDeviceRecognition = false
+        // Audio must never leave this Mac. `init` already refuses locales without an
+        // on-device model, so this cannot stall silently waiting for a missing model.
+        request.requiresOnDeviceRecognition = true
         request.taskHint = .dictation
         // Punctuated finals read dramatically better and give the transcript
         // roll-up rule a "sentence is complete" signal to key on.
@@ -373,7 +375,7 @@ private final class ChannelPipe {
             timestamp: Date()
         )
         sink.yield(update)
-        wpInfo("Transcriber.\(ch) flushed synthetic FINAL: \"\(text)\"")
+        wpInfo("Transcriber.\(ch) flushed synthetic FINAL (\(text.count) chars)")
         return update
     }
 
@@ -401,7 +403,7 @@ private final class ChannelPipe {
                 channel: ch,
                 timestamp: Date()
             ))
-            wpInfo("Transcriber.\(ch) synthetic FINAL: \"\(text)\"")
+            wpInfo("Transcriber.\(ch) synthetic FINAL (\(text.count) chars)")
         }
     }
 
@@ -535,7 +537,7 @@ private final class ChannelPipe {
                     self.mutex.lock()
                     self.transcriptsEmitted += 1
                     self.mutex.unlock()
-                    wpInfo("Transcriber.\(channel) FINAL\(current ? "" : " (late)"): \"\(text)\"")
+                    wpInfo("Transcriber.\(channel) FINAL\(current ? "" : " (late)") (\(text.count) chars)")
                     if current { self.continueAfterFinalization() }
                     // Don't fall through to the error branch — see comment above.
                     return
@@ -574,7 +576,7 @@ private final class ChannelPipe {
                 let isFirstTranscript = self.transcriptsEmitted == 1
                 self.mutex.unlock()
                 if isFirstTranscript {
-                    wpInfo("Transcriber.\(channel) FIRST transcript: \"\(update.text)\" final=\(update.isFinal)")
+                    wpInfo("Transcriber.\(channel) FIRST transcript (\(update.text.count) chars) final=\(update.isFinal)")
                 }
             }
             if let error {
@@ -759,11 +761,13 @@ enum ReplayOverlapTrimmer {
 enum TranscriberError: LocalizedError {
     case notAuthorized
     case unavailable(String)
+    case onDeviceUnavailable(String)
 
     var errorDescription: String? {
         switch self {
         case .notAuthorized: return "Speech Recognition is not allowed. Open Setup from the overlay, or turn on Whisper Pilot in System Settings → Privacy & Security → Speech Recognition."
         case .unavailable(let id): return "Speech recognition is unavailable for \(id)."
+        case .onDeviceUnavailable(let id): return "Apple's on-device speech model isn't available for \(id), and Whisper Pilot never sends audio to Apple's servers. Pick another language in Settings, or add this language in System Settings → Keyboard → Dictation."
         }
     }
 }

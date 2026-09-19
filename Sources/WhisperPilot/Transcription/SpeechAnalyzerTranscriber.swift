@@ -389,7 +389,7 @@ private final class Pipe: @unchecked Sendable {
         sink.yield(update)
 
         if count == 1 {
-            wpInfo("SpeechAnalyzer.\(channel) FIRST result: \"\(text)\" final=\(isFinal)")
+            wpInfo("SpeechAnalyzer.\(channel) FIRST result (\(text.count) chars) final=\(isFinal)")
         }
     }
 
@@ -415,7 +415,7 @@ private final class Pipe: @unchecked Sendable {
             timestamp: Date()
         )
         sink.yield(update)
-        wpInfo("SpeechAnalyzer.\(channel) flushed synthetic FINAL: \"\(text)\"")
+        wpInfo("SpeechAnalyzer.\(channel) flushed synthetic FINAL (\(text.count) chars)")
         return update
     }
 }

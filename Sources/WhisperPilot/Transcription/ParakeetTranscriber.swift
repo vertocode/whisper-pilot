@@ -217,7 +217,7 @@ private final class Pipe: @unchecked Sendable {
             timestamp: Date()
         )
         sink.yield(update)
-        wpInfo("Parakeet.\(channel) flushed synthetic FINAL: \"\(pending.text)\"")
+        wpInfo("Parakeet.\(channel) flushed synthetic FINAL (\(pending.text.count) chars)")
         return update
     }
 
@@ -317,7 +317,7 @@ private final class Pipe: @unchecked Sendable {
             channel: channel,
             timestamp: Date()
         ))
-        wpInfo("Parakeet.\(channel) FINAL: \"\(final.text)\"")
+        wpInfo("Parakeet.\(channel) FINAL (\(final.text.count) chars)")
     }
 }
 
