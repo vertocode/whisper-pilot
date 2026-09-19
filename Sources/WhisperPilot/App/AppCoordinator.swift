@@ -2509,7 +2509,14 @@ final class AppCoordinator {
                 let message = error.localizedDescription
                 wpError("AI stream failed: \(message)")
                 self.overlayState.finishAssistant(id: messageId)
-                self.overlayState.appendSystemNote("⚠️ \(message)", category: .ai)
+                let note = "⚠️ \(message)"
+                // Auto-triggered questions can fail back to back for the same reason;
+                // one note is enough. Anything the user asked for always shows.
+                if origin == .detectedQuestion, RepeatedNote.isRepeat(note, in: self.overlayState.messages) {
+                    wpInfo("Skipped a repeated AI error note")
+                } else {
+                    self.overlayState.appendSystemNote(note, category: .ai)
+                }
                 await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID)
             }
             self.completionFinished(messageId: messageId)

@@ -21,7 +21,13 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
             let task = Task {
                 do {
                     self.log.info("Gemini stream request → model=\(self.model, privacy: .public), question=\"\(prompt.question, privacy: .private)\", style=\(prompt.style.rawValue, privacy: .public)")
-                    let reason = try await stream(prompt: prompt, continuation: continuation)
+                    let reason = try await AIRetryPolicy.withRetry(
+                        onRetry: { delay, error in
+                            self.log.info("Gemini request failed before any text (\(String(describing: error), privacy: .public)); retrying in \(delay, format: .fixed(precision: 1))s")
+                        }
+                    ) { attempt in
+                        try await stream(prompt: prompt, continuation: continuation, attempt: attempt)
+                    }
                     self.log.info("Gemini stream complete (reason=\(String(describing: reason), privacy: .public))")
                     continuation.yield(.finish(reason))
                     continuation.finish()
@@ -70,19 +76,24 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
     /// Returns the final `AIFinishReason` derived from the stream's last chunk.
     /// Yields `.delta(text)` for every chunk that carried text; the caller is
     /// responsible for yielding the final `.finish(reason)` after this returns.
-    private func stream(prompt: Prompt, continuation: AsyncThrowingStream<AIStreamEvent, Error>.Continuation) async throws -> AIFinishReason {
+    private func stream(
+        prompt: Prompt,
+        continuation: AsyncThrowingStream<AIStreamEvent, Error>.Continuation,
+        attempt: StreamAttempt
+    ) async throws -> AIFinishReason {
         let url = endpoint(streaming: true)
         let body = try encode(requestBody(for: prompt))
         let request = makeRequest(url: url, body: body)
 
         let (bytes, response) = try await session.bytes(for: request)
-        try await ensureSuccess(response: response, bytes: bytes)
+        try await ensureSuccess(response: response, bytes: bytes, attempt: attempt)
 
         // Track the most recent finishReason we saw across all chunks. Gemini
         // typically emits it only in the terminal chunk; if the stream ends
         // *without* one, leave this nil so the coordinator can flag "ended
         // without a finish reason" — usually a transport-level drop.
         var lastReason: String?
+        var decodeFailures = 0
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
@@ -90,22 +101,36 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
             if payload.isEmpty || payload == "[DONE]" { continue }
             guard let data = payload.data(using: .utf8) else { continue }
-            if let chunk = try? JSONDecoder().decode(GeminiResponse.self, from: data) {
-                if let blockReason = chunk.promptFeedback?.blockReason {
-                    // Input blocked: no candidates will ever arrive. Surface the
-                    // real cause instead of ending reason-less (which downstream
-                    // reads as "likely a network drop").
-                    throw GeminiError.promptBlocked(reason: blockReason)
+            let chunk: GeminiResponse
+            do {
+                chunk = try JSONDecoder().decode(GeminiResponse.self, from: data)
+            } catch {
+                decodeFailures += 1
+                if decodeFailures == 1 {
+                    log.error("Gemini stream: could not decode a chunk (\(data.count) bytes): \(String(describing: error), privacy: .public)")
                 }
-                if let text = chunk.firstText, !text.isEmpty {
-                    continuation.yield(.delta(text))
-                }
-                if let reason = chunk.firstFinishReason {
-                    lastReason = reason
-                }
+                continue
+            }
+            if let blockReason = chunk.promptFeedback?.blockReason {
+                // Input blocked: no candidates will ever arrive. Surface the
+                // real cause instead of ending reason-less (which downstream
+                // reads as "likely a network drop").
+                throw GeminiError.promptBlocked(reason: blockReason)
+            }
+            if let text = chunk.firstText, !text.isEmpty {
+                attempt.deltaCount += 1
+                continuation.yield(.delta(text))
+            }
+            if let reason = chunk.firstFinishReason {
+                lastReason = reason
             }
         }
 
+        // Nothing usable arrived and chunks did not parse: the API shape changed.
+        // Without this the empty reply looks like a dropped connection.
+        if attempt.deltaCount == 0, decodeFailures > 0 {
+            throw GeminiError.unexpectedFormat
+        }
         return Self.parseFinishReason(lastReason)
     }
 
@@ -186,9 +211,10 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
     /// On a non-2xx streaming response we need to drain the body before throwing so the
     /// user sees Gemini's actual error message (e.g. "model not found"). Without this we'd
     /// surface a bare "Gemini error 404" with no clue what went wrong.
-    private func ensureSuccess(response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
+    private func ensureSuccess(response: URLResponse, bytes: URLSession.AsyncBytes, attempt: StreamAttempt) async throws {
         guard let http = response as? HTTPURLResponse else { return }
         if !(200..<300).contains(http.statusCode) {
+            attempt.retryAfter = http.value(forHTTPHeaderField: "Retry-After")
             let buffer = (try? await bytes.reduce(into: Data(), { $0.append($1) })) ?? Data()
             let body = buffer.isEmpty ? nil : String(data: buffer, encoding: .utf8)
             throw GeminiError.http(status: http.statusCode, body: body)
@@ -288,9 +314,12 @@ private struct GeminiResponse: Decodable {
 enum GeminiError: LocalizedError {
     case http(status: Int, body: String?)
     case promptBlocked(reason: String)
+    case unexpectedFormat
 
     var errorDescription: String? {
         switch self {
+        case .unexpectedFormat:
+            return "Gemini sent a reply in a format Whisper Pilot doesn't understand. Try again; if it keeps happening, update the app."
         case .promptBlocked(let reason):
             return "Gemini blocked the request before generating (\(reason)). Usually a safety filter on the prompt content — rephrase the question or trim the attached context."
         case .http(let status, let body):
@@ -300,17 +329,17 @@ enum GeminiError: LocalizedError {
             case 429:
                 let detail = body.flatMap { extractMessage(from: $0) } ?? ""
                 let suffix = detail.isEmpty ? "" : " — \(detail)"
-                return "Gemini rate limit hit (HTTP 429). Free-tier quotas are tight; wait ~30s, switch to gemini-2.0-flash-lite in Settings, or add billing to your Google AI Studio key.\(suffix)"
+                return "Gemini rate limit hit (HTTP 429). Free-tier quotas are tight; wait ~30s, pick another Gemini model in Settings, or add billing to your Google AI Studio key.\(suffix)"
             case 400:
-                return "Gemini rejected the request (HTTP 400)\(body.map { ": \($0)" } ?? "")"
+                return "Gemini rejected the request (HTTP 400)\(AIErrorBody.summary(body).map { ": \($0)" } ?? "")"
             case 404:
                 let detail = body.flatMap { extractMessage(from: $0) } ?? ""
                 let suffix = detail.isEmpty ? "" : " — \(detail)"
-                return "Gemini model not found (HTTP 404). The selected model isn't available on this API key — pick a different model in Settings (e.g. gemini-2.5-flash or gemini-2.0-flash).\(suffix)"
+                return "Gemini model not found (HTTP 404). The selected model isn't available on this API key — pick a different model in Settings (for example gemini-2.5-flash).\(suffix)"
             case 500..<600:
                 return "Gemini server error (HTTP \(status)). Usually transient — retry in a moment."
             default:
-                if let body, !body.isEmpty { return "Gemini error \(status): \(body)" }
+                if let detail = AIErrorBody.summary(body) { return "Gemini error \(status): \(detail)" }
                 return "Gemini error \(status)"
             }
         }

@@ -35,7 +35,13 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
             let task = Task {
                 do {
                     self.log.info("Anthropic stream request → model=\(self.model, privacy: .public), question=\"\(prompt.question, privacy: .private)\", style=\(prompt.style.rawValue, privacy: .public)")
-                    let reason = try await stream(prompt: prompt, continuation: continuation)
+                    let reason = try await AIRetryPolicy.withRetry(
+                        onRetry: { delay, error in
+                            self.log.info("Anthropic request failed before any text (\(String(describing: error), privacy: .public)); retrying in \(delay, format: .fixed(precision: 1))s")
+                        }
+                    ) { attempt in
+                        try await stream(prompt: prompt, continuation: continuation, attempt: attempt)
+                    }
                     self.log.info("Anthropic stream complete (reason=\(String(describing: reason), privacy: .public))")
                     continuation.yield(.finish(reason))
                     continuation.finish()
@@ -83,13 +89,14 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
 
     private func stream(
         prompt: Prompt,
-        continuation: AsyncThrowingStream<AIStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<AIStreamEvent, Error>.Continuation,
+        attempt: StreamAttempt
     ) async throws -> AIFinishReason {
         let body = try encode(requestBody(for: prompt, stream: true))
         let request = makeRequest(body: body)
 
         let (bytes, response) = try await session.bytes(for: request)
-        try await ensureSuccess(response: response, bytes: bytes)
+        try await ensureSuccess(response: response, bytes: bytes, attempt: attempt)
 
         // Anthropic SSE uses named events. The line stream interleaves
         // `event: <name>` and `data: <json>` lines (plus blank separators).
@@ -98,6 +105,7 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         // carries the terminal `stop_reason` we need for `AIFinishReason`.
         var currentEvent: String?
         var stopReason: String?
+        var decodeFailures = 0
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
@@ -112,14 +120,21 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
 
             switch currentEvent {
             case "content_block_delta":
-                if let chunk = try? JSONDecoder().decode(AnthropicContentBlockDelta.self, from: data),
-                   let text = chunk.delta?.text, !text.isEmpty {
-                    continuation.yield(.delta(text))
+                do {
+                    let chunk = try JSONDecoder().decode(AnthropicContentBlockDelta.self, from: data)
+                    if let text = chunk.delta?.text, !text.isEmpty {
+                        attempt.deltaCount += 1
+                        continuation.yield(.delta(text))
+                    }
+                } catch {
+                    noteDecodeFailure(error, byteCount: data.count, total: &decodeFailures)
                 }
             case "message_delta":
-                if let chunk = try? JSONDecoder().decode(AnthropicMessageDelta.self, from: data),
-                   let reason = chunk.delta?.stop_reason {
-                    stopReason = reason
+                do {
+                    let chunk = try JSONDecoder().decode(AnthropicMessageDelta.self, from: data)
+                    if let reason = chunk.delta?.stop_reason { stopReason = reason }
+                } catch {
+                    noteDecodeFailure(error, byteCount: data.count, total: &decodeFailures)
                 }
             case "error":
                 // Mid-stream API errors (overloaded_error, api_error, …) arrive
@@ -136,7 +151,19 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
             }
         }
 
+        // Nothing usable arrived and events did not parse: the API shape changed.
+        // Without this the empty reply looks like a dropped connection.
+        if attempt.deltaCount == 0, decodeFailures > 0 {
+            throw AnthropicError.unexpectedFormat
+        }
         return Self.parseFinishReason(stopReason)
+    }
+
+    private func noteDecodeFailure(_ error: Error, byteCount: Int, total: inout Int) {
+        total += 1
+        if total == 1 {
+            log.error("Anthropic stream: could not decode an event (\(byteCount) bytes): \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Maps Anthropic's `stop_reason` string to our provider-agnostic enum.
@@ -211,9 +238,10 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         return try encoder.encode(value)
     }
 
-    private func ensureSuccess(response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
+    private func ensureSuccess(response: URLResponse, bytes: URLSession.AsyncBytes, attempt: StreamAttempt) async throws {
         guard let http = response as? HTTPURLResponse else { return }
         if !(200..<300).contains(http.statusCode) {
+            attempt.retryAfter = http.value(forHTTPHeaderField: "Retry-After")
             let buffer = (try? await bytes.reduce(into: Data(), { $0.append($1) })) ?? Data()
             let body = buffer.isEmpty ? nil : String(data: buffer, encoding: .utf8)
             throw AnthropicError.http(status: http.statusCode, body: body)
@@ -319,9 +347,12 @@ private struct AnthropicStreamErrorEvent: Decodable {
 enum AnthropicError: LocalizedError {
     case http(status: Int, body: String?)
     case stream(type: String?, message: String?)
+    case unexpectedFormat
 
     var errorDescription: String? {
         switch self {
+        case .unexpectedFormat:
+            return "Anthropic sent a reply in a format Whisper Pilot doesn't understand. Try again; if it keeps happening, update the app."
         case .stream(let type, let message):
             switch type {
             case "overloaded_error":
@@ -340,7 +371,7 @@ enum AnthropicError: LocalizedError {
                 let suffix = detail.isEmpty ? "" : " — \(detail)"
                 return "Anthropic rate limit hit (HTTP 429). Wait a moment, switch to a cheaper Claude model in Settings, or check your usage limits at console.anthropic.com.\(suffix)"
             case 400:
-                return "Anthropic rejected the request (HTTP 400)\(body.map { ": \($0)" } ?? "")"
+                return "Anthropic rejected the request (HTTP 400)\(AIErrorBody.summary(body).map { ": \($0)" } ?? "")"
             case 404:
                 let detail = body.flatMap { extractMessage(from: $0) } ?? ""
                 let suffix = detail.isEmpty ? "" : " — \(detail)"
@@ -348,7 +379,7 @@ enum AnthropicError: LocalizedError {
             case 500..<600:
                 return "Anthropic server error (HTTP \(status)). Usually transient — retry in a moment."
             default:
-                if let body, !body.isEmpty { return "Anthropic error \(status): \(body)" }
+                if let detail = AIErrorBody.summary(body) { return "Anthropic error \(status): \(detail)" }
                 return "Anthropic error \(status)"
             }
         }
