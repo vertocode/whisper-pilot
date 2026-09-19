@@ -193,6 +193,7 @@ actor SessionStore {
 
     // MARK: - Append (called from coordinator on every finalized event)
 
+    @discardableResult
     func appendTranscriptLine(
         channel: AudioChannel,
         text: String,
@@ -200,7 +201,7 @@ actor SessionStore {
         translationLanguage: String? = nil,
         at: Date,
         to id: SessionID
-    ) {
+    ) -> Result<Void, Error> {
         let speaker = channel == .system ? "Other" : "Me"
         let timestamp = Self.timeFormatter.string(from: at)
         var line = "**\(speaker)** [\(timestamp)] \(text)"
@@ -212,22 +213,25 @@ actor SessionStore {
             let tag = translationLanguage.map { "\($0) — " } ?? ""
             line += "\n> \(tag)\(translation)"
         }
-        appendToFile(line + "\n\n", at: sessionFolder(for: id).appendingPathComponent("transcript.md"))
+        let result = appendToFile(line + "\n\n", at: sessionFolder(for: id).appendingPathComponent("transcript.md"))
         touch(id)
+        return result
     }
 
+    @discardableResult
     func appendChatTurn(
         role: String,
         text: String,
         origin: ChatMessage.Origin? = nil,
         at: Date,
         to id: SessionID
-    ) {
+    ) -> Result<Void, Error> {
         let timestamp = Self.timeFormatter.string(from: at)
         let metadata = origin.map { "<!-- whisper-pilot:origin=\($0.rawValue) -->\n\n" } ?? ""
         let block = "## \(role) [\(timestamp)]\n\n\(metadata)\(text)\n"
-        appendToFile(block + "\n", at: sessionFolder(for: id).appendingPathComponent("chat.md"))
+        let result = appendToFile(block + "\n", at: sessionFolder(for: id).appendingPathComponent("chat.md"))
         touch(id)
+        return result
     }
 
     // MARK: - Load on resume
@@ -478,15 +482,16 @@ actor SessionStore {
         )
     }
 
-    private func appendToFile(_ text: String, at url: URL) {
+    private func appendToFile(_ text: String, at url: URL) -> Result<Void, Error> {
         let manager = FileManager.default
         if !manager.fileExists(atPath: url.path) {
             do {
                 try text.write(to: url, atomically: true, encoding: .utf8)
+                return .success(())
             } catch {
                 log.error("Create-and-append failed for \(url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
+                return .failure(error)
             }
-            return
         }
         do {
             let handle = try FileHandle(forWritingTo: url)
@@ -496,8 +501,10 @@ actor SessionStore {
                 try handle.write(contentsOf: data)
                 try handle.synchronize()
             }
+            return .success(())
         } catch {
             log.error("Append failed for \(url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
+            return .failure(error)
         }
     }
 

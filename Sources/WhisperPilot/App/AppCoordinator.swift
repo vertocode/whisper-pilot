@@ -149,6 +149,8 @@ final class AppCoordinator {
     /// it lets us avoid appending a duplicate on a stop+start cycle within the
     /// same session, and dismiss it the moment a key is set.
     private var transcriptionOnlyNoteID: UUID?
+    private var saveHealth = SaveHealth()
+    private var saveFailureNoteID: UUID?
     /// Per-channel scheduled "cycle the recognizer" tasks, used to debounce VAD boundary
     /// events. Mid-sentence pauses (~0.4 s) shouldn't split a transcript line — only
     /// genuine end-of-utterance pauses should. A pending task is cancelled when speech
@@ -1263,6 +1265,8 @@ final class AppCoordinator {
         transcriptionOnlyNoteID = nil
         noFramesWarningID = nil
         noTranscriptsWarningID = nil
+        saveHealth = SaveHealth()
+        saveFailureNoteID = nil
         slowStartupNoteID = nil
         stuckStartupNoteID = nil
         // The Tier-1 alert lives in the chat that `clearChat()` just wiped; drop
@@ -1651,13 +1655,43 @@ final class AppCoordinator {
         to sessionID: SessionID?
     ) async {
         guard let sessionID else { return }
-        await SessionStore.shared.appendChatTurn(
+        let result = await SessionStore.shared.appendChatTurn(
             role: role,
             text: text,
             origin: origin,
             at: Date(),
             to: sessionID
         )
+        recordSaveResult(result)
+    }
+
+    /// Saves what the user saw of an assistant reply, including a cut-off one.
+    private func persistAssistantReply(
+        messageId: UUID,
+        incomplete: Bool,
+        origin: ChatMessage.Origin,
+        sessionID: SessionID?
+    ) async {
+        guard let text = overlayState.messages.first(where: { $0.id == messageId })?.text,
+              let toSave = AssistantTurnText.persisted(text, incomplete: incomplete) else { return }
+        await persistChatTurn(role: "Assistant", text: toSave, origin: origin, to: sessionID)
+    }
+
+    /// Shows one persistent banner when writes to the session folder start
+    /// failing, and replaces it with a short note once they work again.
+    private func recordSaveResult(_ result: Result<Void, Error>) {
+        switch saveHealth.record(result) {
+        case .none:
+            break
+        case .started(let reason):
+            wpError("Session save failing: \(reason)")
+            saveFailureNoteID = overlayState.appendSystemNote(SaveHealth.bannerText(reason: reason), category: .general)
+        case .recovered:
+            wpInfo("Session save recovered")
+            if let id = saveFailureNoteID { overlayState.removeMessage(id: id) }
+            saveFailureNoteID = nil
+            overlayState.appendSystemNote(SaveHealth.recoveredText, category: .general)
+        }
     }
 
     /// Snapshots the recent assistant↔user chat as `[ChatTurn]` for prompt context. Drops
@@ -2437,17 +2471,15 @@ final class AppCoordinator {
                     self.overlayState.appendSystemNote("⚠️ AI reply was incomplete — \(diagnostic).", category: .ai)
                     wpWarn("AI stream finished with non-stop reason: \(diagnostic)")
                 }
-                if let finalText = self.overlayState.messages.first(where: { $0.id == messageId })?.text,
-                   !finalText.isEmpty {
-                    await self.persistChatTurn(
-                        role: "Assistant",
-                        text: finalText,
-                        origin: origin,
-                        to: sessionID
-                    )
-                }
+                await self.persistAssistantReply(
+                    messageId: messageId,
+                    incomplete: finishReason.diagnosticMessage != nil,
+                    origin: origin,
+                    sessionID: sessionID
+                )
             } catch is CancellationError {
                 self.overlayState.finishAssistant(id: messageId)
+                await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID)
             } catch {
                 // 404 means the selected model isn't reachable on this key — almost always
                 // because Google retired it for new users (e.g. `gemini-2.0-flash`). Try
@@ -2478,6 +2510,7 @@ final class AppCoordinator {
                 wpError("AI stream failed: \(message)")
                 self.overlayState.finishAssistant(id: messageId)
                 self.overlayState.appendSystemNote("⚠️ \(message)", category: .ai)
+                await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID)
             }
             self.completionFinished(messageId: messageId)
         }
@@ -2676,7 +2709,7 @@ final class AppCoordinator {
         let translation = translationQueue == nil
             ? nil
             : await transcriptBuffer.translation(forID: pending.id)
-        await SessionStore.shared.appendTranscriptLine(
+        let result = await SessionStore.shared.appendTranscriptLine(
             channel: channel,
             text: pending.text,
             translation: translation,
@@ -2684,6 +2717,7 @@ final class AppCoordinator {
             at: pending.timestamp,
             to: sessionID
         )
+        recordSaveResult(result)
     }
 
     /// Force the active transcriber to flush any in-progress partials as
