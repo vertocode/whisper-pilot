@@ -25,7 +25,7 @@ struct SessionMeta: Identifiable, Sendable, Codable, Equatable {
     /// user picks a model in the overlay during this session; reapplied on
     /// resume so each session sticks to the model it was started with.
     var selectedModel: String? = nil
-    /// Live counts maintained on every list refresh — not persisted.
+    /// Filled in on every list refresh — not persisted.
     var transcriptLineCount: Int = 0
     var chatTurnCount: Int = 0
 
@@ -41,6 +41,22 @@ actor SessionStore {
 
     let baseURL: URL
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "SessionStore")
+
+    /// Line and turn counts per session, keyed by folder name. A file is re-read
+    /// only when its size or modification time changed, so refreshing the list
+    /// stays cheap however much history there is.
+    private struct FileStamp: Equatable {
+        let modified: Date
+        let size: Int
+    }
+    private struct CountEntry {
+        var stamp: FileStamp?
+        var count: Int
+    }
+    private var transcriptCounts: [String: CountEntry] = [:]
+    private var chatCounts: [String: CountEntry] = [:]
+    /// How many times a session file was actually read for counting. Tests use it.
+    private(set) var countFileReads = 0
 
     init(baseURL overrideBaseURL: URL? = nil) {
         if let overrideBaseURL {
@@ -88,10 +104,19 @@ actor SessionStore {
                 // is missing or was damaged by an older build or manual edit.
                 meta = fallbackMetadata(for: name, folder: folder)
             }
-            meta.transcriptLineCount = countTranscriptLines(at: folder)
-            meta.chatTurnCount = countChatTurns(at: folder)
+            meta.transcriptLineCount = cachedCount(
+                at: folder.appendingPathComponent("transcript.md"), cache: &transcriptCounts, key: name,
+                count: Self.countTranscriptLines
+            )
+            meta.chatTurnCount = cachedCount(
+                at: folder.appendingPathComponent("chat.md"), cache: &chatCounts, key: name,
+                count: Self.countChatTurns
+            )
             metas.append(meta)
         }
+        let present = Set(names)
+        transcriptCounts = transcriptCounts.filter { present.contains($0.key) }
+        chatCounts = chatCounts.filter { present.contains($0.key) }
         metas.sort { $0.lastUsedAt > $1.lastUsedAt }
         return metas
     }
@@ -508,21 +533,50 @@ actor SessionStore {
         }
     }
 
-    private func countTranscriptLines(at folder: URL) -> Int {
-        guard let s = try? String(contentsOf: folder.appendingPathComponent("transcript.md"), encoding: .utf8) else {
+    private func cachedCount(
+        at url: URL,
+        cache: inout [String: CountEntry],
+        key: String,
+        count: (Data) -> Int
+    ) -> Int {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        guard let modified = attributes?[.modificationDate] as? Date,
+              let size = (attributes?[.size] as? NSNumber)?.intValue else {
+            cache[key] = CountEntry(stamp: nil, count: 0)
             return 0
         }
-        return s.split(separator: "\n").filter { $0.hasPrefix("**") }.count
+        let stamp = FileStamp(modified: modified, size: size)
+        if let entry = cache[key], entry.stamp == stamp { return entry.count }
+        countFileReads += 1
+        let value = (try? Data(contentsOf: url)).map(count) ?? 0
+        cache[key] = CountEntry(stamp: stamp, count: value)
+        return value
     }
 
-    private func countChatTurns(at folder: URL) -> Int {
-        guard let s = try? String(contentsOf: folder.appendingPathComponent("chat.md"), encoding: .utf8) else {
-            return 0
+    /// Lines that start with `**`, counted straight off the bytes so a long
+    /// transcript is not turned into an array of strings.
+    static func countTranscriptLines(_ data: Data) -> Int {
+        let star = UInt8(ascii: "*")
+        let newline = UInt8(ascii: "\n")
+        return data.withUnsafeBytes { raw -> Int in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            var total = 0
+            var i = 0
+            while i < bytes.count {
+                if i + 1 < bytes.count, bytes[i] == star, bytes[i + 1] == star { total += 1 }
+                while i < bytes.count, bytes[i] != newline { i += 1 }
+                i += 1
+            }
+            return total
         }
-        // Same rule as `parseChatMarkdown`: only well-formed turn headers count,
-        // not `## ` headings inside a message body.
-        return s.split(separator: "\n").filter { line in
-            line.hasPrefix("## ") && line.dropFirst(3).wholeMatch(of: Self.chatHeaderRegex) != nil
+    }
+
+    /// Same rule as `parseChatMarkdown`: only well-formed turn headers count,
+    /// not `## ` headings inside a message body.
+    static func countChatTurns(_ data: Data) -> Int {
+        guard let text = String(data: data, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n").filter { line in
+            line.hasPrefix("## ") && line.dropFirst(3).wholeMatch(of: chatHeaderRegex) != nil
         }.count
     }
 

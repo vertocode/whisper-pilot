@@ -42,6 +42,11 @@ final class CrashLogger: @unchecked Sendable {
     /// get a raw fd we control.
     private var fileHandle: FileHandle?
     private var fileDescriptor: Int32 = -1
+    /// Bytes in the log file, tracked on `queue` so a long session can trim it
+    /// while running. Lines written by the signal handler are not counted.
+    private var bytesInFile = 0
+    fileprivate static let maxBytes = 1_000_000
+    fileprivate static let keepBytes = 256_000
     private var memorySource: DispatchSourceMemoryPressure?
     /// Static copy of the fd for the C-function signal handlers — they can't
     /// capture `self`. Set in `start()`. -1 means "logger not started yet".
@@ -84,7 +89,8 @@ final class CrashLogger: @unchecked Sendable {
             // `seekToEnd` is what makes subsequent writes append rather than
             // overwriting the file's existing content. We don't care about
             // the return value (the new offset) — only the side effect.
-            _ = try? handle.seekToEnd()
+            let endOffset = (try? handle.seekToEnd()) ?? 0
+            queue.sync { bytesInFile = Int(endOffset) }
             fileHandle = handle
             fileDescriptor = handle.fileDescriptor
             Self.signalFD = fileDescriptor
@@ -185,7 +191,25 @@ final class CrashLogger: @unchecked Sendable {
             line.withCString { ptr in
                 _ = Darwin.write(fileDescriptor, ptr, strlen(ptr))
             }
+            bytesInFile += line.utf8.count
+            if bytesInFile > Self.maxBytes {
+                bytesInFile = Self.rotate(fileDescriptor: fileDescriptor, at: logURL, keepBytes: Self.keepBytes)
+            }
         }
+    }
+
+    /// Keeps the newest `keepBytes` of the log, starting at a whole line, and
+    /// returns the new file size. Works in place on the open descriptor because
+    /// the signal handler holds the same fd and must keep writing to this file.
+    static func rotate(fileDescriptor: Int32, at url: URL, keepBytes: Int) -> Int {
+        guard let data = try? Data(contentsOf: url) else { return 0 }
+        var tail = data.suffix(keepBytes)
+        if tail.count < data.count, let newline = tail.firstIndex(of: UInt8(ascii: "\n")) {
+            tail = tail[tail.index(after: newline)...]
+        }
+        guard ftruncate(fileDescriptor, 0) == 0, lseek(fileDescriptor, 0, SEEK_SET) == 0 else { return data.count }
+        let written = tail.withUnsafeBytes { Darwin.write(fileDescriptor, $0.baseAddress, $0.count) }
+        return max(written, 0)
     }
 
     fileprivate func handleUncaughtException(_ exception: NSException) {
