@@ -34,6 +34,8 @@ struct SmokeTestRunner {
         await runLogRotationSuite()
         await runAIProviderSuite()
         await runSingleInstanceSuite()
+        await runKeychainSuite()
+        await runPermissionMappingSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
         await runTranslationQueueSuite()
