@@ -46,10 +46,10 @@ final class AppleSpeechTranscriber: NSObject, TranscriptionProvider, @unchecked 
         let newMicPipe = enabledChannels.contains(.microphone)
             ? try ChannelPipe(channel: .microphone, locale: locale, sink: continuation, log: log, autoRestart: autoRestart)
             : nil
-        stateLock.lock()
-        systemPipe = newSystemPipe
-        micPipe = newMicPipe
-        stateLock.unlock()
+        stateLock.withLock {
+            systemPipe = newSystemPipe
+            micPipe = newMicPipe
+        }
         print("[WP][Transcriber] channel pipes ready (system=\(newSystemPipe != nil), mic=\(newMicPipe != nil))")
     }
 

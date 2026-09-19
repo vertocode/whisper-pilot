@@ -63,12 +63,12 @@ final class ParakeetTranscriber: TranscriptionProvider, @unchecked Sendable {
             throw error
         }
 
-        mutex.lock()
-        let stopped = isStopped
-        if !stopped {
-            for (channel, pipe) in built { pipes[channel] = pipe }
+        let stopped: Bool = mutex.withLock {
+            if !isStopped {
+                for (channel, pipe) in built { pipes[channel] = pipe }
+            }
+            return isStopped
         }
-        mutex.unlock()
         if stopped {
             for pipe in built.values { pipe.finish() }
             return
@@ -233,19 +233,19 @@ private final class Pipe: @unchecked Sendable {
                 do {
                     try await self.manager.appendAudio(buffer)
                     try await self.manager.processBufferedAudio()
-                    self.mutex.lock()
-                    self.appendedSeconds += buffer.format.sampleRate > 0
-                        ? Double(buffer.frameLength) / buffer.format.sampleRate
-                        : 0
-                    self.consecutiveErrors = 0
-                    self.mutex.unlock()
+                    self.mutex.withLock {
+                        self.appendedSeconds += buffer.format.sampleRate > 0
+                            ? Double(buffer.frameLength) / buffer.format.sampleRate
+                            : 0
+                        self.consecutiveErrors = 0
+                    }
                     let timings = await self.manager.consumeTokenTimings()
                     self.absorbAndEmit(timings)
                 } catch {
-                    self.mutex.lock()
-                    self.consecutiveErrors += 1
-                    let failures = self.consecutiveErrors
-                    self.mutex.unlock()
+                    let failures: Int = self.mutex.withLock {
+                        self.consecutiveErrors += 1
+                        return self.consecutiveErrors
+                    }
                     wpError("Parakeet.\(channel) processing error (#\(failures)): \(error.localizedDescription)")
                     if failures >= Self.maxConsecutiveErrors {
                         wpError("Parakeet.\(channel) too many consecutive errors — stopping this channel")
@@ -269,9 +269,7 @@ private final class Pipe: @unchecked Sendable {
             } catch {
                 wpWarn("Parakeet.\(channel) finish threw: \(error.localizedDescription)")
             }
-            self.mutex.lock()
-            let final = self.segmenter.finish()
-            self.mutex.unlock()
+            let final = self.mutex.withLock { self.segmenter.finish() }
             if let final { self.emitFinal(final) }
             await self.manager.cleanup()
             wpInfo("Parakeet.\(channel) pump ended after \(buffersFed) buffers")

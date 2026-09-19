@@ -83,10 +83,10 @@ final class MicrophoneCapture {
             log.error("Microphone returned invalid format (sampleRate=0)")
             throw MicrophoneError.invalidFormat
         }
-        stateLock.lock()
-        sourceFormat = inputFormat
-        converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
-        stateLock.unlock()
+        stateLock.withLock {
+            sourceFormat = inputFormat
+            converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
+        }
 
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.handle(buffer)
@@ -121,12 +121,13 @@ final class MicrophoneCapture {
         }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        stateLock.lock()
-        converter = nil
-        sourceFormat = nil
-        let emitted = framesEmitted
-        framesEmitted = 0
-        stateLock.unlock()
+        let emitted: Int = stateLock.withLock {
+            converter = nil
+            sourceFormat = nil
+            let emitted = framesEmitted
+            framesEmitted = 0
+            return emitted
+        }
         log.info("Microphone capture stopped after \(emitted, privacy: .public) frames")
     }
 
@@ -142,10 +143,10 @@ final class MicrophoneCapture {
             guard !Task.isCancelled, let self, self.isRunning else { return }
             self.engine.inputNode.removeTap(onBus: 0)
             self.engine.stop()
-            self.stateLock.lock()
-            self.converter = nil
-            self.sourceFormat = nil
-            self.stateLock.unlock()
+            self.stateLock.withLock {
+                self.converter = nil
+                self.sourceFormat = nil
+            }
             do {
                 try await self.start()
                 wpInfo("Microphone capture rebuilt after configuration change")

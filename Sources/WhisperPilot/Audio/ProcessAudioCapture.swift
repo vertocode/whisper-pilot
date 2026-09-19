@@ -97,10 +97,10 @@ final class ProcessAudioCapture {
         guard let inputFormat = AVAudioFormat(streamDescription: &asbdCopy) else {
             throw ProcessAudioError.formatConversionFailed
         }
-        stateLock.lock()
-        self.inputFormat = inputFormat
-        self.converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
-        stateLock.unlock()
+        stateLock.withLock {
+            self.inputFormat = inputFormat
+            self.converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
+        }
         wpInfo("ProcessAudio: AVAudioFormat resolved — sampleRate=\(inputFormat.sampleRate), channels=\(inputFormat.channelCount), interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
 
         // 4. Create a private aggregate device backed by the tap.

@@ -79,10 +79,10 @@ final class SystemAudioCapture: NSObject {
             log.error("Stop error: \(String(describing: error), privacy: .public)")
         }
         self.stream = nil
-        stateLock.lock()
-        self.converter = nil
-        self.sourceFormat = nil
-        stateLock.unlock()
+        stateLock.withLock {
+            self.converter = nil
+            self.sourceFormat = nil
+        }
         self.framesEmitted = 0
     }
 
