@@ -136,13 +136,15 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 - Fix: log the first decode failure per stream (without content) and, when zero deltas were decoded, report "unexpected response format".
 - **Done:** both providers log the first decode failure (byte count and error, no content) and throw `unexpectedFormat` when nothing usable arrived. A stray bad chunk among good ones is tolerated. New `Tools/SmokeTests/AIProviderTests.swift` covers Gemini and Anthropic SSE with a stub `URLProtocol` (deltas, finish reasons, `promptBlocked`, mid-stream error event, garbled data). This is the first half of the P3 provider tests; the P1-1 retry tests can reuse `StubURLProtocol`.
 
-**P1-4. No App Nap protection while listening.** 🔧
+**P1-4. No App Nap protection while listening.** 🔧 — **DONE in code (2026-09-19), not verified on a Mac**
 - `grep beginActivity` finds nothing. The app is `LSUIElement`, often fully covered by other windows during a call. Timers, watchdogs and network tasks may be throttled in long meetings.
 - Fix to evaluate: `ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: …)` between start and stop of listening (avoid `idleSystemSleepDisabled` unless the owner wants it). Verify with a 30-60 minute session in the background.
+- **Done:** `ListeningActivity` (`App/ListeningActivity.swift`) begins in `startListening` once the pipeline runs and ends in `stopListening`. It uses `.userInitiatedAllowingIdleSystemSleep`, because plain `.userInitiated` includes `idleSystemSleepDisabled` and would keep the Mac awake. begin/end are idempotent (tested). 🔧 Still to do: a 30-60 minute session with the window covered, checking that transcripts and timers keep up.
 
-**P1-5. No sleep/wake handling.** 🔧
+**P1-5. No sleep/wake handling.** 🔧 — **DONE in code (2026-09-19), not verified on a Mac**
 - No `NSWorkspace.willSleepNotification` / `didWakeNotification` observers. Device-change rebuilds and SCStream restarts exist, but the lid-close/wake path is untested.
 - Fix: on wake, if listening, verify frames resume within a few seconds and otherwise restart capture, telling the user. Manually test: start listening, close the lid for a minute, reopen.
+- **Done:** `AppCoordinator` observes `NSWorkspace.didWakeNotification`. If a session is running, it waits 5 seconds and, when `audioFrameCount` did not grow (`WakeRecovery.needsRestart`, tested), posts a note and calls `restartListening()` (which keeps the mic mute choice). It only acts if the same session is still running. 🔧 Still to do: start listening, close the lid for a minute, reopen, and check both the "audio kept flowing" and the "restarted" outcomes.
 
 **P1-6. Shortcut registration failure is invisible.** — **DONE in code (2026-09-19), not seen on screen**
 - Where: `Shortcuts/GlobalHotKey.swift:57` logs and returns nil. A user who records a combo already used by another app gets a shortcut that silently does nothing.
@@ -159,18 +161,20 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 - Fix: at launch, if another running instance of the same bundle id exists, activate it and quit.
 - **Done:** `SingleInstance` (pure, tested) picks the oldest copy as the winner, so two copies started together don't both quit. `AppDelegate.handOverToRunningCopy()` runs first in `applicationDidFinishLaunching`, before the crash logger, so the running copy's clean-shutdown marker is untouched. It asks macOS to open the winner's bundle (which triggers P1-7) and exits. Caveat: `AppCoordinator` is created before that call, so the second copy still builds `SettingsStore` once; it only reads the Keychain for a build the user already approved. 🔧 To check: start a second copy with `open -n`.
 
-**P1-9. Permission status is partly a guess.** 🔧
+**P1-9. Permission status is partly a guess.** 🔧 — **PARTLY DONE (2026-09-19)**
 - `PermissionsManager.requestSystemAudio` (line 141) opens a Process Tap for 2 seconds and then records "granted" regardless of what the user clicked, because macOS has no API to read the system-audio permission. The onboarding row shows a "System Settings" hint for that reason.
 - Screen Recording (line 165): after the user enables it, macOS asks to quit and reopen; the resume logic (`OnboardingEligibility.startPoint`) exists but was never run end to end.
 - Suggested hardening (not a new feature): at the end of onboarding, or on the first Play, validate that frames with non-zero level actually arrive (the diagnostics "System Audio Test" in `AppCoordinator.runSystemAudioTest` already does the measurement) and, if silent, tell the user exactly which permission to check.
+- **Done:** the start-of-session watchdogs already report "no frames after 6 s" and "frames are silent" (and switch to ScreenCaptureKit); both messages now also name System Settings → Privacy & Security → Screen & System Audio Recording, the setting that most often explains silent system audio. **Not done, on purpose:** a new post-onboarding measurement step. It would open the audio tap again (a new dialog risk) and is new behavior. The Screen Recording quit-and-reopen path (`OnboardingEligibility.startPoint`) is still unrun end to end. 🔧
 
-**P1-10. Keychain follow-ups.** 🔧
+**P1-10. Keychain follow-ups.** 🔧 — **MOSTLY DONE (2026-09-19)**
 - Ad-hoc signing means every release has a new signature, so macOS re-asks for Keychain approval once per release (README:70 already explains this for Microphone/Screen Recording but does not mention the Keychain). Update the README and the update-button tooltip (`UpdateChecker.swift`, `.help(...)`).
 - The migrated legacy items (`gemini.api_key`, `anthropic.api_key` under service `com.whisperpilot.app`) remain in the Keychain. Decide with the owner how to clean them without triggering another prompt (for example a one-line note in the README on deleting them in Keychain Access).
 - Not verified: whether one item produces exactly one macOS dialog. The previous behavior was 3-4 password prompts for 2 items.
 - `SettingsStore.init` reads the secrets synchronously on the main thread at launch for an approved build (`restoreKeychainAccess`). If the user later revoked the approval this blocks launch behind a dialog. Consider moving it off the main thread.
 - `SettingsStore.hasGeminiAPIKey`/`availableVendors` are evaluated from SwiftUI bodies and can call `KeychainHelper.exists` (attribute queries) up to 3 times per evaluation until migration completes. Cache the answer.
 - The Settings "Allow Keychain access" button (`SettingsView.swift:262`) has no in-flight guard, so repeated clicks can stack dialogs.
+- **Done:** (a) `unlockStoredKeys()` ignores a second call while one is waiting on macOS (guard in the store, so the Settings button and onboarding are both covered; a test presses twice and checks one read, and fails if the guard is removed). (b) `hasGeminiAPIKey` / `hasAnthropicAPIKey` / `availableVendors` cache the "which vendors exist" answer until a key is saved or unlocked (tested: ten redraws cost at most one round of queries). (c) The update-button tooltip and the README say macOS asks again for permissions and the Keychain after an update, and the README explains how to delete the two legacy Keychain items after the first successful unlock. **Not done, on purpose:** moving the launch-time read of an approved build off the main thread. `AppCoordinator.init` builds the AI provider from those keys straight away, so making the read asynchronous would change startup order (AI unavailable until it finishes) and can only be judged on a Mac. 🔧 Whether one item produces exactly one macOS dialog is still unverified.
 
 **P1-11. Duplicate notes when Answer Screen is used before Screen Recording was requested.** — **DONE (2026-09-19)**
 - `AppCoordinator.captureScreenJPEG` now posts a "needs Screen Recording, open Setup" note and returns nil, then the callers (`sendUserPrompt`, `answerScreen`) add their own generic "Couldn't capture screen" note. Keep one message.
@@ -202,14 +206,16 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 
 **P2-8. Deferred from the July 2026 sweep (need live hardware, behavior-changing).** Do not do these without the owner and a device: replace the fixed 5× system-audio gain with AGC; share one Parakeet encoder across channels; flip `CATapDescription.isPrivate` to true on the process tap; move the transcript consumer off the main actor and fix the `MarkdownMessageView` O(n²) re-parse.
 
-### P3. Test gaps
+### P3. Test gaps — **mostly done (2026-09-19); what is left is listed at the end of this section**
 
 The smoke runner (`Tools/SmokeTests/SmokeTestRunner.swift`, 28 suites, one 1.8k-line file) covers parsing, buffers, session store, translation queue and onboarding eligibility. It does **not** cover:
 
-- Gemini/Anthropic SSE parsing, finish reasons, mid-stream error events, `promptBlocked` (stub `URLProtocol`, no network needed).
-- Keychain flows: `SettingsStore` unlock/migration/save/remove and the `KeychainAccess` state machine. `KeychainHelper` is a static enum; put it behind a small protocol so tests can inject a fake.
-- `PermissionsManager` status mapping, `MenuBarController` rebuild logic, `AppDelegate.showInitialWindow`.
-- The new `SettingsStore` migration is only compile-checked.
+- ~~Gemini/Anthropic SSE parsing, finish reasons, mid-stream error events, `promptBlocked`~~ **Done** (`Tools/SmokeTests/AIProviderTests.swift`, stub `URLProtocol`).
+- ~~Keychain flows~~ **Done.** New `SecretStore` protocol (`Settings/SecretStore.swift`) with `SystemSecretStore` as the default; `SettingsStore.init(defaults:secrets:)` takes a fake in tests, so a test can never raise a macOS dialog. `Tools/SmokeTests/KeychainAndPermissionsTests.swift` covers: no secret read at launch for an unapproved build, unlock, approval remembered per build (and "unknown" never approved), refusal and retry, failed and damaged reads, legacy migration (both items, retry when the bundle write fails, stop at the first refusal, legacy items left in place), save/replace/remove, failed save keeps the old key, "Set up later" per build. A mutation check (breaking the locked-save guard and the approval check) made 17 assertions fail.
+- `PermissionsManager` status mapping **done**: the mapping moved into pure functions in `Permissions/PermissionMapping.swift` and is tested. `MenuBarController` rebuild logic and `AppDelegate.showInitialWindow` are **still untested** (both need AppKit windows or a menu).
+- ~~The new `SettingsStore` migration is only compile-checked.~~ Done, see above.
+- **Menu bar layout: done.** The rule for which entries show (setup missing vs full, running vs idle) is now `MenuLayout.entries`, tested; `MenuBarController.rebuildMenu` only turns entries into `NSMenuItem`s.
+- **Still open in P3:** `AppDelegate.showInitialWindow` (its decision is `OnboardingEligibility.shouldPresent`, already tested; the window code itself needs a screen) and the permission *requests* (they open real dialogs, so they can only be checked by hand in section 4). The fake proves our rules; whether macOS shows exactly one dialog per item is still only checkable on a Mac.
 
 ## 4. Manual QA checklist for the onboarding and permissions work (not yet run)
 
@@ -234,6 +240,6 @@ Use the `.dev` build and reset recipe in section 1. Tick each one on a real Mac.
 4. Provider retry (P1-1) with tests from P3.
 5. Hardware-dependent items: P1-4, P1-5, P1-9, P1-10 (verify each on a real device).
 6. Performance and hygiene: P2-1, P2-2, P2-5, P2-6, then P2-3/P2-4.
-7. Update `README.md` (privacy claims, TCC and Keychain explanation) and `docs/ARCHITECTURE.md` when behavior changes.
+7. ~~Update `README.md` (privacy claims, TCC and Keychain explanation) and `docs/ARCHITECTURE.md` when behavior changes.~~ **Done (2026-09-19):** README first-run steps, Keychain-after-update note, legacy item cleanup, log contents, on-device-only wording; ARCHITECTURE lifecycle, transcription, AI retry, persistence, permissions and threading.
 
 Keep each fix small and separately committable (when the owner asks). Add a test for every pure-logic fix. Re-run `swift run SmokeTests` and the `xcodebuild` line before saying anything is done, and say plainly which items you could not verify without hardware.
