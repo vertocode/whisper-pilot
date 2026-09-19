@@ -168,7 +168,7 @@ final class PermissionsManager: ObservableObject {
         } catch {
             deniedThisRun.insert(.screenRecording)
             snapshot.screenRecording = .denied
-            issues[.screenRecording] = "Screen Recording was not allowed. Click Open Settings and switch Whisper Pilot on under Privacy & Security → Screen & System Audio Recording. If it isn't listed, drag its icon from the small window that opens into the list. macOS may ask you to quit and reopen Whisper Pilot afterwards."
+            issues[.screenRecording] = "Screen Recording was not allowed. Click Open Settings and switch Whisper Pilot on under Privacy & Security → Screen & System Audio Recording. If it isn't listed, drag its icon from the small window that opens into the list. If it still says not allowed after that, quit Whisper Pilot from the menu bar icon and open it again."
             wpWarn("Screen Recording permission denied: \(error.localizedDescription)")
         }
     }

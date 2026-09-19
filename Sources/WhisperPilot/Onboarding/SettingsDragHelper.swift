@@ -59,10 +59,9 @@ private struct DragHelperView: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath))
-                .resizable()
-                .frame(width: 52, height: 52)
-                .onDrag { NSItemProvider(object: Bundle.main.bundleURL as NSURL) }
+            DraggableAppIcon()
+                .frame(width: 56, height: 56)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.12)))
                 .help("Drag this into the list in System Settings")
             VStack(alignment: .leading, spacing: 4) {
                 Label("Drag Whisper Pilot into the list above", systemImage: "arrow.up")
@@ -77,5 +76,44 @@ private struct DragHelperView: View {
         }
         .padding(14)
         .frame(width: 430, height: 96)
+    }
+}
+
+/// Plain AppKit on purpose: the panel can be dragged by its background, and a
+/// SwiftUI drag on top of that moves the window instead of the icon.
+private struct DraggableAppIcon: NSViewRepresentable {
+    func makeNSView(context: Context) -> AppIconDragView { AppIconDragView() }
+    func updateNSView(_ nsView: AppIconDragView, context: Context) {}
+}
+
+private final class AppIconDragView: NSView, NSDraggingSource {
+    private let icon: NSImage = {
+        let image = NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath)
+        image.size = NSSize(width: 128, height: 128)
+        return image
+    }()
+    private var dragStarted = false
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        icon.draw(in: bounds.insetBy(dx: 4, dy: 4))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        dragStarted = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !dragStarted else { return }
+        dragStarted = true
+        let item = NSDraggingItem(pasteboardWriter: Bundle.main.bundleURL as NSURL)
+        item.setDraggingFrame(bounds, contents: icon)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        .copy
     }
 }
