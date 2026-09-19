@@ -25,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // Two copies with one bundle id share settings, the log and the clean-shutdown
+        // marker. Hand over to the older one before touching any of them.
+        if handOverToRunningCopy() { return }
         // Start the crash logger BEFORE anything else so the earliest possible
         // wpInfo / wpError lines + any startup crash land on disk. The
         // unclean-shutdown check immediately below uses its sentinel.
@@ -232,6 +235,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
+    /// Launching the app again (Finder, Spotlight, "Quit & Reopen" landing on a
+    /// live process) must show something, or it reads as "the app didn't open".
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showInitialWindow()
+        return false
+    }
+
+    /// Returns true when another copy is already running and this one is quitting.
+    private func handOverToRunningCopy() -> Bool {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return false }
+        let current = NSRunningApplication.current
+        let me = SingleInstance.Candidate(pid: current.processIdentifier, launchDate: current.launchDate)
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != current.processIdentifier && !$0.isTerminated }
+        let byPID = Dictionary(uniqueKeysWithValues: others.map { ($0.processIdentifier, $0) })
+        let candidates = others.map { SingleInstance.Candidate(pid: $0.processIdentifier, launchDate: $0.launchDate) }
+        guard let target = SingleInstance.copyToHandOverTo(me: me, others: candidates),
+              let running = byPID[target.pid] else { return false }
+
+        wpInfo("Another Whisper Pilot copy is already running (pid \(target.pid)); handing over and quitting")
+        // Opening the running copy's bundle makes macOS send it a reopen event,
+        // which shows its window.
+        if let url = running.bundleURL {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in exit(0) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
+        } else {
+            running.activate()
+            exit(0)
+        }
+        return true
+    }
+
     func showSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
@@ -429,6 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] in
             self?.overlay?.toggleVisibility()
         }
+        coordinator.settings.toggleOverlayShortcutUnavailable = toggleOverlayHotKey == nil
         if toggleOverlayHotKey != nil {
             wpInfo("AppDelegate: registered toggle-overlay hotkey \(binding.displayLabel)")
         }
@@ -454,6 +490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.overlay?.window?.orderFrontRegardless()
             self.coordinator.answerScreen()
         }
+        coordinator.settings.answerScreenShortcutUnavailable = answerScreenHotKey == nil
         if answerScreenHotKey != nil {
             wpInfo("AppDelegate: registered answer-screen hotkey \(binding.displayLabel)")
         }

@@ -286,6 +286,11 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Set by the app when macOS refuses to register a shortcut, usually because
+    /// another app already owns the combo. Runtime state only, never saved.
+    @Published var toggleOverlayShortcutUnavailable = false
+    @Published var answerScreenShortcutUnavailable = false
+
     @Published var localeIdentifier: String {
         didSet { defaults.set(localeIdentifier, forKey: Keys.localeIdentifier) }
     }

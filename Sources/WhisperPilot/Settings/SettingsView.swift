@@ -515,6 +515,7 @@ struct SettingsView: View {
                     .controlSize(.small)
                 }
                 FormHint("Global shortcut — works from any app, including when the overlay is click-through. Click the field, then press the combo you want. Press Escape to cancel without changing. Default: ⌘⇧Z.")
+                if store.toggleOverlayShortcutUnavailable { ShortcutUnavailableHint() }
             }
             Section {
                 HStack {
@@ -529,6 +530,7 @@ struct SettingsView: View {
                     .controlSize(.small)
                 }
                 FormHint("Captures your current screen and asks the AI to answer whatever question is visible — picks the right option for multiple-choice, or replies briefly for an open question. If there's no question, it tells you what it sees and offers to help. Requires Screen Recording permission. Default: ⌘⇧A.")
+                if store.answerScreenShortcutUnavailable { ShortcutUnavailableHint() }
             }
         }
         .formStyle(.grouped)
@@ -542,6 +544,15 @@ struct SettingsView: View {
 /// Inline helper text used under controls in Settings tabs. One source of truth so every
 /// hint has matching size/color/wrapping behavior. Internal (not private) so tabs living
 /// in their own files — `TranslationSettingsTab` — read identically to the ones here.
+private struct ShortcutUnavailableHint: View {
+    var body: some View {
+        Text("⚠️ This shortcut doesn't work: another app or macOS already uses it. Record a different combo.")
+            .font(.system(size: 11))
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 struct FormHint: View {
     let text: String
     init(_ text: String) { self.text = text }
