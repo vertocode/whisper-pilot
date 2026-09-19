@@ -35,6 +35,7 @@ struct SmokeTestRunner {
         await runAIProviderSuite()
         await runSingleInstanceSuite()
         await runKeychainSuite()
+        await runListeningActivitySuite()
         await runPermissionMappingSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
@@ -1686,6 +1687,25 @@ struct SmokeTestRunner {
 
             let small = CrashLogger.rotate(fileDescriptor: fd, at: url, keepBytes: 1_000_000)
             await expect(small == after.utf8.count, "a file under the keep size is left whole")
+        }
+    }
+
+    static func runListeningActivitySuite() async {
+        await suite("Listening activity and wake recovery") {
+            let activity = ListeningActivity()
+            await expect(!activity.isActive, "starts idle")
+            activity.begin()
+            await expect(activity.isActive, "begin holds an activity")
+            activity.begin()
+            await expect(activity.isActive, "a second begin does not stack a second activity")
+            activity.end()
+            await expect(!activity.isActive, "end releases it")
+            activity.end()
+            await expect(!activity.isActive, "a second end is harmless")
+
+            await expect(WakeRecovery.needsRestart(framesBefore: 500, framesAfter: 500), "no new frames after wake -> restart")
+            await expect(WakeRecovery.needsRestart(framesBefore: 500, framesAfter: 0), "counter reset after wake -> restart")
+            await expect(!WakeRecovery.needsRestart(framesBefore: 500, framesAfter: 620), "frames still arriving -> leave it alone")
         }
     }
 

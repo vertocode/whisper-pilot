@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Combine
 import CoreGraphics
@@ -167,6 +168,8 @@ final class AppCoordinator {
     private let muteFlags = OSAllocatedUnfairLock(initialState: MuteFlags())
     private var micMuteObserver: AnyCancellable?
     private var systemMuteObserver: AnyCancellable?
+    private let listeningActivity = ListeningActivity()
+    private var wakeObserver: NSObjectProtocol?
 
     /// Plain value mirror of the overlay's two mute toggles, read by the audio
     /// pipeline consumer without touching the main actor.
@@ -262,6 +265,30 @@ final class AppCoordinator {
             .sink { [weak self] muted in
                 self?.muteFlags.withLock { $0.systemMuted = muted }
             }
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.handleWake() }
+        }
+    }
+
+    /// Closing the lid or a long sleep can leave capture running but silent.
+    /// After a wake with a session running, give audio a few seconds to resume
+    /// and restart the capture if it did not.
+    private func handleWake() {
+        guard isRunning else { return }
+        let generation = sessionGeneration
+        let framesBefore = overlayState.audioFrameCount
+        wpInfo("[Coordinator] Mac woke up while listening; checking that audio resumes")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: WakeRecovery.gracePeriodSeconds * 1_000_000_000)
+            guard let self, self.isRunning, self.sessionGeneration == generation else { return }
+            guard WakeRecovery.needsRestart(framesBefore: framesBefore, framesAfter: self.overlayState.audioFrameCount) else { return }
+            wpWarn("[Coordinator] No audio after wake; restarting capture")
+            self.overlayState.appendSystemNote("ℹ️ Audio stopped when your Mac woke up. Restarting the capture.", category: .transcript)
+            await self.restartListening()
+        }
     }
 
     /// Debounces saves of the session context to disk so typing bursts don't
@@ -629,6 +656,7 @@ final class AppCoordinator {
         startPipeline(transcriber: transcriber, ai: aiProvider)
 
         isRunning = true
+        listeningActivity.begin()
         // Keep status as `.starting` here — the mixer-output consumer flips it to
         // `.listening` when the first audio frame arrives, so the UI's "ready" state
         // matches the moment audio is actually flowing rather than the moment our
@@ -973,7 +1001,7 @@ final class AppCoordinator {
                 let micHint = self.settings.captureMicrophone
                     ? "Microphone capture is on — speak audibly into the mic, or play system audio through your default output device (“\(outName)”)."
                     : "Microphone capture is off. Either enable Capture Microphone in Settings → Capture so your voice is transcribed, or play system audio through your default output device (“\(outName)”)."
-                let message = "No audio frames after 6 seconds. \(method) is set up but isn't receiving any audio. \(micHint) Virtual / aggregate / Bluetooth output devices sometimes bypass the macOS audio mixdown that we capture from."
+                let message = "No audio frames after 6 seconds. \(method) is set up but isn't receiving any audio. \(micHint) If system audio is what's missing, also check that Whisper Pilot is on in System Settings → Privacy & Security → Screen & System Audio Recording. Virtual / aggregate / Bluetooth output devices sometimes bypass the macOS audio mixdown that we capture from."
                 wpWarn(message)
                 self.noFramesWarningID = self.overlayState.appendSystemNote("⚠️ \(message)", category: .transcript)
             } else if sysCount == 0 && micCount > 0 {
@@ -1029,7 +1057,7 @@ final class AppCoordinator {
                sysFrames > 100,
                sysTranscripts == 0,
                micTranscripts > 0 {
-                let message = "System audio frames are arriving (sys=\(sysFrames)) but contain silence — the macOS audio mixdown that Core Audio Process Tap reads from looks empty. This usually happens when the Mac's output device (USB headset, Bluetooth headphones, aggregate / virtual driver) routes audio in a way that bypasses the mixdown. ScreenCaptureKit uses a different capture path that works around it."
+                let message = "System audio frames are arriving (sys=\(sysFrames)) but contain silence — the macOS audio mixdown that Core Audio Process Tap reads from looks empty. This usually happens when the Mac's output device (USB headset, Bluetooth headphones, aggregate / virtual driver) routes audio in a way that bypasses the mixdown, or when system audio access was refused in System Settings → Privacy & Security → Screen & System Audio Recording. ScreenCaptureKit uses a different capture path that works around it."
                 wpWarn(message)
                 if self.permissions.snapshot.screenRecording == .granted {
                     self.settings.forceScreenCaptureKitForSystemAudio = true
@@ -1199,6 +1227,7 @@ final class AppCoordinator {
         // aiProvider stays alive across stop/start so the composer keeps working.
 
         isRunning = false
+        listeningActivity.end()
         overlayState.status = .idle
         overlayState.audioFrameCount = 0
         overlayState.transcriptCount = 0
