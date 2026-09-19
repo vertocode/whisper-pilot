@@ -28,6 +28,12 @@ struct SmokeTestRunner {
         await runSessionStorePersistenceSuite()
         await runInstallDiagnosticsSuite()
         await runOnboardingEligibilitySuite()
+        await runEngineFallbackNoteSuite()
+        await runSaveHealthSuite()
+        await runSessionCountCacheSuite()
+        await runLogRotationSuite()
+        await runAIProviderSuite()
+        await runSingleInstanceSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
         await runTranslationQueueSuite()
@@ -1437,7 +1443,7 @@ struct SmokeTestRunner {
         init(delay: Duration = .zero) { self.delay = delay }
 
         func translate(_ text: String) async throws -> String {
-            lock.lock(); recorded.append(text); lock.unlock()
+            lock.withLock { recorded.append(text) }
             if delay != .zero { try? await Task.sleep(for: delay) }
             return "<\(text)>"
         }
@@ -1508,6 +1514,208 @@ struct SmokeTestRunner {
                          "remedy targets the documented install path")
             await expect(InstallDiagnostics.translocationMessage.contains(InstallDiagnostics.remedyCommand),
                          "the note shows the command even if the user doesn't press Copy")
+        }
+    }
+
+    static func runSaveHealthSuite() async {
+        struct Boom: Error {}
+        let diskFull = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+        let noPermission = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+
+        await suite("Save health") {
+            var health = SaveHealth()
+            await expect(health.record(.success(())) == .none, "success while healthy -> no change")
+            await expect(
+                health.record(.failure(diskFull)) == .started(reason: "the disk is full"),
+                "first failure -> banner with the disk-full reason"
+            )
+            await expect(health.isFailing, "state is failing after a failure")
+            await expect(health.record(.failure(diskFull)) == .none, "repeated failure -> no second banner")
+            await expect(health.record(.success(())) == .recovered, "first success after failing -> recovered")
+            await expect(!health.isFailing, "state is healthy after recovery")
+            await expect(health.record(.success(())) == .none, "success after recovery -> no change")
+
+            await expect(
+                SaveHealth.reason(for: noPermission).contains("no permission"),
+                "POSIX EACCES -> permission message"
+            )
+            let wrapped = NSError(domain: NSCocoaErrorDomain, code: 512, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))])
+            await expect(SaveHealth.reason(for: wrapped) == "the disk is full", "underlying ENOSPC -> disk full")
+            await expect(
+                SaveHealth.reason(for: NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError)).contains("moved or deleted"),
+                "missing folder -> moved or deleted message"
+            )
+            await expect(SaveHealth.bannerText(reason: "x").contains("not being saved"), "banner says the session is not being saved")
+        }
+
+        await suite("Assistant turn text") {
+            await expect(AssistantTurnText.persisted("  \n", incomplete: true) == nil, "blank reply is not saved")
+            await expect(AssistantTurnText.persisted("Done.", incomplete: false) == "Done.", "complete reply is saved as-is")
+            await expect(
+                AssistantTurnText.persisted("Half an ans", incomplete: true) == "Half an ans\n\n(incomplete)",
+                "cut-off reply keeps its text and gets the marker"
+            )
+        }
+
+        await suite("SessionStore write failures") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+            do {
+                let session = try await store.createSession(name: "Write failures")
+                let ok = await store.appendChatTurn(role: "You", text: "hi", at: Date(), to: session.id)
+                await expect((try? ok.get()) != nil, "append to a healthy session reports success")
+
+                let folder = root.appendingPathComponent(session.folderName)
+                let chatURL = folder.appendingPathComponent("chat.md")
+                try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: chatURL.path)
+                let readOnly = await store.appendChatTurn(role: "You", text: "again", at: Date(), to: session.id)
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: chatURL.path)
+                if geteuid() != 0 {
+                    await expect((try? readOnly.get()) == nil, "append to a read-only file reports failure")
+                }
+
+                try FileManager.default.removeItem(at: folder)
+                let gone = await store.appendTranscriptLine(channel: .system, text: "x", at: Date(), to: session.id)
+                await expect((try? gone.get()) == nil, "append after the folder was deleted reports failure")
+            } catch {
+                await expect(false, "write failure setup failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    static func runSingleInstanceSuite() async {
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        let older = SingleInstance.Candidate(pid: 200, launchDate: t0)
+        let newer = SingleInstance.Candidate(pid: 100, launchDate: t0.addingTimeInterval(5))
+        await suite("Single instance") {
+            await expect(SingleInstance.copyToHandOverTo(me: newer, others: [older]) == older, "newer copy hands over to the older one")
+            await expect(SingleInstance.copyToHandOverTo(me: older, others: [newer]) == nil, "older copy keeps running")
+            await expect(SingleInstance.copyToHandOverTo(me: older, others: []) == nil, "alone -> keeps running")
+            let tieA = SingleInstance.Candidate(pid: 10, launchDate: t0)
+            let tieB = SingleInstance.Candidate(pid: 11, launchDate: t0)
+            await expect(SingleInstance.copyToHandOverTo(me: tieA, others: [tieB]) == nil, "same launch time: lower pid keeps running")
+            await expect(SingleInstance.copyToHandOverTo(me: tieB, others: [tieA]) == tieA, "same launch time: higher pid hands over")
+            let unknown = SingleInstance.Candidate(pid: 1, launchDate: nil)
+            await expect(SingleInstance.copyToHandOverTo(me: unknown, others: [older]) == older, "unknown launch date loses")
+            await expect(SingleInstance.copyToHandOverTo(me: older, others: [unknown]) == nil, "known launch date beats unknown")
+            await expect(
+                SingleInstance.copyToHandOverTo(me: newer, others: [SingleInstance.Candidate(pid: 300, launchDate: t0.addingTimeInterval(9)), older]) == older,
+                "with several copies, the oldest wins"
+            )
+        }
+    }
+
+    static func runSessionCountCacheSuite() async {
+        await suite("Session count parsing") {
+            let transcript = Data("# Transcript\n\n**Me** [10:00:00] hi\n\n**Other** [10:00:05] hello\n> pt — oi\n\nnot **bold** start\n**Me**".utf8)
+            await expect(SessionStore.countTranscriptLines(transcript) == 3, "counts lines that start with ** (including the last, unterminated one)")
+            await expect(SessionStore.countTranscriptLines(Data()) == 0, "empty file -> 0")
+            await expect(SessionStore.countTranscriptLines(Data("*single star\n".utf8)) == 0, "one star is not a speaker line")
+            let chat = Data("# Chat\n\n## You [10:00:00]\n\nhi\n\n## Assistant [10:00:01]\n\n## A heading inside a reply\n".utf8)
+            await expect(SessionStore.countChatTurns(chat) == 2, "counts only well-formed turn headers")
+        }
+
+        await suite("Session list count cache") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+            do {
+                let a = try await store.createSession(name: "Alpha")
+                let b = try await store.createSession(name: "Beta")
+                await store.appendTranscriptLine(channel: .system, text: "one", at: Date(), to: a.id)
+                await store.appendTranscriptLine(channel: .microphone, text: "two", at: Date(), to: a.id)
+                await store.appendChatTurn(role: "You", text: "q", at: Date(), to: a.id)
+
+                func counts(_ id: SessionID, _ list: [SessionMeta]) -> (Int, Int)? {
+                    list.first { $0.id == id }.map { ($0.transcriptLineCount, $0.chatTurnCount) }
+                }
+                let first = await store.listSessions()
+                await expect(counts(a.id, first)! == (2, 1), "first list counts lines and turns")
+                await expect(counts(b.id, first)! == (0, 0), "an empty session counts zero")
+
+                let readsAfterFirst = await store.countFileReads
+                _ = await store.listSessions()
+                let readsAfterSecond = await store.countFileReads
+                await expect(readsAfterSecond == readsAfterFirst, "an unchanged list does not re-read any file")
+
+                await store.appendTranscriptLine(channel: .system, text: "three", at: Date(), to: a.id)
+                let third = await store.listSessions()
+                await expect(counts(a.id, third)! == (3, 1), "a new line shows up on the next list")
+                let readsAfterThird = await store.countFileReads
+                await expect(readsAfterThird == readsAfterSecond + 1, "only the changed file was re-read")
+
+                try FileManager.default.removeItem(at: root.appendingPathComponent(b.folderName))
+                let fourth = await store.listSessions()
+                await expect(fourth.count == 1, "a deleted session leaves the list")
+            } catch {
+                await expect(false, "count cache setup failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    static func runLogRotationSuite() async {
+        await suite("Log rotation") {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("wp-log-\(UUID().uuidString).log")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let lines = (0..<200).map { "line-\($0)" }
+            try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+            guard let handle = try? FileHandle(forWritingTo: url) else {
+                await expect(false, "could not open temp log")
+                return
+            }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            let fd = handle.fileDescriptor
+
+            let size = CrashLogger.rotate(fileDescriptor: fd, at: url, keepBytes: 100)
+            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            await expect(size == text.utf8.count && size <= 100, "file shrinks to the keep size or less")
+            await expect(text.hasSuffix("line-199\n"), "newest line is kept")
+            await expect(text.hasPrefix("line-"), "the kept text starts on a whole line")
+            await expect(!text.contains("line-0\n"), "old lines are dropped")
+
+            let extra = Data("after-rotation\n".utf8)
+            _ = extra.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+            let after = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            await expect(after.hasSuffix("line-199\nafter-rotation\n"), "writes through the same descriptor append after rotation")
+
+            let small = CrashLogger.rotate(fileDescriptor: fd, at: url, keepBytes: 1_000_000)
+            await expect(small == after.utf8.count, "a file under the keep size is left whole")
+        }
+    }
+
+    static func runEngineFallbackNoteSuite() async {
+        struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+
+        await suite("Engine fallback note") {
+            await expect(
+                EngineFallbackNote.reason(for: URLError(.notConnectedToInternet)).contains("no internet"),
+                "offline -> says there is no internet connection"
+            )
+            await expect(
+                EngineFallbackNote.reason(for: URLError(.timedOut)).contains("timed out"),
+                "timeout -> says the download timed out"
+            )
+            await expect(
+                EngineFallbackNote.reason(for: URLError(.cannotFindHost)).contains("can't reach"),
+                "DNS failure -> says the server can't be reached"
+            )
+            let wrapped = NSError(domain: "FluidAudio", code: 1, userInfo: [NSUnderlyingErrorKey: URLError(.networkConnectionLost)])
+            await expect(
+                EngineFallbackNote.reason(for: wrapped).contains("no internet"),
+                "URLError wrapped as an underlying error is still recognized"
+            )
+            await expect(EngineFallbackNote.reason(for: Boom()) == "boom", "other errors keep their own message")
+            let text = EngineFallbackNote.text(for: URLError(.notConnectedToInternet))
+            await expect(text.contains("Apple's on-device engine"), "note names the engine now in use")
+            await expect(text.contains("next time you press Play"), "note says Parakeet is retried")
+            await expect(
+                TranscriberError.onDeviceUnavailable("pt-BR").errorDescription?.contains("never sends audio") == true,
+                "on-device-unavailable error states that audio is not sent to Apple"
+            )
         }
     }
 
