@@ -149,7 +149,7 @@ final class PermissionsManager: ObservableObject {
             tap.stop()
             deniedThisRun.insert(.systemAudio)
             snapshot.systemAudio = .denied
-            issues[.systemAudio] = "Whisper Pilot could not open system audio (\(error.localizedDescription)). Check that Whisper Pilot is on in System Settings → Privacy & Security → Screen & System Audio Recording, then try again."
+            issues[.systemAudio] = "Whisper Pilot could not open system audio (\(error.localizedDescription)). Click Open Settings and switch Whisper Pilot on under Privacy & Security → Screen & System Audio Recording. If it isn't listed, drag its icon from the small window that opens into the list."
             wpWarn("System audio request failed: \(error.localizedDescription)")
         }
     }
@@ -168,7 +168,7 @@ final class PermissionsManager: ObservableObject {
         } catch {
             deniedThisRun.insert(.screenRecording)
             snapshot.screenRecording = .denied
-            issues[.screenRecording] = "Screen Recording was not allowed. Turn on Whisper Pilot in System Settings → Privacy & Security → Screen & System Audio Recording. macOS may ask you to quit and reopen Whisper Pilot afterwards."
+            issues[.screenRecording] = "Screen Recording was not allowed. Click Open Settings and switch Whisper Pilot on under Privacy & Security → Screen & System Audio Recording. If it isn't listed, drag its icon from the small window that opens into the list. macOS may ask you to quit and reopen Whisper Pilot afterwards."
             wpWarn("Screen Recording permission denied: \(error.localizedDescription)")
         }
     }
@@ -184,6 +184,10 @@ final class PermissionsManager: ObservableObject {
         case .systemAudio: pane = "Privacy_AudioCapture"
         }
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
+        // These two lists only show apps that already asked, so offer a way to add ours.
+        if kind == .screenRecording || kind == .systemAudio {
+            SettingsDragHelper.shared.show()
+        }
     }
 
     func openScreenRecordingSettings() { openSettings(for: .screenRecording) }

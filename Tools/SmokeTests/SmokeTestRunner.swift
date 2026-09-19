@@ -37,6 +37,7 @@ struct SmokeTestRunner {
         await runKeychainSuite()
         await runListeningActivitySuite()
         await runMenuLayoutSuite()
+        await runDragHelperPlacementSuite()
         await runPermissionMappingSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
@@ -1730,6 +1731,25 @@ struct SmokeTestRunner {
                 MenuLayout.entries(needsSetup: true, listeningActive: true) == setup,
                 "a running flag does not bring session entries back while setup is missing"
             )
+        }
+    }
+
+    static func runDragHelperPlacementSuite() async {
+        await suite("Drag helper placement") {
+            let screen = CGRect(x: 0, y: 40, width: 1440, height: 800)
+            let size = CGSize(width: 430, height: 96)
+            let frame = DragHelperPlacement.frame(panel: size, visibleScreen: screen)
+            await expect(frame.midX == screen.midX, "centred horizontally")
+            await expect(frame.minY == screen.minY + 12, "sits at the bottom of the visible area")
+            await expect(screen.contains(frame), "stays inside the screen")
+
+            let offset = CGRect(x: 1440, y: 0, width: 1000, height: 700)
+            let second = DragHelperPlacement.frame(panel: size, visibleScreen: offset)
+            await expect(second.midX == offset.midX && offset.contains(second), "works on a second screen")
+
+            let tiny = CGRect(x: 0, y: 0, width: 300, height: 200)
+            let squeezed = DragHelperPlacement.frame(panel: size, visibleScreen: tiny)
+            await expect(squeezed.minX >= tiny.minX, "a screen narrower than the panel does not push it off the left edge")
         }
     }
 
