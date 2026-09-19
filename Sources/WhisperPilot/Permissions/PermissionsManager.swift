@@ -117,21 +117,13 @@ final class PermissionsManager: ObservableObject {
         let status: SFSpeechRecognizerAuthorizationStatus = await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
         }
-        switch status {
-        case .authorized:
-            snapshot.speechRecognition = .granted
-            issues[.speechRecognition] = nil
+        let outcome = PermissionMapping.speechRequestOutcome(status)
+        snapshot.speechRecognition = outcome.status
+        issues[.speechRecognition] = outcome.issue
+        if outcome.status == .granted {
             wpInfo("Speech Recognition permission granted")
-        case .restricted:
-            snapshot.speechRecognition = .denied
-            issues[.speechRecognition] = "Speech Recognition is blocked by a device policy (Screen Time or your organization). Whisper Pilot can't change that."
-        case .denied, .notDetermined:
-            snapshot.speechRecognition = .denied
-            issues[.speechRecognition] = "Speech Recognition was not allowed. Turn on Whisper Pilot in System Settings → Privacy & Security → Speech Recognition."
-            wpWarn("Speech Recognition permission denied")
-        @unknown default:
-            snapshot.speechRecognition = .denied
-            issues[.speechRecognition] = "macOS returned an unknown Speech Recognition status. Check System Settings → Privacy & Security → Speech Recognition."
+        } else {
+            wpWarn("Speech Recognition permission not granted (status \(status.rawValue))")
         }
     }
 
@@ -200,41 +192,31 @@ final class PermissionsManager: ObservableObject {
     // MARK: - Passive checks (never show a dialog)
 
     private func currentMicrophone() -> PermissionStatus {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: return .granted
-        case .denied, .restricted: return .denied
-        case .notDetermined: return .unknown
-        @unknown default: return .unknown
-        }
+        PermissionMapping.microphone(AVCaptureDevice.authorizationStatus(for: .audio))
     }
 
     private func currentSpeechRecognition() -> PermissionStatus {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized: return .granted
-        case .denied, .restricted: return .denied
-        case .notDetermined: return .unknown
-        @unknown default: return .unknown
-        }
+        PermissionMapping.speechRecognition(SFSpeechRecognizer.authorizationStatus())
     }
 
     /// There is no public way to read the system-audio permission. We know the
     /// tap opened once (onboarding) or failed this run; anything else is unknown.
     private func currentSystemAudio() -> PermissionStatus {
-        guard Self.processTapSupported else { return .granted }
-        if defaults.bool(forKey: Keys.systemAudioRequested) { return .granted }
-        return deniedThisRun.contains(.systemAudio) ? .denied : .unknown
+        PermissionMapping.systemAudio(
+            processTapSupported: Self.processTapSupported,
+            openedBefore: defaults.bool(forKey: Keys.systemAudioRequested),
+            deniedThisRun: deniedThisRun.contains(.systemAudio)
+        )
     }
 
     /// Passive check for Screen Recording permission. Deliberately uses
     /// `CGPreflightScreenCaptureAccess` and NOT an `SCShareableContent` probe:
     /// the probe *triggers* the system dialog the first time it runs.
     private func currentScreenRecording() async -> PermissionStatus {
-        if snapshot.screenRecording == .granted {
-            // A live probe already confirmed the grant this run — don't let the
-            // stale preflight cache downgrade it.
-            return .granted
-        }
-        if CGPreflightScreenCaptureAccess() { return .granted }
-        return deniedThisRun.contains(.screenRecording) ? .denied : .unknown
+        PermissionMapping.screenRecording(
+            alreadyGranted: snapshot.screenRecording == .granted,
+            preflightGranted: snapshot.screenRecording == .granted ? false : CGPreflightScreenCaptureAccess(),
+            deniedThisRun: deniedThisRun.contains(.screenRecording)
+        )
     }
 }
