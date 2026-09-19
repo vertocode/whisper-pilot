@@ -83,7 +83,7 @@ final class UpdateChecker: ObservableObject {
     /// Numeric dotted-version comparison ("0.1.13" vs "0.1.9" → true). Missing
     /// components count as 0; non-numeric components count as 0, so a malformed
     /// tag can never claim to be newer than a well-formed installed version.
-    static func isVersion(_ candidate: String, newerThan installed: String) -> Bool {
+    nonisolated static func isVersion(_ candidate: String, newerThan installed: String) -> Bool {
         let a = candidate.split(separator: ".").map { Int($0) ?? 0 }
         let b = installed.split(separator: ".").map { Int($0) ?? 0 }
         for i in 0..<max(a.count, b.count) {

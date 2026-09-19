@@ -38,6 +38,7 @@ struct SmokeTestRunner {
         await runListeningActivitySuite()
         await runMenuLayoutSuite()
         await runDragHelperPlacementSuite()
+        await runOlderCopiesSuite()
         await runPermissionMappingSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
@@ -1731,6 +1732,46 @@ struct SmokeTestRunner {
                 MenuLayout.entries(needsSetup: true, listeningActive: true) == setup,
                 "a running flag does not bring session entries back while setup is missing"
             )
+        }
+    }
+
+    static func runOlderCopiesSuite() async {
+        await suite("Older copies") {
+            typealias Copy = OlderCopies.Copy
+            let apps = "/Applications/WhisperPilot.app"
+            let old = Copy(path: "/Users/me/Downloads/WhisperPilot.app", version: "0.1.25")
+
+            let found = OlderCopies.find(installedVersion: "0.1.26", currentPath: apps, candidates: [Copy(path: apps, version: "0.1.26"), old])
+            await expect(found == [old], "an older copy elsewhere is offered, the running one is not")
+
+            await expect(
+                OlderCopies.find(installedVersion: "0.1.26", currentPath: apps, candidates: [Copy(path: "/x/WhisperPilot.app", version: "0.1.27")]).isEmpty,
+                "a newer copy is never offered for removal"
+            )
+            await expect(
+                OlderCopies.find(installedVersion: "0.1.26", currentPath: apps, candidates: [Copy(path: "/x/WhisperPilot.app", version: "0.1.26")]).isEmpty,
+                "a copy with the same version is left alone"
+            )
+            await expect(
+                OlderCopies.find(installedVersion: "0.1.10", currentPath: apps, candidates: [Copy(path: "/x/WhisperPilot.app", version: "0.1.9")]).count == 1,
+                "versions compare as numbers (0.1.9 is older than 0.1.10)"
+            )
+            await expect(
+                OlderCopies.find(installedVersion: "0.1.26", currentPath: apps, candidates: [
+                    Copy(path: "/Volumes/Whisper Pilot/WhisperPilot.app", version: "0.1.20"),
+                    Copy(path: "/Users/me/.Trash/WhisperPilot.app", version: "0.1.20"),
+                ]).isEmpty,
+                "disk images and the Trash are not offered"
+            )
+            await expect(
+                OlderCopies.find(installedVersion: "0.1.26", currentPath: "/Volumes/Whisper Pilot/WhisperPilot.app", candidates: [old]).isEmpty,
+                "running from a disk image offers nothing, since that copy is not permanent"
+            )
+            await expect(
+                OlderCopies.find(installedVersion: "0.1.26", currentPath: "/private/var/folders/x/AppTranslocation/y/d/WhisperPilot.app", candidates: [old]).isEmpty,
+                "running from a quarantined download offers nothing"
+            )
+            await expect(old.dismissalKey != Copy(path: old.path, version: "0.1.24").dismissalKey, "Not now is remembered per version")
         }
     }
 

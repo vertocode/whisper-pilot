@@ -172,6 +172,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             await coordinator.bootstrap()
             showInitialWindow()
+            // Let the first window settle before asking anything else.
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            OlderCopyCleanup.offerIfNeeded()
         }
     }
 
