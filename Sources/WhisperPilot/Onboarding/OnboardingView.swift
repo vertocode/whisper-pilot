@@ -350,7 +350,7 @@ struct OnboardingView: View {
     }
 
     private var permissionsStep: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        scrollingStep {
             Text("Allow everything here")
                 .font(.system(size: 26, weight: .semibold))
                 .tracking(-0.35)
@@ -375,9 +375,7 @@ struct OnboardingView: View {
                 .font(.system(size: 12))
                 .padding(.top, WP.Space.md)
             }
-
-            Spacer(minLength: WP.Space.md)
-
+        } footer: {
             if !missingRequired.isEmpty {
                 Text("Still needed to start listening: \(missingRequired.map(title(of:)).joined(separator: ", ")).")
                     .font(.system(size: 11))
@@ -404,6 +402,30 @@ struct OnboardingView: View {
                     .controlSize(.large)
                     .disabled(!missingRequired.isEmpty)
             }
+        }
+    }
+
+    /// A step whose content can grow (long error messages, several rows) must not
+    /// push its buttons out of the fixed-size window. The body scrolls and the
+    /// footer stays put.
+    private func scrollingStep<Body: View, Footer: View>(
+        @ViewBuilder body: () -> Body,
+        @ViewBuilder footer: () -> Footer
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 0) {
+                    body()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.trailing, 4)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+
+            VStack(alignment: .leading, spacing: 0) {
+                footer()
+            }
+            .padding(.top, WP.Space.md)
         }
         .contentPadding()
     }
@@ -486,7 +508,7 @@ struct OnboardingView: View {
     }
 
     private var aiStep: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        scrollingStep {
             Text("Connect AI when you’re ready")
                 .font(.system(size: 26, weight: .semibold))
                 .tracking(-0.35)
@@ -546,7 +568,7 @@ struct OnboardingView: View {
                     .padding(.top, WP.Space.md)
             }
 
-            Spacer()
+        } footer: {
             footer(
                 secondaryTitle: hasSavedKey ? "Back" : "Set up later",
                 secondaryAction: hasSavedKey ? { step = .permissions } : finish,
@@ -555,8 +577,8 @@ struct OnboardingView: View {
                 primaryAction: saveKeyAndFinish
             )
         }
-        .contentPadding()
     }
+
 
     private var providerKeyURL: URL {
         switch selectedVendor {
