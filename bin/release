@@ -200,6 +200,13 @@ if [[ $SKIP_PUBLISH -eq 0 ]]; then
   fi
 fi
 
+# --- Tests -----------------------------------------------------------------
+# Run before anything is bumped or built, so a failing test leaves the repo
+# untouched and nothing gets published.
+step "Running smoke tests"
+swift run SmokeTests
+done_step "Smoke tests passed"
+
 # --- Bump in-repo version files --------------------------------------------
 # Keep Project.yml in sync with the version actually being released, so a
 # developer running the app from Xcode after a release sees the correct

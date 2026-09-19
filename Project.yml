@@ -7,11 +7,12 @@ options:
   generateEmptyDirectories: false
 
 # FluidAudio provides the Parakeet Unified streaming ASR engine (CoreML, ANE).
-# Pinned by minor version: its streaming APIs are still pre-1.0 and move fast.
+# Pinned by minor version (0.15.x only): its streaming APIs are still pre-1.0
+# and move fast. `from:` would also accept 0.16 and later.
 packages:
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio
-    from: 0.15.5
+    minorVersion: 0.15.5
 
 settings:
   base:

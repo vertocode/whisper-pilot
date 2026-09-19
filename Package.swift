@@ -18,7 +18,7 @@ let package = Package(
     name: "WhisperPilot",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio", from: "0.15.5")
+        .package(url: "https://github.com/FluidInference/FluidAudio", .upToNextMinor(from: "0.15.5"))
     ],
     targets: [
         .target(

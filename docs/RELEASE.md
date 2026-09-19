@@ -41,15 +41,16 @@ If `gh auth login` is done once and you have push access to both `vertocode/whis
 
 ### What the script does, step by step
 
-1. **Regenerates** the Xcode project (`./bin/regenerate`)
-2. **Archives** `Release` config with `MARKETING_VERSION=<your version>`
-3. **Extracts** the `.app` (signed export via `xcodebuild -exportArchive` if `WP_DEVELOPER_ID` is set, otherwise a plain copy out of the archive)
-4. **Notarizes** the `.app`, if all of `WP_APPLE_ID` / `WP_APPLE_APP_PASSWORD` / `WP_TEAM_ID` are set
-5. **Wraps** the `.app` into a DMG via `create-dmg`
-6. **Signs + notarizes the DMG** if signing is configured
-7. **Computes SHA-256** and writes `WhisperPilot-<version>.dmg.sha256` next to the DMG
-8. *(unless `--build-only`)* **Creates GitHub Release** `v<version>` via `gh release create` and attaches the DMG
-9. *(unless `--skip-tap`)* **Clones the tap**, sed-bumps `version` + `sha256` in `Casks/whisper-pilot.rb`, commits, pushes
+1. **Runs the smoke tests** (`swift run SmokeTests`) and stops if any fail, before anything is bumped or built
+2. **Regenerates** the Xcode project (`./bin/regenerate`)
+3. **Archives** `Release` config with `MARKETING_VERSION=<your version>`
+4. **Extracts** the `.app` (signed export via `xcodebuild -exportArchive` if `WP_DEVELOPER_ID` is set, otherwise a plain copy out of the archive)
+5. **Notarizes** the `.app`, if all of `WP_APPLE_ID` / `WP_APPLE_APP_PASSWORD` / `WP_TEAM_ID` are set
+6. **Wraps** the `.app` into a DMG via `create-dmg`
+7. **Signs + notarizes the DMG** if signing is configured
+8. **Computes SHA-256** and writes `WhisperPilot-<version>.dmg.sha256` next to the DMG
+9. *(unless `--build-only`)* **Creates GitHub Release** `v<version>` via `gh release create` and attaches the DMG
+10. *(unless `--skip-tap`)* **Clones the tap**, sed-bumps `version` + `sha256` in `Casks/whisper-pilot.rb`, commits, pushes
 
 ## CI release
 
@@ -109,8 +110,9 @@ Without these, builds ship unsigned and users must right-click → Open the firs
 
 ## What the release script does
 
-`bin/release` chains five steps:
+`bin/release` chains six steps:
 
+0. **Run the smoke tests** — `swift run SmokeTests`; a failure stops the release before anything is built or published.
 1. **Regenerate the Xcode project** — runs `xcodegen` so the `.xcodeproj` matches `Project.yml`.
 2. **Archive** — `xcodebuild archive` in Release configuration produces a `.xcarchive`.
 3. **Export** — pulls the `.app` out of the archive.

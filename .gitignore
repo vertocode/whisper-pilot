@@ -13,7 +13,6 @@ build/
 # Swift Package Manager
 .swiftpm/
 Packages/
-Package.resolved
 
 # Generated
 *.pbxproj.bak
