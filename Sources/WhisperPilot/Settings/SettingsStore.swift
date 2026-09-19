@@ -486,6 +486,11 @@ final class SettingsStore: ObservableObject {
     @Published private(set) var keychainErrorMessage: String? = nil
 
     @Published private(set) var keychainAccess: KeychainAccess = .noKeysStored
+    private var isUnlockingKeys = false
+    /// Answer to "which vendors have a key" while nothing is unlocked. SwiftUI
+    /// asks on every redraw, and each answer can cost up to three Keychain
+    /// attribute queries; it only changes when a key is saved or unlocked.
+    private var configuredVendorsCache: Set<AIVendor>?
 
     /// Cache-only: returns nil until the Keychain has been unlocked (or the key
     /// was saved in this run). Check `keychainAccess` to tell "no key" apart
@@ -527,6 +532,7 @@ final class SettingsStore: ObservableObject {
             objectWillChange.send()
             return
         }
+        configuredVendorsCache = nil
         let cleaned = (newValue ?? "").isEmpty ? nil : newValue
         var bundle = KeyBundle(gemini: geminiAPIKey, anthropic: anthropicAPIKey)
         switch vendor {
@@ -571,6 +577,11 @@ final class SettingsStore: ObservableObject {
     /// main thread because it blocks until the user answers the dialog.
     @discardableResult
     func unlockStoredKeys() async -> KeychainAccess {
+        // A second press while the first is still waiting on macOS must not
+        // stack another dialog.
+        guard !isUnlockingKeys else { return keychainAccess }
+        isUnlockingKeys = true
+        defer { isUnlockingKeys = false }
         let migrated = defaults.bool(forKey: Keys.legacyKeysMigrated)
         let secrets = self.secrets
         let outcome = await Task.detached { Self.loadFromKeychain(legacyMigrated: migrated, secrets: secrets) }.value
@@ -650,6 +661,7 @@ final class SettingsStore: ObservableObject {
     }
 
     private func apply(_ outcome: LoadOutcome) {
+        configuredVendorsCache = nil
         if let bundle = outcome.bundle {
             cachedGeminiAPIKey = .loaded(bundle.gemini)
             cachedAnthropicAPIKey = .loaded(bundle.anthropic)
@@ -720,12 +732,19 @@ final class SettingsStore: ObservableObject {
     /// reason, so a later AI call doesn't re-query.
     var hasGeminiAPIKey: Bool {
         if case .loaded(let v) = cachedGeminiAPIKey { return !(v ?? "").isEmpty }
-        return Self.configuredVendors(defaults: defaults, secrets: secrets).contains(.gemini)
+        return cachedConfiguredVendors().contains(.gemini)
     }
 
     var hasAnthropicAPIKey: Bool {
         if case .loaded(let v) = cachedAnthropicAPIKey { return !(v ?? "").isEmpty }
-        return Self.configuredVendors(defaults: defaults, secrets: secrets).contains(.anthropic)
+        return cachedConfiguredVendors().contains(.anthropic)
+    }
+
+    private func cachedConfiguredVendors() -> Set<AIVendor> {
+        if let configuredVendorsCache { return configuredVendorsCache }
+        let vendors = Self.configuredVendors(defaults: defaults, secrets: secrets)
+        configuredVendorsCache = vendors
+        return vendors
     }
 
     init(defaults: UserDefaults = .standard, secrets: any SecretStore = SystemSecretStore()) {

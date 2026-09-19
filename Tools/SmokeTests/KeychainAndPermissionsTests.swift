@@ -11,6 +11,7 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private var build: String
     private var readLog: [String] = []
     private var setCalls = 0
+    private var existsCalls = 0
     private var overrides: [String: KeychainHelper.ReadResult] = [:]
     private var writeStatus: OSStatus = errSecSuccess
 
@@ -22,12 +23,13 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     var buildIdentity: String { lock.withLock { build } }
     var reads: [String] { lock.withLock { readLog } }
     var setCount: Int { lock.withLock { setCalls } }
+    var existsCount: Int { lock.withLock { existsCalls } }
     func item(_ key: String) -> String? { lock.withLock { items[key] } }
     func setBuild(_ value: String) { lock.withLock { build = value } }
     func failReads(of key: String, with result: KeychainHelper.ReadResult?) { lock.withLock { overrides[key] = result } }
     func failWrites(with status: OSStatus) { lock.withLock { writeStatus = status } }
 
-    func exists(_ key: String) -> Bool { lock.withLock { items[key] != nil } }
+    func exists(_ key: String) -> Bool { lock.withLock { existsCalls += 1; return items[key] != nil } }
 
     func read(_ key: String) -> KeychainHelper.ReadResult {
         lock.withLock {
@@ -144,6 +146,15 @@ extension SmokeTestRunner {
         let nextBuild = SettingsStore(defaults: deferDefaults, secrets: FakeSecretStore(build: "build-2"))
         await expect(!nextBuild.isSetupDeferredForThisBuild, "Set up later does not carry over to an updated build")
 
+        // Two presses of "Allow Keychain access" must not read twice.
+        let doubleFake = FakeSecretStore(items: ["api_keys": bundleJSON(gemini: "g")])
+        let doubleStore = SettingsStore(defaults: scratchDefaults(), secrets: doubleFake)
+        async let first = doubleStore.unlockStoredKeys()
+        async let second = doubleStore.unlockStoredKeys()
+        _ = await (first, second)
+        await expect(doubleFake.reads == ["api_keys"], "a second press while unlocking does not read again")
+        await expect(doubleStore.keychainAccess == .ready, "the first press still finishes the unlock")
+
         // Denied, then allowed on retry.
         let deniedFake = FakeSecretStore(items: ["api_keys": bundleJSON(gemini: "g-key")])
         deniedFake.failReads(of: "api_keys", with: .denied)
@@ -187,6 +198,15 @@ extension SmokeTestRunner {
 
         let relaunched = SettingsStore(defaults: defaults, secrets: fake)
         await expect(relaunched.geminiAPIKey == "g" && relaunched.anthropicAPIKey == "a", "after migration the bundle supplies the keys")
+        let lockedFake = FakeSecretStore(items: ["gemini.api_key": "g", "anthropic.api_key": "a"])
+        let lockedStore = SettingsStore(defaults: scratchDefaults(), secrets: lockedFake)
+        let existsAtLaunch = lockedFake.existsCount
+        for _ in 0..<10 { _ = lockedStore.hasGeminiAPIKey; _ = lockedStore.availableVendors }
+        await expect(lockedFake.existsCount - existsAtLaunch <= 3, "repeated redraw checks query the Keychain at most once")
+        _ = await lockedStore.unlockStoredKeys()
+        let existsAfterUnlock = lockedFake.existsCount
+        for _ in 0..<10 { _ = lockedStore.hasGeminiAPIKey }
+        await expect(lockedFake.existsCount == existsAfterUnlock, "after unlock the checks use memory only")
         await expect(Array(fake.reads.suffix(1)) == ["api_keys"], "after migration only the bundle is read")
         await expect(fake.reads.filter { $0 == "gemini.api_key" }.count == 1, "legacy items are not read a second time")
 

@@ -112,7 +112,7 @@ struct UpdateAvailableButton: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
-                .help("You're on v\(AppInfo.version). Opens the GitHub release page — download the DMG, or run: brew upgrade --cask whisper-pilot")
+                .help("You're on v\(AppInfo.version). Opens the GitHub release page — download the DMG, or run: brew upgrade --cask whisper-pilot. macOS will ask again for permissions and Keychain access after an update.")
             }
         }
         .task { await checker.checkForUpdates() }
