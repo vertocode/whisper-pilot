@@ -65,6 +65,7 @@ final class SettingsStore: ObservableObject {
     nonisolated static let currentOnboardingVersion = 1
 
     private let defaults: UserDefaults
+    private let secrets: any SecretStore
 
     private(set) var onboardingCompletedVersion: Int
 
@@ -76,11 +77,11 @@ final class SettingsStore: ObservableObject {
     /// "Set up later" on the permissions screen. Remembered per build so the
     /// app does not nag on every launch, but comes back after an update.
     func deferSetupForThisBuild() {
-        defaults.set(KeychainHelper.buildIdentity, forKey: Keys.setupDeferredBuild)
+        defaults.set(secrets.buildIdentity, forKey: Keys.setupDeferredBuild)
     }
 
     var isSetupDeferredForThisBuild: Bool {
-        defaults.string(forKey: Keys.setupDeferredBuild) == KeychainHelper.buildIdentity
+        defaults.string(forKey: Keys.setupDeferredBuild) == secrets.buildIdentity
     }
 
     /// Wire id of the currently-selected model. Sourced from
@@ -535,9 +536,9 @@ final class SettingsStore: ObservableObject {
 
         let status: OSStatus
         if bundle.vendorIDs.isEmpty {
-            status = KeychainHelper.set(nil, forKey: Keys.apiKeysBundle)
+            status = secrets.set(nil, forKey: Keys.apiKeysBundle)
         } else if let data = try? JSONEncoder().encode(bundle), let json = String(data: data, encoding: .utf8) {
-            status = KeychainHelper.set(json, forKey: Keys.apiKeysBundle)
+            status = secrets.set(json, forKey: Keys.apiKeysBundle)
         } else {
             status = errSecParam
         }
@@ -555,7 +556,7 @@ final class SettingsStore: ObservableObject {
                 keychainAccess = .noKeysStored
             } else {
                 keychainAccess = .ready
-                defaults.set(KeychainHelper.buildIdentity, forKey: Keys.keychainApprovedBuild)
+                defaults.set(secrets.buildIdentity, forKey: Keys.keychainApprovedBuild)
             }
         } else {
             let action = cleaned == nil ? "Removing" : "Saving"
@@ -571,7 +572,8 @@ final class SettingsStore: ObservableObject {
     @discardableResult
     func unlockStoredKeys() async -> KeychainAccess {
         let migrated = defaults.bool(forKey: Keys.legacyKeysMigrated)
-        let outcome = await Task.detached { Self.loadFromKeychain(legacyMigrated: migrated) }.value
+        let secrets = self.secrets
+        let outcome = await Task.detached { Self.loadFromKeychain(legacyMigrated: migrated, secrets: secrets) }.value
         apply(outcome)
         return outcome.access
     }
@@ -587,9 +589,9 @@ final class SettingsStore: ObservableObject {
     /// Reads the single bundle item; if only the old one-item-per-vendor
     /// entries exist, reads those (one approval each, once) and rewrites them
     /// into the bundle.
-    private nonisolated static func loadFromKeychain(legacyMigrated: Bool) -> LoadOutcome {
-        if KeychainHelper.exists(Keys.apiKeysBundle) {
-            switch KeychainHelper.read(Keys.apiKeysBundle) {
+    private nonisolated static func loadFromKeychain(legacyMigrated: Bool, secrets: any SecretStore) -> LoadOutcome {
+        if secrets.exists(Keys.apiKeysBundle) {
+            switch secrets.read(Keys.apiKeysBundle) {
             case .value(let json):
                 guard let bundle = try? JSONDecoder().decode(KeyBundle.self, from: Data(json.utf8)) else {
                     wpError("Keychain bundle could not be decoded")
@@ -609,8 +611,8 @@ final class SettingsStore: ObservableObject {
         var readLegacy = false
         if !legacyMigrated {
             for (vendor, account) in [(AIVendor.gemini, Keys.geminiAPIKey), (AIVendor.anthropic, Keys.anthropicAPIKey)]
-            where KeychainHelper.exists(account) {
-                switch KeychainHelper.read(account) {
+            where secrets.exists(account) {
+                switch secrets.read(account) {
                 case .value(let v):
                     readLegacy = true
                     if vendor == .gemini { bundle.gemini = v } else { bundle.anthropic = v }
@@ -628,7 +630,7 @@ final class SettingsStore: ObservableObject {
         }
         var outcome = LoadOutcome(bundle: bundle, access: .ready)
         if let data = try? JSONEncoder().encode(bundle), let json = String(data: data, encoding: .utf8),
-           KeychainHelper.set(json, forKey: Keys.apiKeysBundle) == errSecSuccess {
+           secrets.set(json, forKey: Keys.apiKeysBundle) == errSecSuccess {
             outcome.migratedLegacy = true
         } else {
             // Keys still work for this run; the move is retried next launch.
@@ -659,7 +661,7 @@ final class SettingsStore: ObservableObject {
         keychainErrorMessage = outcome.errorMessage
         keychainAccess = outcome.access
         if outcome.access == .ready {
-            defaults.set(KeychainHelper.buildIdentity, forKey: Keys.keychainApprovedBuild)
+            defaults.set(secrets.buildIdentity, forKey: Keys.keychainApprovedBuild)
         }
         objectWillChange.send()
     }
@@ -667,13 +669,13 @@ final class SettingsStore: ObservableObject {
     /// Vendors that have a saved key, answered without opening any secret.
     /// Uses the list remembered in UserDefaults, plus the old per-vendor items
     /// (attributes only) until they've been moved into the bundle.
-    private nonisolated static func configuredVendors(defaults: UserDefaults) -> Set<AIVendor> {
+    private nonisolated static func configuredVendors(defaults: UserDefaults, secrets: any SecretStore) -> Set<AIVendor> {
         var vendors = Set((defaults.stringArray(forKey: Keys.storedVendors) ?? []).compactMap(AIVendor.init(rawValue:)))
         if !defaults.bool(forKey: Keys.legacyKeysMigrated) {
-            if KeychainHelper.exists(Keys.geminiAPIKey) { vendors.insert(.gemini) }
-            if KeychainHelper.exists(Keys.anthropicAPIKey) { vendors.insert(.anthropic) }
+            if secrets.exists(Keys.geminiAPIKey) { vendors.insert(.gemini) }
+            if secrets.exists(Keys.anthropicAPIKey) { vendors.insert(.anthropic) }
         }
-        if vendors.isEmpty, KeychainHelper.exists(Keys.apiKeysBundle) {
+        if vendors.isEmpty, secrets.exists(Keys.apiKeysBundle) {
             // The list was lost (defaults wiped) — assume both until unlocked.
             vendors = Set(AIVendor.allCases)
         }
@@ -684,17 +686,17 @@ final class SettingsStore: ObservableObject {
     /// this exact build, which means macOS will not ask again. Otherwise the
     /// state becomes `.needsUnlock` and onboarding asks, with an explanation.
     private func restoreKeychainAccess() {
-        guard !Self.configuredVendors(defaults: defaults).isEmpty else {
+        guard !Self.configuredVendors(defaults: defaults, secrets: secrets).isEmpty else {
             keychainAccess = .noKeysStored
             return
         }
-        let build = KeychainHelper.buildIdentity
+        let build = secrets.buildIdentity
         guard build != KeychainHelper.unknownBuildIdentity,
               defaults.string(forKey: Keys.keychainApprovedBuild) == build else {
             keychainAccess = .needsUnlock
             return
         }
-        apply(Self.loadFromKeychain(legacyMigrated: defaults.bool(forKey: Keys.legacyKeysMigrated)))
+        apply(Self.loadFromKeychain(legacyMigrated: defaults.bool(forKey: Keys.legacyKeysMigrated), secrets: secrets))
     }
 
     /// Which AI vendors have a configured API key right now. Used by the
@@ -718,22 +720,23 @@ final class SettingsStore: ObservableObject {
     /// reason, so a later AI call doesn't re-query.
     var hasGeminiAPIKey: Bool {
         if case .loaded(let v) = cachedGeminiAPIKey { return !(v ?? "").isEmpty }
-        return Self.configuredVendors(defaults: defaults).contains(.gemini)
+        return Self.configuredVendors(defaults: defaults, secrets: secrets).contains(.gemini)
     }
 
     var hasAnthropicAPIKey: Bool {
         if case .loaded(let v) = cachedAnthropicAPIKey { return !(v ?? "").isEmpty }
-        return Self.configuredVendors(defaults: defaults).contains(.anthropic)
+        return Self.configuredVendors(defaults: defaults, secrets: secrets).contains(.anthropic)
     }
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, secrets: any SecretStore = SystemSecretStore()) {
         self.defaults = defaults
+        self.secrets = secrets
         self.onboardingCompletedVersion = defaults.integer(forKey: Keys.onboardingCompletedVersion)
         // Existence checks only (attributes, never the secret): the model choice
         // below needs to know which vendors have a key, and this must not cost
         // the user a macOS dialog. The secrets themselves are opened at the end
         // of init, and only for a build the user already approved.
-        let configuredAtBoot = Self.configuredVendors(defaults: defaults)
+        let configuredAtBoot = Self.configuredVendors(defaults: defaults, secrets: secrets)
 
         // Resolve the active model in priority order:
         //   1. New unified key set by post-v0.1.11 builds.
