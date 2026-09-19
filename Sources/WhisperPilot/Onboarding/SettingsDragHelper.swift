@@ -10,11 +10,13 @@ import SwiftUI
 final class SettingsDragHelper {
     static let shared = SettingsDragHelper()
 
-    private static let size = CGSize(width: 430, height: 96)
+    private static let size = CGSize(width: 430, height: 120)
     private var panel: NSPanel?
     private var activeObserver: NSObjectProtocol?
 
-    func show() {
+    /// `listName` is the heading of the list in System Settings the user should
+    /// look for, so the text can say exactly where to drop the icon.
+    func show(listName: String) {
         close()
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: Self.size),
@@ -29,7 +31,7 @@ final class SettingsDragHelper {
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView: DragHelperView(onDone: { [weak self] in self?.close() }))
+        panel.contentView = NSHostingView(rootView: DragHelperView(listName: listName, onDone: { [weak self] in self?.close() }))
 
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main
         if let visible = screen?.visibleFrame {
@@ -55,6 +57,7 @@ final class SettingsDragHelper {
 }
 
 private struct DragHelperView: View {
+    let listName: String
     let onDone: () -> Void
 
     var body: some View {
@@ -64,9 +67,10 @@ private struct DragHelperView: View {
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.12)))
                 .help("Drag this into the list in System Settings")
             VStack(alignment: .leading, spacing: 4) {
-                Label("Drag Whisper Pilot into the list above", systemImage: "arrow.up")
+                Text("Drag this icon into the “\(listName)” list in System Settings")
                     .font(.system(size: 13, weight: .semibold))
-                Text("Or click + under the list and choose Whisper Pilot. Then switch it on.")
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Or click + under that list and choose Whisper Pilot. Then switch it on.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -75,7 +79,7 @@ private struct DragHelperView: View {
             Button("Done", action: onDone)
         }
         .padding(14)
-        .frame(width: 430, height: 96)
+        .frame(width: 430, height: 120)
     }
 }
 

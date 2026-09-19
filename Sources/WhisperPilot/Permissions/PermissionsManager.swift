@@ -186,7 +186,9 @@ final class PermissionsManager: ObservableObject {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
         // These two lists only show apps that already asked, so offer a way to add ours.
         if kind == .screenRecording || kind == .systemAudio {
-            SettingsDragHelper.shared.show()
+            SettingsDragHelper.shared.show(
+                listName: kind == .systemAudio ? "System Audio Recording Only" : "Screen & System Audio Recording"
+            )
         }
     }
 
