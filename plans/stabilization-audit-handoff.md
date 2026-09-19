@@ -180,6 +180,15 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 - `AppCoordinator.captureScreenJPEG` now posts a "needs Screen Recording, open Setup" note and returns nil, then the callers (`sendUserPrompt`, `answerScreen`) add their own generic "Couldn't capture screen" note. Keep one message.
 - **Done:** `captureScreenJPEG` returns `.image / .needsSetup / .failed`; callers add the generic note only for `.failed`. The setup note now says "Reading your screen needs…" because it also shows for the composer's "See my screen". 🔧 Checklist item 10 still needs a real run.
 
+**P1-12. Onboarding buttons pushed out of the window (found by the owner on a real Mac, 2026-09-19).** — **FIXED in code, not seen on screen**
+- What: the window is a fixed 780×640. On the Access step, a long red message under a row (for example "Screen Recording was not allowed…") made the content taller than the window, so Back and Continue were cut off and the user could not advance.
+- Fix: the Access and Answer steps now use `scrollingStep`: the body scrolls and the buttons stay pinned at the bottom, whatever the message length. 🔧 Confirm by denying Screen Recording again and checking that Continue is visible (scroll the list if needed).
+
+**P1-13. Whisper Pilot is missing from System Settings → Screen & System Audio Recording (found by the owner on a real Mac, 2026-09-19).** — **MITIGATED in code, root cause not confirmed**
+- What: after "Screen Recording was not allowed", **Open Settings** opened the pane but the app was not in the list, so there was no switch to turn on. macOS only lists an app after a permission request it accepted as a request; I could not reproduce the request outcome without a dialog.
+- Fix: opening either pane now also shows a small floating window (`SettingsDragHelper`) at the bottom of the screen with the app icon to drag into the list, and the text "or click + and choose Whisper Pilot, then switch it on". It never starts a capture or asks macOS for anything. The red messages for Screen Recording and system audio now say the same. Placement is `DragHelperPlacement` (tested). It closes on Done, on ✕, or when the user comes back to Whisper Pilot.
+- Not done: making the app appear already listed with the switch off. Only a request that macOS registers does that, and `CGRequestScreenCaptureAccess()` next to the existing `SCShareableContent` probe could show two dialogs, which cannot be judged without a Mac. 🔧 To check: on a fresh `tccutil reset`, press Allow on Screen Recording, note whether the app appears in the list; then Open Settings and try the drag. If the app *does* appear after Allow but stays off, the drag helper is just a fallback.
+
 ### P2. Performance and maintainability
 
 **P2-1. Session list re-reads every transcript.** — **DONE (2026-09-19)**
