@@ -36,6 +36,7 @@ struct SmokeTestRunner {
         await runSingleInstanceSuite()
         await runKeychainSuite()
         await runListeningActivitySuite()
+        await runMenuLayoutSuite()
         await runPermissionMappingSuite()
         await runTranslationLayoutSuite()
         await runTranslationBufferSuite()
@@ -1706,6 +1707,29 @@ struct SmokeTestRunner {
             await expect(WakeRecovery.needsRestart(framesBefore: 500, framesAfter: 500), "no new frames after wake -> restart")
             await expect(WakeRecovery.needsRestart(framesBefore: 500, framesAfter: 0), "counter reset after wake -> restart")
             await expect(!WakeRecovery.needsRestart(framesBefore: 500, framesAfter: 620), "frames still arriving -> leave it alone")
+        }
+    }
+
+    static func runMenuLayoutSuite() async {
+        await suite("Menu bar layout") {
+            let setup = MenuLayout.entries(needsSetup: true, listeningActive: false)
+            await expect(
+                setup == [.finishSetup, .separator, .settings, .separator, .about, .quit],
+                "while setup is missing: Finish setup, Settings, About, Quit only"
+            )
+            await expect(!setup.contains(.showOverlay) && !setup.contains(.sessions), "no session entries while setup is missing")
+            let idle = MenuLayout.entries(needsSetup: false, listeningActive: false)
+            await expect(
+                idle == [.toggleListening(running: false), .showOverlay, .separator, .sessions, .settings, .separator, .about, .quit],
+                "full menu once setup is done"
+            )
+            let running = MenuLayout.entries(needsSetup: false, listeningActive: true)
+            await expect(running.first == .toggleListening(running: true), "the first entry reflects a running session")
+            await expect(!idle.contains(.finishSetup), "the full menu has no Finish setup")
+            await expect(
+                MenuLayout.entries(needsSetup: true, listeningActive: true) == setup,
+                "a running flag does not bring session entries back while setup is missing"
+            )
         }
     }
 

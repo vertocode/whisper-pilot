@@ -79,47 +79,35 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func rebuildMenu() {
         menu.removeAllItems()
-
-        if needsSetup() {
-            let setup = NSMenuItem(title: "Finish setup…", action: #selector(openSetupAction), keyEquivalent: "")
-            setup.target = self
-            menu.addItem(setup)
-            menu.addItem(.separator())
-            addSettingsItem()
-        } else {
-            let toggle = NSMenuItem(title: listeningActive ? "Stop listening" : "Start listening", action: #selector(toggleListening), keyEquivalent: "l")
-            toggle.target = self
-            toggle.tag = 1
-            menu.addItem(toggle)
-
-            let showOverlay = NSMenuItem(title: "Show overlay", action: #selector(showOverlay), keyEquivalent: "o")
-            showOverlay.target = self
-            menu.addItem(showOverlay)
-
-            menu.addItem(.separator())
-
-            let sessions = NSMenuItem(title: "Sessions…", action: #selector(openSessionsAction), keyEquivalent: "s")
-            sessions.target = self
-            menu.addItem(sessions)
-
-            addSettingsItem()
+        for entry in MenuLayout.entries(needsSetup: needsSetup(), listeningActive: listeningActive) {
+            switch entry {
+            case .finishSetup:
+                addItem("Finish setup…", #selector(openSetupAction))
+            case .toggleListening(let running):
+                let toggle = addItem(running ? "Stop listening" : "Start listening", #selector(toggleListening), key: "l")
+                toggle.tag = 1
+            case .showOverlay:
+                addItem("Show overlay", #selector(showOverlay), key: "o")
+            case .sessions:
+                addItem("Sessions…", #selector(openSessionsAction), key: "s")
+            case .settings:
+                addItem("Settings…", #selector(openSettingsAction), key: ",")
+            case .separator:
+                menu.addItem(.separator())
+            case .about:
+                addItem("About Whisper Pilot", #selector(showAbout))
+            case .quit:
+                addItem("Quit Whisper Pilot", #selector(quit), key: "q")
+            }
         }
-
-        menu.addItem(.separator())
-
-        let about = NSMenuItem(title: "About Whisper Pilot", action: #selector(showAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
-
-        let quit = NSMenuItem(title: "Quit Whisper Pilot", action: #selector(quit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
     }
 
-    private func addSettingsItem() {
-        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettingsAction), keyEquivalent: ",")
-        settings.target = self
-        menu.addItem(settings)
+    @discardableResult
+    private func addItem(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+        let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        menuItem.target = self
+        menu.addItem(menuItem)
+        return menuItem
     }
 
     private func updateToggleTitle(running: Bool) {
