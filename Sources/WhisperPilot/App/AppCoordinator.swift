@@ -1697,6 +1697,14 @@ final class AppCoordinator {
         var channels: Set<AudioChannel> = [.system]
         if settings.captureMicrophone { channels.insert(.microphone) }
 
+        // Set when Parakeet fails; the note is posted only once an Apple engine
+        // actually starts, so we never claim a fallback that didn't happen.
+        var parakeetFailure: Error?
+        func announceFallbackIfNeeded() {
+            guard let parakeetFailure else { return }
+            overlayState.appendSystemNote(EngineFallbackNote.text(for: parakeetFailure), category: .general)
+        }
+
         // Parakeet is English-only; other locales go straight to the Apple engines.
         if settings.localeIdentifier.lowercased().hasPrefix("en") {
             let parakeet = ParakeetTranscriber(statusNote: { [weak self] note in
@@ -1710,6 +1718,7 @@ final class AppCoordinator {
                 return parakeet
             } catch {
                 wpWarn("[Coordinator] Parakeet start failed (\(error.localizedDescription)); falling back to Apple speech engines")
+                parakeetFailure = error
                 parakeet.stop()
             }
         } else {
@@ -1721,6 +1730,7 @@ final class AppCoordinator {
             do {
                 try await modern.start(enabledChannels: channels)
                 wpInfo("[Coordinator] using SpeechAnalyzer (macOS 26+) transcriber (channels=\(channels))")
+                announceFallbackIfNeeded()
                 return modern
             } catch {
                 wpWarn("[Coordinator] SpeechAnalyzer start failed (\(error.localizedDescription)); falling back to SFSpeechRecognizer")
@@ -1730,6 +1740,7 @@ final class AppCoordinator {
         let legacy = AppleSpeechTranscriber(locale: settings.locale)
         try await legacy.start(enabledChannels: channels)
         wpInfo("[Coordinator] using SFSpeechRecognizer transcriber (channels=\(channels))")
+        announceFallbackIfNeeded()
         return legacy
     }
 
