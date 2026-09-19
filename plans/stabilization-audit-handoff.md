@@ -87,46 +87,54 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 
 ### P0. Trust, privacy, data loss
 
-**P0-1. The legacy speech path can send audio to Apple's servers, contradicting our privacy claims.** 🔧
+**P0-1. The legacy speech path can send audio to Apple's servers, contradicting our privacy claims.** 🔧 — **DONE in code (2026-09-18), not verified on a device**
 - Where: `Transcription/AppleSpeechTranscriber.swift:209` sets `request.requiresOnDeviceRecognition = false` (the comment above it says Apple's servers are used when the on-device model is unavailable).
 - When it runs: non-English locales on macOS < 26, or English when Parakeet and SpeechAnalyzer both fail (see P0-3).
 - Contradicts: `README.md:106` ("Audio never leaves your device"), `NSSpeechRecognitionUsageDescription` in `Project.yml` and `Resources/Info.plist` ("on-device"), and **the onboarding copy** in `OnboardingView.swift` (`reason(of:)` for Microphone and Speech Recognition says audio is processed on this Mac).
 - Fix, in order of preference: (a) set `requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition` and, when on-device is not supported for the chosen locale, stop with a clear message ("Your language needs Apple's servers. Whisper Pilot won't send audio unless you allow it") instead of silently using the network; (b) if the owner decides to keep the server fallback, make it opt-in and state it in the README and onboarding. The existing comment warns that forcing `true` when the model is not ready produces silent no-output, so check `supportsOnDeviceRecognition` first and surface the failure.
 - Until fixed, soften the onboarding and README wording so it stays true.
+- **Done:** took option (a). `ChannelPipe.init` throws `TranscriberError.onDeviceUnavailable` when `supportsOnDeviceRecognition` is false, and every request now sets `requiresOnDeviceRecognition = true`. README and onboarding copy are true again, no wording change needed. 🔧 Still to check on a Mac: a locale with no on-device model (macOS < 26) shows the new error in the overlay instead of transcribing; English still works.
 
-**P0-2. Meeting text is written to `runtime.log`, and the README tells users to share that log.**
+**P0-2. Meeting text is written to `runtime.log`, and the README tells users to share that log.** — **DONE (2026-09-18)**
 - Where: `AppleSpeechTranscriber.swift:376,404,538,577`, `ParakeetTranscriber.swift:220,320`, `SpeechAnalyzerTranscriber.swift:392,418` log final/first transcript text (`FINAL: "…"`). `CrashLogger` mirrors every `wpInfo/wpWarn/wpError` line to `~/Library/Application Support/<bundle id>/runtime.log`. `README.md:80` points users at that file and asks for log excerpts in issues; the app also re-shows the last ~20 lines after an unclean shutdown.
 - Fix: log segment ids, lengths and timing, never text. If content logging is useful for development, gate it behind an explicit debug setting that is off by default. Also `SessionStore.swift:136` logs the session folder path publicly; the folder name contains the user's session title.
 - Verify: run a short session, then `grep -c` the log for words you spoke.
+- **Done:** all 8 transcript-text log lines now log the character count only. `SessionStore` logs the session folder path as `.private`. The AI providers already log the question as `.private`, and only `wp*` lines reach `runtime.log`. 🔧 The grep check on a real session is still open.
 
-**P0-3. Silent downgrade from Parakeet to Apple engines.** 🔧
+**P0-3. Silent downgrade from Parakeet to Apple engines.** 🔧 — **DONE in code (2026-09-18), not verified on a device**
 - Where: `AppCoordinator.swift:1712` (`Parakeet start failed … falling back`) only writes to the log. Typical cause: first run offline, the ~600 MB model download fails.
 - Why: the user gets a different (lower accuracy, and per P0-1 possibly server-based) engine with no notice.
 - Fix: post a system note saying which engine is active and why, with the actionable reason ("Couldn't download the speech model: offline. Using Apple's engine for now").
+- **Done:** `EngineFallbackNote` (new, pure, 8 assertions) builds the note. `makeStartedTranscriber` posts it only after an Apple engine actually started. 🔧 To check: start a session offline with no cached model and see the note.
 
-**P0-4. Transcript persistence failures are silent.**
+**P0-4. Transcript persistence failures are silent.** — **DONE except the free-space check (2026-09-19)**
 - Where: `Persistence/SessionStore.swift:481` `appendToFile` catches and only logs; the callers (`AppCoordinator.queueTranscriptPersistence`, `persistPendingTranscriptLine`) never learn about it.
 - Why: disk full, permission changes or a removed folder mean the overlay looks healthy while `transcript.md` stops growing. That is silent data loss in the app's core promise.
 - Fix: return success/failure, count consecutive failures, and show a persistent banner ("Can't save this transcript: <reason>. Your session is not being saved"). Consider a free-space check before starting a session (`volumeAvailableCapacityForImportantUsage`).
 - Verify with a read-only session folder or a tiny disk image.
+- **Done:** `SessionStore.appendTranscriptLine/appendChatTurn` now return `Result<Void, Error>`. New pure `SaveHealth` turns the first failure into one persistent overlay banner with a plain reason (disk full, no permission, read-only, folder deleted) and posts a short note when saving recovers. Tests cover the state machine and real failures (read-only file, deleted folder). **Not done:** the free-space check before starting a session (the handoff said "consider"). 🔧 Still to try on a real tiny disk image.
 
-**P0-5. Partial AI answers are lost from `chat.md` on error or cancel.**
+**P0-5. Partial AI answers are lost from `chat.md` on error or cancel.** — **DONE (2026-09-19)**
 - Where: `AppCoordinator.runCompletion` (~line 2387). The assistant text is persisted only on the success path; on `CancellationError` or a thrown error the bubble stays in the overlay (with whatever streamed) but nothing reaches `chat.md`.
 - Fix: persist the partial text with a marker (for example "(incomplete)") on those paths so resumed sessions match what the user saw.
+- **Done:** `runCompletion` saves the visible text on cancel, error and non-clean finish (for example token limit) through `AssistantTurnText`, which appends `(incomplete)` and skips empty replies. 🔧 Not tried against a live API.
 
 ### P1. Reliability and error quality
 
-**P1-1. No retry or backoff for transient AI failures.**
+**P1-1. No retry or backoff for transient AI failures.** — **DONE (2026-09-19), only tested against stubs, not the live APIs**
 - Where: `GeminiProvider.swift`, `AnthropicProvider.swift` use `URLSession.shared`, one attempt, `timeoutInterval = 60`. Only a Gemini 404 triggers the model-fallback chain (`AppCoordinator.swift:~2550 migrateToFallbackModel`).
 - Fix: one bounded retry with jitter for 429/5xx/connection-lost **only before the first delta arrives**; honor `Retry-After`; consider `waitsForConnectivity`. Deduplicate repeated identical error notes when auto-triggered questions fail in a row.
+- **Done:** new `AIRetryPolicy` (pure) plus `AIRetryPolicy.withRetry`, used by both providers' `streamCompletion`. One retry, only while no text has reached the user, for 429, any 5xx, Anthropic `overloaded_error`/`api_error` events and dropped or timed-out connections. `Retry-After` in seconds is honored; more than 8 s means no retry. Otherwise it waits 1 s plus up to 0.5 s of jitter. Not retried: 401/403/404/400, no internet, cancellation. `RepeatedNote` skips an identical error note (last 6 messages) only for auto-detected questions. Not done: `waitsForConnectivity`, and the one-shot helpers (`classifyQuestion`, `summarize`) still have no retry. 🔧 Never run against the real APIs.
 
-**P1-2. Error messages recommend a retired model.**
+**P1-2. Error messages recommend a retired model.** — **DONE (2026-09-19)**
 - Where: `GeminiProvider.swift:303` suggests `gemini-2.0-flash-lite`, `:309` suggests `gemini-2.0-flash`, while `SettingsView.swift:235` says `gemini-2.0-flash` was retired for new keys. Check the names against `AI/AIModel.swift` (`AIModelRegistry`) and make messages refer to models that actually exist there.
 - Also: 400 responses put the raw response body in the message; trim it.
+- **Done:** the 429 message no longer names a model, the 404 message suggests only `gemini-2.5-flash`. New `AIErrorBody.summary` (used by both providers for 400 and unknown statuses) prefers `error.message` and cuts anything else at 200 chars. A test checks every `gemini-*` name in Gemini error text exists in `AIModelRegistry`.
 
-**P1-3. Stream decode errors are swallowed.**
+**P1-3. Stream decode errors are swallowed.** — **DONE (2026-09-19)**
 - Where: `GeminiProvider.stream` (`if let chunk = try? JSONDecoder().decode(...)`), and the same pattern in `AnthropicProvider`. If the API schema shifts, the result is an empty reply that ends "without a finish reason", which downstream reads as a network drop.
 - Fix: log the first decode failure per stream (without content) and, when zero deltas were decoded, report "unexpected response format".
+- **Done:** both providers log the first decode failure (byte count and error, no content) and throw `unexpectedFormat` when nothing usable arrived. A stray bad chunk among good ones is tolerated. New `Tools/SmokeTests/AIProviderTests.swift` covers Gemini and Anthropic SSE with a stub `URLProtocol` (deltas, finish reasons, `promptBlocked`, mid-stream error event, garbled data). This is the first half of the P3 provider tests; the P1-1 retry tests can reuse `StubURLProtocol`.
 
 **P1-4. No App Nap protection while listening.** 🔧
 - `grep beginActivity` finds nothing. The app is `LSUIElement`, often fully covered by other windows during a call. Timers, watchdogs and network tasks may be throttled in long meetings.
@@ -136,17 +144,20 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 - No `NSWorkspace.willSleepNotification` / `didWakeNotification` observers. Device-change rebuilds and SCStream restarts exist, but the lid-close/wake path is untested.
 - Fix: on wake, if listening, verify frames resume within a few seconds and otherwise restart capture, telling the user. Manually test: start listening, close the lid for a minute, reopen.
 
-**P1-6. Shortcut registration failure is invisible.**
+**P1-6. Shortcut registration failure is invisible.** — **DONE in code (2026-09-19), not seen on screen**
 - Where: `Shortcuts/GlobalHotKey.swift:57` logs and returns nil. A user who records a combo already used by another app gets a shortcut that silently does nothing.
 - Fix: surface the failure inline in Settings → Shortcuts.
+- **Done:** `SettingsStore.toggleOverlayShortcutUnavailable` / `answerScreenShortcutUnavailable` (runtime only) are set by `AppDelegate` after each registration; Settings → Shortcuts shows a red line under the row. 🔧 To check: record a combo another app owns (for example ⌘Space).
 
-**P1-7. Launching an already-running app does nothing visible.**
+**P1-7. Launching an already-running app does nothing visible.** — **DONE in code (2026-09-19), not tried**
 - No `applicationShouldHandleReopen(_:hasVisibleWindows:)` in `AppDelegate`. For an accessory app, clicking it in Finder/Spotlight, or macOS "Quit & Reopen" landing on a live process, shows nothing, which reads as "the app didn't open".
 - Fix: bring Onboarding (if setup is needed) or Sessions to the front.
+- **Done:** `applicationShouldHandleReopen` calls `showInitialWindow()` (Onboarding if needed, else Sessions). 🔧 To check: with the app running, open it again from Finder or Spotlight.
 
-**P1-8. No single-instance guard.**
+**P1-8. No single-instance guard.** — **DONE in code (2026-09-19), not tried**
 - Two copies with one bundle id share `UserDefaults`, `runtime.log`, the `clean-shutdown` sentinel and the Keychain item, which produces false "did not shut down cleanly" warnings and confusing state. This already confused the owner while testing.
 - Fix: at launch, if another running instance of the same bundle id exists, activate it and quit.
+- **Done:** `SingleInstance` (pure, tested) picks the oldest copy as the winner, so two copies started together don't both quit. `AppDelegate.handOverToRunningCopy()` runs first in `applicationDidFinishLaunching`, before the crash logger, so the running copy's clean-shutdown marker is untouched. It asks macOS to open the winner's bundle (which triggers P1-7) and exits. Caveat: `AppCoordinator` is created before that call, so the second copy still builds `SettingsStore` once; it only reads the Keychain for a build the user already approved. 🔧 To check: start a second copy with `open -n`.
 
 **P1-9. Permission status is partly a guess.** 🔧
 - `PermissionsManager.requestSystemAudio` (line 141) opens a Process Tap for 2 seconds and then records "granted" regardless of what the user clicked, because macOS has no API to read the system-audio permission. The onboarding row shows a "System Settings" hint for that reason.
@@ -161,24 +172,31 @@ Each item: **what**, **where**, **why it matters**, **suggested fix**, **verific
 - `SettingsStore.hasGeminiAPIKey`/`availableVendors` are evaluated from SwiftUI bodies and can call `KeychainHelper.exists` (attribute queries) up to 3 times per evaluation until migration completes. Cache the answer.
 - The Settings "Allow Keychain access" button (`SettingsView.swift:262`) has no in-flight guard, so repeated clicks can stack dialogs.
 
-**P1-11. Duplicate notes when Answer Screen is used before Screen Recording was requested.**
+**P1-11. Duplicate notes when Answer Screen is used before Screen Recording was requested.** — **DONE (2026-09-19)**
 - `AppCoordinator.captureScreenJPEG` now posts a "needs Screen Recording, open Setup" note and returns nil, then the callers (`sendUserPrompt`, `answerScreen`) add their own generic "Couldn't capture screen" note. Keep one message.
+- **Done:** `captureScreenJPEG` returns `.image / .needsSetup / .failed`; callers add the generic note only for `.failed`. The setup note now says "Reading your screen needs…" because it also shows for the composer's "See my screen". 🔧 Checklist item 10 still needs a real run.
 
 ### P2. Performance and maintainability
 
-**P2-1. Session list re-reads every transcript.**
+**P2-1. Session list re-reads every transcript.** — **DONE (2026-09-19)**
 - `SessionStore.listSessions` (line 73) calls `countTranscriptLines` and `countChatTurns` (lines 504, 511), each reading whole files, for every session on every refresh. Cost grows with total history.
 - Fix: store the counts in `metadata.json` and update incrementally, or count lazily/asynchronously.
+- **Done:** a different fix from the two suggested. `SessionStore` keeps an in-memory cache of line and turn counts per session and re-reads a file only when its size or modification time changed. No change to `metadata.json`, and manual edits to a transcript are still picked up. Counting the transcript now scans bytes instead of building strings. The first list after launch still reads every file once. Tests: parsing, "unchanged list reads nothing", "one new line re-reads one file".
 
-**P2-2. `runtime.log` only trims at launch** (`CrashLogger.start`, trims >1 MB to the last 256 KB). A long session in one run can grow it without bound. Add size-based rotation while running.
+**P2-2. `runtime.log` only trims at launch** — **DONE (2026-09-19)** (`CrashLogger.start`, trims >1 MB to the last 256 KB). A long session in one run can grow it without bound. Add size-based rotation while running.
+- **Done:** `CrashLogger` tracks the file size on its queue and, past 1 MB, keeps the newest 256 KB (from a whole line) in place on the same descriptor, so the signal handler keeps writing to the right file. `CrashLogger.rotate` is tested against a temp file.
 
-**P2-3. Swift 6 concurrency warnings.** `NSLock.lock()/unlock()` used from async contexts (`AppleSpeechTranscriber.swift:22,49,52`, Parakeet mutexes, `SmokeTestRunner.swift:1440`). Warnings today, errors in Swift 6 language mode. Move to `OSAllocatedUnfairLock.withLock` or an actor.
+**P2-3. Swift 6 concurrency warnings.** — **DONE (2026-09-19)** `NSLock.lock()/unlock()` used from async contexts (`AppleSpeechTranscriber.swift:22,49,52`, Parakeet mutexes, `SmokeTestRunner.swift:1440`). Warnings today, errors in Swift 6 language mode. Move to `OSAllocatedUnfairLock.withLock` or an actor.
+- **Done:** every `lock()/unlock()` inside an async function now uses `NSLock.withLock` (`AppleSpeechTranscriber`, `MicrophoneCapture`, `ProcessAudioCapture`, `SystemAudioCapture`, `ParakeetTranscriber`, the smoke runner's `FakeTranslator`). Only the full `xcodebuild` showed all of them; `swift build` hid most. A clean `xcodebuild` now has two warnings left, neither about locks: `MicrophoneCapture.swift:108` (captures a non-`Sendable` `self` in a `Task`; left alone because marking the class `@unchecked Sendable` would only hide its unsynchronized `isRunning`/`restartTask`), and the 512@2x app icon is 730×730 instead of 1024×1024 (an asset, not code).
 
-**P2-4. Deprecated `NSApp.activate(ignoringOtherApps:)`** (6 call sites). Works today; plan the replacement.
+**P2-4. Deprecated `NSApp.activate(ignoringOtherApps:)`** (6 call sites). Works today; plan the replacement. — **NOT CHANGED on purpose (2026-09-19)**
+- Why: the replacement, `NSApp.activate()`, is cooperative on macOS 14+. From the menu bar click it works, but from a global shortcut, the reopen path or the onboarding "bring to front after a macOS dialog" retries it may not bring the window forward. That is exactly the behavior the onboarding relies on, and it can only be checked on a Mac. The old call still works. 🔧 Do this together with the section 4 checklist: swap all 6 sites (`AppDelegate.swift` ×5, `MenuBarController.swift` ×1) and re-run checklist items 2, 3 and 9.
 
-**P2-5. Reproducible builds.** `Package.swift` and `Project.yml:14` use `from: 0.15.5` for FluidAudio. For a 0.x package SwiftPM's `from` still accepts later minor versions, and `Package.resolved` is gitignored, so two release builds can pick different FluidAudio versions (the comment says "pinned by minor version", which is not what it does). Use `.upToNextMinor(from:)` / `exact:` and consider committing `Package.resolved`.
+**P2-5. Reproducible builds.** — **DONE (2026-09-19)** `Package.swift` and `Project.yml:14` use `from: 0.15.5` for FluidAudio. For a 0.x package SwiftPM's `from` still accepts later minor versions, and `Package.resolved` is gitignored, so two release builds can pick different FluidAudio versions (the comment says "pinned by minor version", which is not what it does). Use `.upToNextMinor(from:)` / `exact:` and consider committing `Package.resolved`.
+- **Done:** `Package.swift` uses `.upToNextMinor(from: "0.15.5")` and `Project.yml` uses `minorVersion: 0.15.5` (checked in the generated project: `upToNextMinorVersion`). `Package.resolved` is no longer in `.gitignore`, so it shows up as a new file to commit. Note: the Xcode build keeps its own resolution inside the ignored `.xcodeproj`, so the release build is pinned by the minor range, not by that file.
 
-**P2-6. Release script does not run tests.** `bin/release` never invokes `swift run SmokeTests` (only the pre-push hook does). Add it as a gate inside the script (this is not CI work).
+**P2-6. Release script does not run tests.** — **DONE (2026-09-19)** `bin/release` never invokes `swift run SmokeTests` (only the pre-push hook does). Add it as a gate inside the script (this is not CI work).
+- **Done:** `bin/release` runs `swift run SmokeTests` right after the prerequisite checks, before the version bump and build (`bash -n` passes; not run for real). `docs/RELEASE.md` lists the new step.
 
 **P2-7. Size of a few files.** `AppCoordinator.swift` (2,732 lines, ~60 functions, ~33 `Task {` blocks) and `Overlay/OverlayView.swift` (1,714 lines) are hard to reason about. Only split with tests around the seams; not urgent.
 
