@@ -1393,10 +1393,14 @@ final class AppCoordinator {
             )
 
             if withScreenshot {
-                if let imageData = await self.captureScreenJPEG() {
+                switch await self.captureScreenJPEG() {
+                case .image(let imageData):
                     prompt.imageJPEGBase64 = imageData.base64EncodedString()
                     wpInfo("Screenshot captured (\(imageData.count) bytes)")
-                } else {
+                case .needsSetup:
+                    // The setup note is already in the chat; the question still goes out without the screen.
+                    wpWarn("Screenshot skipped: Screen Recording not requested yet; sending text-only")
+                case .failed:
                     self.overlayState.appendSystemNote("⚠️ Couldn't capture screen — sending without it. Make sure Screen Recording permission is granted.", category: .ai)
                     wpWarn("Screenshot capture failed; falling back to text-only")
                 }
@@ -1547,8 +1551,11 @@ final class AppCoordinator {
                 history: self.filteredHistory(history),
                 style: self.settings.responseStyle
             )
-            guard let imageData = await self.captureScreenJPEG() else {
-                self.overlayState.appendSystemNote("⚠️ Couldn't capture your screen. Grant Screen Recording permission in System Settings → Privacy & Security → Screen Recording, then try again.", category: .ai)
+            let capture = await self.captureScreenJPEG()
+            guard case .image(let imageData) = capture else {
+                if case .failed = capture {
+                    self.overlayState.appendSystemNote("⚠️ Couldn't capture your screen. Grant Screen Recording permission in System Settings → Privacy & Security → Screen Recording, then try again.", category: .ai)
+                }
                 // Nothing to answer without the screen — drop back out of the
                 // thinking state so the pill doesn't hang.
                 if self.overlayState.status == .thinking {
@@ -1574,18 +1581,18 @@ final class AppCoordinator {
     /// Captures the configured display via ScreenCaptureKit, downsamples to ≤1280 px wide so
     /// we don't ship 4K frames to the model, and JPEG-encodes at quality 0.7. Returns nil
     /// if Screen Recording permission isn't granted or no display is shareable.
-    private func captureScreenJPEG(maxWidth: Int = 1280, quality: CGFloat = 0.7) async -> Data? {
+    private func captureScreenJPEG(maxWidth: Int = 1280, quality: CGFloat = 0.7) async -> ScreenCaptureOutcome {
         // Screen Recording is requested in onboarding. If it never was, capturing
         // here would raise a surprise system dialog, so send the user to Setup.
         await permissions.refresh()
         if permissions.snapshot.screenRecording != .granted, !permissions.hasAskedForScreenRecording {
-            overlayState.appendSystemNote("⚠️ Answer screen needs Screen Recording, which hasn't been allowed yet. Open Setup to allow it (no video is saved).", category: .ai)
+            overlayState.appendSystemNote("⚠️ Reading your screen needs Screen Recording, which hasn't been allowed yet. Open Setup to allow it (no video is saved).", category: .ai)
             requestSetup?()
-            return nil
+            return .needsSetup
         }
         do {
             let content = try await SCShareableContent.current
-            guard !content.displays.isEmpty else { return nil }
+            guard !content.displays.isEmpty else { return .failed }
             // On a multi-monitor setup, pick the display the user configured (a
             // specific monitor) or, when set to follow, the one the pointer is on.
             // If the configured monitor was disconnected, fall back to the first
@@ -1609,10 +1616,10 @@ final class AppCoordinator {
             config.height = display.height
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             let resized = downsample(cgImage, maxWidth: maxWidth) ?? cgImage
-            return jpegData(from: resized, quality: quality)
+            return jpegData(from: resized, quality: quality).map(ScreenCaptureOutcome.image) ?? .failed
         } catch {
             log.error("Screenshot capture failed: \(String(describing: error), privacy: .public)")
-            return nil
+            return .failed
         }
     }
 
@@ -2781,4 +2788,12 @@ final class AppCoordinator {
     private func filteredHistory(_ history: [ChatTurn]) -> [ChatTurn] {
         settings.includeChatHistoryInPrompt ? history : []
     }
+}
+
+/// Result of a screen capture. `needsSetup` means the user was already told
+/// (with an "Open Setup" route), so callers must not add a second message.
+private enum ScreenCaptureOutcome {
+    case image(Data)
+    case needsSetup
+    case failed
 }
