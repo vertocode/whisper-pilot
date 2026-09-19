@@ -44,6 +44,8 @@ Newer sessions may include an invisible HTML comment beneath a turn heading to p
 its UI origin (for example, an auto-detected question). Older files without this metadata
 remain fully supported, and the comment does not appear in rendered Markdown.
 
+An AI reply that was cancelled, failed part-way or was cut off (for example by the token limit) is still saved with what you saw, followed by a final `(incomplete)` line, so a resumed session does not mistake it for a finished answer.
+
 System notes (the contextual messages the overlay shows, e.g. *"Microphone permission was not granted"*) are deliberately **not** persisted — they're UI affordances, not part of the conversation.
 
 ### `metadata.json`

@@ -31,7 +31,7 @@ Sources/WhisperPilot/
 
 ## Lifecycle
 
-1. App launches → `WhisperPilotApp` (SwiftUI) → `AppDelegate.applicationDidFinishLaunching`.
+1. App launches → `WhisperPilotApp` (SwiftUI) → `AppDelegate.applicationDidFinishLaunching`. First it checks for another running copy with the same bundle id (`SingleInstance`): the older copy wins, the newer one asks macOS to reopen it and quits before touching the log or settings. Opening the app again while it runs (Finder, Spotlight) triggers `applicationShouldHandleReopen`, which shows Onboarding or Sessions.
 2. `AppDelegate` constructs `AppCoordinator`, the overlay window (hidden), and the Sessions window, then refreshes the permission snapshot.
 3. Onboarding opens first when a first run (or a newer onboarding version) has something missing, or when an updated build needs the Keychain approved again. It asks for everything in one screen, each with its reason: Microphone (only if mic capture is on), Speech Recognition, system audio, Screen Recording (optional on the Process Tap path, required when ScreenCaptureKit is used) and Keychain access. "Set up later" or closing the window is remembered for the current build.
 4. Picking a session calls `coordinator.useSession(_:resumed:)`, which seeds `ConversationContext` (with prior markdown if resumed), and shows the overlay.
@@ -64,9 +64,11 @@ protocol TranscriptionProvider {
 
 Engine selection is automatic — there is no user-facing setting — and goes best-first:
 
-1. **`ParakeetTranscriber`** (English locales): FluidAudio's Parakeet Unified 0.6B CoreML engine, one `StreamingUnifiedAsrManager` per channel on the Neural Engine. Chosen for transcript quality: 1.79% aggregate WER on LibriSpeech test-clean *with punctuation and capitalization* — the accuracy class of Meet/Teams server captions, and well ahead of the Apple engines. True streaming (~2 s latency), designed for hour-long sessions. The engine emits one continuous token stream with per-token audio timings; `TranscriptStreamSegmenter` owns the cutting rules that turn it into utterance-sized lines (pause-based gap cut on decoder timings, idle cut against the decoded frontier, length cut for pauseless monologues). Models (~600 MB) auto-download from Hugging Face on first use, cached under Application Support/FluidAudio; failure (offline first launch, unsupported hardware) falls through to the Apple engines.
+1. **`ParakeetTranscriber`** (English locales): FluidAudio's Parakeet Unified 0.6B CoreML engine, one `StreamingUnifiedAsrManager` per channel on the Neural Engine. Chosen for transcript quality: 1.79% aggregate WER on LibriSpeech test-clean *with punctuation and capitalization* — the accuracy class of Meet/Teams server captions, and well ahead of the Apple engines. True streaming (~2 s latency), designed for hour-long sessions. The engine emits one continuous token stream with per-token audio timings; `TranscriptStreamSegmenter` owns the cutting rules that turn it into utterance-sized lines (pause-based gap cut on decoder timings, idle cut against the decoded frontier, length cut for pauseless monologues). Models (~600 MB) auto-download from Hugging Face on first use, cached under Application Support/FluidAudio; failure (offline first launch, unsupported hardware) falls through to the Apple engines, and the overlay says so with the reason (`EngineFallbackNote`), so a lower-accuracy engine is never a surprise.
 2. **`SpeechAnalyzerTranscriber`** (macOS 26+): Apple's long-form `SpeechAnalyzer`/`SpeechTranscriber` framework. Handles every locale Apple ships a model for.
-3. **`AppleSpeechTranscriber`** (older systems): two `SFSpeechRecognizer` pipes in parallel — one per channel — cycling recognition tasks at VAD utterance boundaries and trimming replay overlap at task seams.
+3. **`AppleSpeechTranscriber`** (older systems): two `SFSpeechRecognizer` pipes in parallel — one per channel — cycling recognition tasks at VAD utterance boundaries and trimming replay overlap at task seams. Always on-device (`requiresOnDeviceRecognition = true`): a locale with no on-device model stops with `TranscriberError.onDeviceUnavailable` instead of sending audio to Apple's servers.
+
+Transcript text is never written to `runtime.log`; transcriber log lines carry ids, lengths and timings only.
 
 `TranscriptBuffer` is an actor holding the live-caption display model: finalized segments are append-only and immutable, and each channel has at most one volatile (in-progress) segment that partial hypotheses replace wholesale. A final on a channel consumes that channel's volatile slot, and consecutive near-duplicate finals are merged. The buffer publishes its current state to `OverlayState`; finalized lines flow to `ConversationContext`.
 
@@ -114,6 +116,8 @@ protocol AIProvider {
 
 `Prompt` carries `systemInstruction`, `context`, `question`, `style`, and an optional `imageJPEGBase64` for multimodal input. `GeminiProvider` packages those into `streamGenerateContent?alt=sse` requests, parses the SSE stream of partial JSON via `URLSession.bytes(for:)`, and yields decoded text deltas. When `imageJPEGBase64` is set, it ships as a second `inline_data` part so vision-capable models reason about the screenshot.
 
+Both providers (`GeminiProvider`, `AnthropicProvider`) share the same failure handling. `AIRetryPolicy.withRetry` retries once, and only before any text has reached the user, for 429, 5xx, Anthropic overloaded events and dropped connections; it honors `Retry-After` up to 8 seconds. A stream that yields no text and only undecodable chunks fails with `unexpectedFormat` instead of looking like a network drop. Error bodies are cut to one line by `AIErrorBody`. For auto-detected questions, an identical error note is shown once (`RepeatedNote`).
+
 `PromptBuilder` is the only place that decides how transcript + history + screenshot context get composed. Three entry points:
 
 - `build(...)` — for detected questions on the call.
@@ -138,7 +142,7 @@ All three include the recent meeting transcript, the prior assistant↔user chat
 
 ### 7. Sessions & persistence
 
-`SessionStore` is an `actor` that owns `~/Library/Application Support/<bundle>/sessions/`. Each session is a folder named `<slug>-YYYY-MM-DD-HH-mm/` containing `transcript.md`, `chat.md`, and `metadata.json`. Files are appended live as transcripts finalize and chat turns complete — no batched flush, no in-memory queue.
+`SessionStore` is an `actor` that owns `~/Library/Application Support/<bundle>/sessions/`. Each session is a folder named `<slug>-YYYY-MM-DD-HH-mm/` containing `transcript.md`, `chat.md`, and `metadata.json`. Files are appended live as transcripts finalize and chat turns complete — no batched flush, no in-memory queue. Appends return a `Result`; `SaveHealth` turns the first failure (disk full, no permission, folder deleted) into one persistent overlay banner and reports when saving recovers. A reply that was cancelled or cut off is still saved to `chat.md`, tagged `(incomplete)` (`AssistantTurnText`). The session list re-reads a transcript or chat file only when its size or modification time changed.
 
 `SessionsWindow` is the launch UI. It lists past sessions (sorted by most-recently-used), supports per-row Resume / Open in Finder / Delete, and prominently displays a tip about the token-cost trade-off of resuming.
 
@@ -146,7 +150,7 @@ On resume, the coordinator loads `transcript.md` and `chat.md` as raw markdown a
 
 ### 8. Settings & permissions
 
-`SettingsStore` wraps `UserDefaults`. `KeychainHelper` reads/writes Gemini and Claude API keys. `PermissionsManager` owns permission checks, requests, and Privacy & Security deep links.
+`SettingsStore` wraps `UserDefaults`. Gemini and Claude API keys live in one Keychain item, reached through the small `SecretStore` protocol (`SystemSecretStore` wraps `KeychainHelper`; tests inject a fake, so no test can raise a dialog). `PermissionsManager` owns permission checks, requests, and Privacy & Security deep links; the raw-status-to-`PermissionStatus` rules live in `PermissionMapping` so they can be tested without a dialog.
 
 **Permissions are requested in one place, onboarding.** Nothing else may raise a macOS dialog: Play, Settings, Sessions and the overlay only read state. Screen Recording and system audio have no public "am I allowed" API, so the manager remembers its own request. The Keychain is the same: `SettingsStore` reads the secret only in `unlockStoredKeys()` (onboarding, or the "Allow Keychain access" button) and, at launch, only for a build the user already approved (`KeychainHelper.buildIdentity`, the code-signature hash, stored in `keychain.approvedBuild`). Every other access reads the in-memory copy. An updated ad-hoc build has a new hash, so macOS asks again; onboarding reopens once for that, with the reason.
 
@@ -162,6 +166,8 @@ The Settings window is owned by `AppDelegate`, not by SwiftUI's `Settings { }` s
 - **AI calls** — plain `Task` chains. Cancellable. The in-flight task is stored on the coordinator so a new trigger or composer submission cancels the old one.
 - **UI** — every observable state mutation hops to `@MainActor`.
 - **Persistence** — `SessionStore` is an actor; appends are serialized.
+- **Long sessions** — while listening, `ListeningActivity` holds a `userInitiatedAllowingIdleSystemSleep` activity so App Nap does not throttle timers and network calls behind a meeting window. After the Mac wakes with a session running, the coordinator waits 5 seconds and restarts capture if no new audio frame arrived (`WakeRecovery`).
+- **Log file** — `CrashLogger` writes from its own queue and trims `runtime.log` in place to the newest 256 KB once it passes 1 MB.
 
 ## Why these choices
 
