@@ -23,15 +23,15 @@ enum ResponseStyle: String, CaseIterable, Codable, Sendable {
     var description: String {
         switch self {
         case .auto:
-            return "Decide the level of detail from the question. Default to a single short, direct answer the user can deliver out loud. Add a sentence or two of supporting detail only if the question genuinely benefits from it. Expand to a full thorough explanation only when the question clearly demands it (e.g. design walk-through, debugging steps, multi-part ask). Never pad. Keep it one coherent answer, not a layered structure."
+            return "Short, natural answer you can say out loud. Goes a bit longer only when the question clearly needs it or someone asks for more detail."
         case .concise:
-            return "Short, conversational answer the user can deliver out loud."
+            return "One or two sentences, the way you'd answer out loud."
         case .detailed:
-            return "Thorough explanation with reasoning and concrete details."
+            return "A fuller answer with the reasoning and an example, still in a spoken tone and short enough to say in about a minute."
         case .strategic:
-            return "Trade-offs, risks, and considerations relevant to the question."
+            return "Talks through the main trade-offs and risks, the way you'd reason out loud in a meeting."
         case .followUp:
-            return "A handful of smart follow-up questions the user could ask next."
+            return "One or two smart follow-up questions you could ask next, phrased the way you'd say them, not as a list."
         }
     }
 }
