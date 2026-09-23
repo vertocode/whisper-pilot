@@ -76,6 +76,10 @@ nonisolated func wpError(_ message: String) {
 struct TranslationLanguagePair: Equatable, Sendable {
     let source: String
     let target: String
+    /// Unique per listening session. The host view is keyed on it so every
+    /// session gets a fresh `.translationTask`, even when the languages match
+    /// the previous session's.
+    let id = UUID()
 }
 
 enum OverlayStatus: Equatable, Sendable {

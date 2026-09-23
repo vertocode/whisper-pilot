@@ -307,6 +307,8 @@ extension SystemAudioCapture: SCStreamDelegate {
                 }
             }
             wpError("System audio capture could not be restarted — the \"Other\" channel is no longer transcribing. Press Stop and Play to retry.")
+            ErrorReporter.offer(kind: "system-audio-restart", title: "System audio capture could not be restarted",
+                                detail: "System audio capture could not be restarted, so the other side is no longer transcribing.")
         }
     }
 }

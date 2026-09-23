@@ -207,6 +207,8 @@ actor SequoiaTranslationService: TranslationProviding {
     private var waiters: [CheckedContinuation<TranslationSession?, Never>] = []
     private var isRelinquished = false
 
+    var hasSession: Bool { session != nil }
+
     /// Called by the host view when SwiftUI produces a session. Wakes anything
     /// that was queued waiting for one.
     func adopt(_ newSession: TranslationSession) {

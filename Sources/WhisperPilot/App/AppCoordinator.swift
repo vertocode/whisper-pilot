@@ -571,6 +571,8 @@ final class AppCoordinator {
                 return
             }
             wpError("Transcriber start failed: \(error.localizedDescription)")
+            ErrorReporter.offer(kind: "transcriber-start", title: "Transcriber failed to start",
+                                detail: "The transcriber could not start: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             dismissStartupNotes()
             await abortStartupCapture()
@@ -636,6 +638,8 @@ final class AppCoordinator {
                 return
             }
             wpError("Pipeline start failed: \(error.localizedDescription)")
+            ErrorReporter.offer(kind: "pipeline-start", title: "Audio pipeline failed to start",
+                                detail: "The audio pipeline could not start: \(error.localizedDescription)")
             overlayState.status = .error(error.localizedDescription)
             dismissStartupNotes()
             self.transcriber?.stop()
@@ -734,13 +738,42 @@ final class AppCoordinator {
         // applies forward only, so the toggle can't fire a burst of up to 150
         // calls and trip the very safety valve this feature hooks into.
         await queue.markBaseline(await buffer.snapshot())
+        await queue.setPersistentFailureHandler { error in
+            await MainActor.run {
+                ErrorReporter.shared.report(
+                    kind: "translation-failing",
+                    title: "Live translation keeps failing",
+                    detail: "Live translation failed several times in a row: \(error)"
+                )
+            }
+        }
         translationQueue = queue
+        watchForMissingSequoiaSession()
 
         wpInfo("[Coordinator] live translation on: \(sourceIdentifier) → \(targetIdentifier)")
         // First call costs ~834 ms versus ~34 ms steady state. Paying it here,
         // during startup, keeps it off the first line the user actually cares
         // about.
         await queue.prewarm()
+    }
+
+    /// On macOS 15.0-25.x the session comes from a SwiftUI host. If it never
+    /// arrives, translations wait silently forever, so check shortly after start.
+    private func watchForMissingSequoiaSession() {
+        guard #available(macOS 15.0, *),
+              let service = pendingSequoiaTranslationService as? SequoiaTranslationService
+        else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard let self, self.pendingSequoiaTranslationService === service else { return }
+            if await !service.hasSession {
+                ErrorReporter.shared.report(
+                    kind: "translation-no-session",
+                    title: "Live translation session never started",
+                    detail: "Live translation is on, but no translation session was created."
+                )
+            }
+        }
     }
 
     private func stopTranslation() async {
@@ -773,10 +806,10 @@ final class AppCoordinator {
     func adoptTranslationSession(_ object: AnyObject?) {
         guard #available(macOS 15.0, *) else { return }
         guard let service = pendingSequoiaTranslationService as? SequoiaTranslationService else { return }
-        guard let session = object as? TranslationSession else {
-            Task { await service.relinquish() }
-            return
-        }
+        // A nil here is the previous host view finishing. It can arrive after
+        // the next session's service exists, so it must not release that one;
+        // `stopTranslation` already relinquishes the old service.
+        guard let session = object as? TranslationSession else { return }
         // No prewarm here: `startTranslationIfNeeded` already called
         // `queue.prewarm()`, and on this path that call is parked inside the
         // service waiting for exactly this session. Adopting releases it.

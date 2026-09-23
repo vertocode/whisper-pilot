@@ -249,6 +249,8 @@ private final class Pipe: @unchecked Sendable {
                     wpError("Parakeet.\(channel) processing error (#\(failures)): \(error.localizedDescription)")
                     if failures >= Self.maxConsecutiveErrors {
                         wpError("Parakeet.\(channel) too many consecutive errors — stopping this channel")
+                        ErrorReporter.offer(kind: "parakeet-stopped", title: "High-accuracy transcription stopped after repeated errors",
+                                            detail: "High-accuracy transcription stopped after repeated errors: \(error.localizedDescription)")
                         // The other channel keeps running, so without a visible
                         // note this failure is indistinguishable from "the other
                         // side just went quiet".

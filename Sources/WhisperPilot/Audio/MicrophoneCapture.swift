@@ -152,6 +152,8 @@ final class MicrophoneCapture {
                 wpInfo("Microphone capture rebuilt after configuration change")
             } catch {
                 wpError("Microphone rebuild after configuration change failed: \(error.localizedDescription) — mic transcription stopped. Press Stop and Play to retry.")
+                ErrorReporter.offer(kind: "mic-rebuild", title: "Microphone capture stopped after a device change",
+                                    detail: "Microphone capture could not restart after an audio configuration change: \(error.localizedDescription)")
             }
         }
     }

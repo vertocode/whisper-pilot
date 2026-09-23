@@ -68,6 +68,12 @@ actor TranslationQueue {
     private var baseline: Set<UUID> = []
     private var isStopped = false
 
+    /// Called once when this many translations in a row fail, so a broken
+    /// engine can be surfaced instead of leaving captions silently empty.
+    private var onPersistentFailure: (@Sendable (String) async -> Void)?
+    private var consecutiveFailures = 0
+    private static let persistentFailureThreshold = 3
+
     /// Bound on tracked rows so a long session can't grow this map without
     /// limit. Mirrors `TranscriptBuffer.maxFinals`; rows evicted from the
     /// buffer can never reappear in a snapshot, so dropping their state is safe.
@@ -79,6 +85,10 @@ actor TranslationQueue {
     ) {
         self.provider = provider
         self.onTranslated = onTranslated
+    }
+
+    func setPersistentFailureHandler(_ handler: @escaping @Sendable (String) async -> Void) {
+        onPersistentFailure = handler
     }
 
     /// Records the rows already on screen as untranslatable. Call once, right
@@ -192,8 +202,13 @@ actor TranslationQueue {
                 state.scheduledSource = nil
                 rows[id] = state
             }
+            consecutiveFailures += 1
+            if consecutiveFailures == Self.persistentFailureThreshold, !isStopped {
+                await onPersistentFailure?(error.localizedDescription)
+            }
             return
         }
+        consecutiveFailures = 0
 
         // Re-check after the await: the row may have moved on, or the session
         // may have been torn down entirely, while the engine was working.

@@ -236,6 +236,8 @@ final class ProcessAudioCapture {
                 wpInfo("ProcessAudio: rebuilt after output device change")
             } catch {
                 wpError("ProcessAudio: rebuild after output device change failed: \(error.localizedDescription) — system audio stopped. Press Stop and Play to retry.")
+                ErrorReporter.offer(kind: "system-audio-rebuild", title: "System audio capture stopped after a device change",
+                                    detail: "System audio capture could not restart after the output device changed: \(error.localizedDescription)")
             }
         }
     }

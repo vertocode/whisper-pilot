@@ -164,6 +164,7 @@ struct OverlayView: View {
                 pair: state.sequoiaTranslationPair,
                 onSession: actions.adoptTranslationSession
             )
+            .id(state.sequoiaTranslationPair?.id)
         }
     }
 
