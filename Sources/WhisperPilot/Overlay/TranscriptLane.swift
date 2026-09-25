@@ -168,6 +168,39 @@ struct CollapseToggle: View {
     }
 }
 
+/// Floating play/pause for a pane's auto-scroll, so the user can read older
+/// lines without being pulled back down. The dot means new content arrived
+/// while paused; pressing play jumps to it.
+struct AutoScrollToggle: View {
+    let isPaused: Bool
+    let hasUnseen: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: isPaused ? "play.fill" : "pause.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(isPaused ? "Auto-scroll off" : "Auto-scroll")
+                    .font(.system(size: 10, weight: .medium))
+                if isPaused && hasUnseen {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: 6, height: 6)
+                }
+            }
+            .foregroundStyle(isPaused ? .primary : .secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(.regularMaterial))
+            .overlay(Capsule().strokeBorder(.quaternary))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(isPaused ? "Resume auto-scroll and jump to the latest" : "Pause auto-scroll to read older lines")
+    }
+}
+
 /// Two language codes in the transcript header, each toggling its own column.
 /// Reads like a chart legend: lit = showing, dimmed = hidden. Switching off the
 /// last visible language shows the other one alone rather than emptying the

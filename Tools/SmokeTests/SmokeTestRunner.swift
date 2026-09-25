@@ -47,6 +47,7 @@ struct SmokeTestRunner {
         await runSpeechRecognitionIntegrationSuite()
         await runParakeetIntegrationSuite()
         await runQuestionEvalSuite()
+        await runChatScrollSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
@@ -310,6 +311,23 @@ struct SmokeTestRunner {
             "Your trial ends next week, so the dashboard may lock soon.",
         ]
     )
+
+    static func runChatScrollSuite() async {
+        await suite("ChatScroll") {
+            func msg(_ role: ChatMessage.Role) -> ChatMessage {
+                ChatMessage(id: UUID(), role: role, origin: .detectedQuestion, text: "x", timestamp: Date(), isStreaming: false, category: .ai)
+            }
+            await expect(ChatScroll.target(in: []) == nil, "no messages, no target")
+            let question = msg(.user), answer = msg(.assistant)
+            await expect(ChatScroll.target(in: [msg(.assistant), question, answer]) == question.id,
+                         "an answer scrolls to the question above it")
+            let lone = msg(.assistant)
+            await expect(ChatScroll.target(in: [msg(.assistant), lone]) == lone.id,
+                         "an answer with no question above scrolls to itself")
+            let note = msg(.system)
+            await expect(ChatScroll.target(in: [question, answer, note]) == note.id, "a system note scrolls to itself")
+        }
+    }
 
     static func runTopicExtractorSuite() async {
         await suite("TopicExtractor") {

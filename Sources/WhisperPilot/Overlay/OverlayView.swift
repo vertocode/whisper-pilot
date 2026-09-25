@@ -104,6 +104,10 @@ struct OverlayView: View {
     @State private var columnDragStartFraction: Double?
     @State private var chatCollapsed: Bool = false
     @State private var transcriptCollapsed: Bool = false
+    @State private var chatAutoScrollPaused = false
+    @State private var chatHasUnseen = false
+    @State private var transcriptAutoScrollPaused = false
+    @State private var transcriptHasUnseen = false
 
     private let dividerThickness: CGFloat = 6
     private let minPaneHeight: CGFloat = 80
@@ -563,8 +567,8 @@ struct OverlayView: View {
     }
 
     /// Top pane: AI chat. Own `ScrollView` (when expanded) so transcript growth
-    /// never pushes new AI messages out of view. Auto-scrolls to the latest
-    /// message on new id or streamed text. When collapsed, renders only the
+    /// never pushes new AI messages out of view. Unless paused, keeps the start
+    /// of the newest answer in view (see `ChatScroll`) as it streams. When collapsed, renders only the
     /// header — no ScrollView, so a single-row pane doesn't show empty space
     /// with scroll indicators.
     @ViewBuilder
@@ -621,16 +625,25 @@ struct OverlayView: View {
                             onToggleCollapse: nil
                         )
                         .padding(compact ? WP.Space.sm : WP.Space.md)
+                        .padding(.bottom, Self.autoScrollToggleClearance)
                     }
+                    // Re-run on every streamed chunk: while the answer is shorter than
+                    // the pane, a top anchor clamps to the end of the content, so this
+                    // follows the text down until the question reaches the top, then
+                    // holds it there.
                     .onChange(of: aiMessages.last?.id) { _, _ in
-                        guard let last = aiMessages.last?.id else { return }
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(last, anchor: .bottom)
-                        }
+                        followChat(proxy, animated: true)
                     }
                     .onChange(of: aiMessages.last?.text) { _, _ in
-                        guard let last = aiMessages.last?.id else { return }
-                        proxy.scrollTo(last, anchor: .bottom)
+                        followChat(proxy, animated: false)
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        AutoScrollToggle(isPaused: chatAutoScrollPaused, hasUnseen: chatHasUnseen) {
+                            chatAutoScrollPaused.toggle()
+                            chatHasUnseen = false
+                            if !chatAutoScrollPaused { followChat(proxy, animated: true) }
+                        }
+                        .padding(WP.Space.sm)
                     }
                 }
             }
@@ -676,6 +689,7 @@ struct OverlayView: View {
                             }
                         }
                         .padding(compact ? WP.Space.sm : WP.Space.md)
+                        .padding(.bottom, Self.autoScrollToggleClearance)
                     }
                     // Column divider rides on top of the scroll view rather
                     // than inside it, so it stays put while transcript lines
@@ -688,13 +702,45 @@ struct OverlayView: View {
                     // sentence wraps to more lines under the same id, and
                     // id-only tracking would leave its tail below the fold.
                     .onChange(of: state.transcript.last) { _, _ in
-                        guard let last = state.transcript.last?.id else { return }
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(last, anchor: .bottom)
+                        followTranscript(proxy)
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        AutoScrollToggle(isPaused: transcriptAutoScrollPaused, hasUnseen: transcriptHasUnseen) {
+                            transcriptAutoScrollPaused.toggle()
+                            transcriptHasUnseen = false
+                            if !transcriptAutoScrollPaused { followTranscript(proxy) }
                         }
+                        .padding(WP.Space.sm)
                     }
                 }
             }
+        }
+    }
+
+    /// Room under the last line so the floating auto-scroll button never covers it.
+    private static let autoScrollToggleClearance: CGFloat = 28
+
+    private func followChat(_ proxy: ScrollViewProxy, animated: Bool) {
+        guard !chatAutoScrollPaused else {
+            chatHasUnseen = true
+            return
+        }
+        guard let target = ChatScroll.target(in: aiMessages) else { return }
+        if animated {
+            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(target, anchor: .top) }
+        } else {
+            proxy.scrollTo(target, anchor: .top)
+        }
+    }
+
+    private func followTranscript(_ proxy: ScrollViewProxy) {
+        guard !transcriptAutoScrollPaused else {
+            transcriptHasUnseen = true
+            return
+        }
+        guard let last = state.transcript.last?.id else { return }
+        withAnimation(.easeOut(duration: 0.15)) {
+            proxy.scrollTo(last, anchor: .bottom)
         }
     }
 
