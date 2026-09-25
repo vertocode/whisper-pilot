@@ -40,17 +40,9 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         }
     }
 
-    func classifyQuestion(_ text: String) async throws -> QuestionClass {
-        let instruction = """
-        Classify the following question into exactly one of these categories: \
-        technical, conversational, status, interview, sales_objection, follow_up, other. \
-        Respond with only the category string.
-
-        Question: \(text)
-        """
-        let raw = try await singleShot(prompt: instruction)
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return QuestionClass(rawValue: trimmed) ?? .other
+    func isQuestionToAnswer(_ text: String) async throws -> Bool {
+        let raw = try await singleShot(prompt: PromptBuilder.buildQuestionCheck(text))
+        return PromptBuilder.parseQuestionCheck(raw)
     }
 
     func extractTopics(from text: String) async throws -> [String] {

@@ -46,6 +46,7 @@ struct SmokeTestRunner {
         await runTranslationPersistenceSuite()
         await runSpeechRecognitionIntegrationSuite()
         await runParakeetIntegrationSuite()
+        await runQuestionEvalSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
@@ -171,8 +172,116 @@ struct SmokeTestRunner {
                 detector.score(systemSegment("Yeah but how come you didn't ship the migration last week?")) >= 0.6,
                 "yeah/but-prefixed question must still clear threshold"
             )
+
+            // Regression: a question at the end of a long, multi-sentence line was
+            // dragged under the threshold by the small talk before it.
+            await expect(
+                detector.score(systemSegment("Alright, thanks for joining. Before we talk about the team and the schedule, I want to hear from you first. To get started, could you walk me through the last project you shipped and what you owned?")) >= 0.6,
+                "question at the end of a multi-sentence line must clear threshold"
+            )
+            await expect(
+                detector.score(systemSegment("Walk through the numbers with the team, is that okay?")) >= 0.6,
+                "any 3+ word sentence ending in ? must clear threshold"
+            )
+            await expect(detector.score(systemSegment("That was great, right?")) >= 0.6,
+                         "3+ word sentence ending in ? counts as a question")
+            await expect(detector.score(systemSegment("We shipped it. Right?")) < 0.6,
+                         "one-word tag question must not fire")
+            await expect(detector.score(micSegment("Can you start the demo")) >= 0.6,
+                         "modal lead must clear threshold without ?")
+            await expect(detector.score(systemSegment("Sure, one sec.")) < 0.6,
+                         "plain statement must not fire")
+
+            // Real interview lines where speech recognition dropped the "?".
+            let noMarkQuestions = [
+                "the detail. That's a fair way to put it. And it sounds like you know where the hard parts are. I'll be open about this, since part of my job is to be clear. This position asks for a few years of Kotlin on the backend, and the group cares about that a lot, because in the first month you'd be changing billing code that real customers depend on. So my main question is: what would show the group that you can learn the stack quickly enough to own that part without a long warm-up",
+                "a very clear answer. I like that you mentioned batching the writes to keep the database calm. That's the kind of detail people often forget. Okay, let's change topics a little. This team works mostly with Kotlin, since all our services run on the JVM. Tell me about your experience running Kotlin services in production",
+                "Walk me through how you would debug a memory leak",
+                "How do you usually handle disagreements on the team",
+                "Do you have any experience with GraphQL subscriptions",
+            ]
+            for text in noMarkQuestions {
+                await expect(detector.score(systemSegment(text)) >= 0.6,
+                             "question without ? must clear threshold: \(text.suffix(60))")
+            }
+
+            let statements = [
+                "I think I already use the same build tools that your team uses every day",
+                "What I did was move the cache in front of the database.",
+                "That's the kind of detail people often forget.",
+                "Tell me about",
+                "Okay, let's change topics a little.",
+                "So my main question is:",
+            ]
+            for text in statements {
+                await expect(detector.score(systemSegment(text)) < 0.6,
+                             "statement must not fire: \(text)")
+            }
         }
     }
+
+    /// Runs transcript lines through the full detection path, including the real
+    /// AI yes/no check for lines the heuristics aren't sure about. Opt-in because it
+    /// calls the API: `WP_AI_EVAL=1 ANTHROPIC_API_KEY=... swift run SmokeTests`
+    /// (or `GEMINI_API_KEY`; `WP_AI_EVAL_MODEL` picks the model).
+    static func runQuestionEvalSuite() async {
+        await suite("Question detection eval (live AI)") {
+            let env = ProcessInfo.processInfo.environment
+            guard env["WP_AI_EVAL"] == "1" else {
+                print("  ⓘ Set WP_AI_EVAL=1 and ANTHROPIC_API_KEY or GEMINI_API_KEY to run the live question-detection eval.")
+                return
+            }
+            let ai: AIProvider
+            if let key = env["ANTHROPIC_API_KEY"], !key.isEmpty {
+                ai = AnthropicProvider(apiKey: key, model: env["WP_AI_EVAL_MODEL"] ?? "claude-sonnet-4-6")
+            } else if let key = env["GEMINI_API_KEY"], !key.isEmpty {
+                ai = GeminiProvider(apiKey: key, model: env["WP_AI_EVAL_MODEL"] ?? "gemini-2.5-flash")
+            } else {
+                await expect(false, "WP_AI_EVAL=1 needs ANTHROPIC_API_KEY or GEMINI_API_KEY")
+                return
+            }
+
+            let detector = QuestionDetector()
+            func answered(_ text: String) async -> (Bool, String) {
+                let segment = systemSegment(text)
+                if detector.score(segment) >= 0.6 { return (true, "heuristics") }
+                guard detector.mightBeQuestion(segment) else { return (false, "no cue") }
+                do {
+                    return (try await ai.isQuestionToAnswer(text), "AI check")
+                } catch {
+                    return (true, "AI check failed: \(error.localizedDescription)")
+                }
+            }
+
+            for text in questionEvalCases.questions {
+                let (result, path) = await answered(text)
+                await expect(result, "question missed (\(path)): \(text.suffix(70))")
+            }
+            for text in questionEvalCases.statements {
+                let (result, path) = await answered(text)
+                await expect(!result, "statement answered (\(path)): \(text.suffix(70))")
+            }
+        }
+    }
+
+    static let questionEvalCases: (questions: [String], statements: [String]) = (
+        questions: [
+            "the detail. That's a fair way to put it. And it sounds like you know where the hard parts are. I'll be open about this, since part of my job is to be clear. This position asks for a few years of Kotlin on the backend, and the group cares about that a lot, because in the first month you'd be changing billing code that real customers depend on. So my main question is: what would show the group that you can learn the stack quickly enough to own that part without a long warm-up",
+            "a very clear answer. I like that you mentioned batching the writes to keep the database calm. That's the kind of detail people often forget. Okay, let's change topics a little. This team works mostly with Kotlin, since all our services run on the JVM. Tell me about your experience running Kotlin services in production",
+            "Alright, thanks for joining. Before we talk about the team and the schedule, I want to hear from you first. To get started, could you walk me through the last project you shipped and what you owned?",
+            "Great. I'm wondering how you'd approach caching for a page that changes every few minutes",
+            "Nice. And the part I keep thinking about is the migration, so what's your plan for rolling it back if something breaks",
+            "Okay that makes sense. Give me a sense of how big the team was and what you owned",
+        ],
+        statements: [
+            "I think I already use the same build tools that your team uses every day",
+            "Sure, one sec.",
+            "Yeah, that's the kind of detail people often forget, so good call there.",
+            "Okay, let's change topics a little. This team works mostly with Kotlin, since all our services run on the JVM.",
+            "What I did was move the cache in front of the database, and how it worked was pretty simple.",
+            "Your trial ends next week, so the dashboard may lock soon.",
+        ]
+    )
 
     static func runTopicExtractorSuite() async {
         await suite("TopicExtractor") {
@@ -1376,6 +1485,32 @@ struct SmokeTestRunner {
                 await engine.absorb(.speechEnded(channel: .system, at: Date(), duration: 2.0, silenceLeading: 0))
                 let event = await collectFirstEvent(from: engine, within: 1.5)
                 await expect(event != nil, "re-arm timer fires the held candidate once the pause elapses")
+            }
+
+            // A high-scoring partial must wait for the speaker to stop, even when
+            // an older pause on the same channel already cleared the pause gate.
+            do {
+                let engine = TriggerEngine()
+                await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-5), duration: 1, silenceLeading: 0))
+                await engine.absorb(.speechStarted(channel: .system, at: Date()))
+                await engine.consider(segment: systemSegment("Tell me about your experience with"))
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                await engine.consider(segment: systemSegment("Tell me about your experience with Kotlin services"))
+                await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1), duration: 3, silenceLeading: 0))
+                let event = await collectFirstEvent(from: engine, within: 0.5)
+                await expect(event?.text == "Tell me about your experience with Kotlin services",
+                             "waits for the speaker to stop, then fires the full sentence (got \(event?.text ?? "nil"))")
+            }
+
+            // A candidate whose newer hypothesis stopped reading as a question is dropped.
+            do {
+                let engine = TriggerEngine()
+                let id = UUID()
+                await engine.consider(segment: TranscriptSegment(id: id, text: "How is it going", isFinal: false, channel: .system, startedAt: Date(), updatedAt: Date()))
+                await engine.consider(segment: TranscriptSegment(id: id, text: "House it going well.", isFinal: true, channel: .system, startedAt: Date(), updatedAt: Date()))
+                await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1), duration: 3, silenceLeading: 0))
+                let event = await collectFirstEvent(from: engine, within: 0.5)
+                await expect(event == nil, "stale candidate dropped when its segment stops reading as a question")
             }
         }
     }

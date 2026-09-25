@@ -29,6 +29,23 @@ enum PromptBuilder {
     - Reply in the same language the question was asked in.
     """
 
+    /// Yes/no check for transcript lines the question detector isn't sure about.
+    static func buildQuestionCheck(_ text: String) -> String {
+        """
+        Below is a line from a live speech-to-text transcript of a conversation. \
+        Punctuation may be missing or wrong. Does the speaker ask the listener a question, \
+        or ask them to talk about something (for example "tell me about...", "walk me \
+        through...", "my question is..."), that the listener is expected to answer now? \
+        Reply with only YES or NO.
+
+        Line: \(text)
+        """
+    }
+
+    static func parseQuestionCheck(_ raw: String) -> Bool {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("YES")
+    }
+
     /// Triggered by the question detector when someone in the meeting asks something.
     static func build(context: ConversationSnapshot, history: [ChatTurn], question: String, style: ResponseStyle) -> Prompt {
         let system = """

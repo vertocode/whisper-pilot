@@ -9,7 +9,37 @@ struct QuestionDetector: Sendable {
         // detected question (on Other only, on Me only, both, or neither) now
         // lives in SettingsStore via the per-channel auto-detect toggles. This
         // detector just answers "does this text look like a question?".
-        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        //
+        // One transcript line often holds several sentences, e.g. "Thanks for
+        // joining. ... could you walk me through your last project?". Scoring the whole
+        // line buried the question under the small talk before it, so each sentence
+        // is scored on its own and the best one wins.
+        Self.sentences(in: segment.text).map(Self.scoreSentence).max() ?? 0
+    }
+
+    /// Looser than `score`: true when a line has a question word or phrase anywhere.
+    /// Those lines are worth a quick yes/no check with the AI, because speech
+    /// recognition often loses the "?" and the heuristics miss oddly phrased questions.
+    func mightBeQuestion(_ segment: TranscriptSegment) -> Bool {
+        let words = segment.text.lowercased()
+            .components(separatedBy: CharacterSet.letters.inverted)
+            .filter { !$0.isEmpty }
+        guard words.count >= 4 else { return false }
+        if segment.text.contains("?") { return true }
+        let padded = " " + words.joined(separator: " ") + " "
+        return Self.questionCues.contains { padded.contains(" \($0) ") }
+    }
+
+    private static let questionCues: [String] = [
+        "what", "how", "why", "which", "where", "when", "who",
+        "can you", "could you", "would you", "will you", "do you", "did you",
+        "have you", "are you", "were you", "question", "curious", "wondering",
+        "tell me", "tell us", "walk me", "walk us", "explain", "describe",
+        "share", "thoughts", "talk about"
+    ]
+
+    private static func scoreSentence(_ raw: String) -> Double {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 6 else { return 0 }
         let lower = text.lowercased()
         let hasQuestionMark = text.hasSuffix("?")
@@ -34,7 +64,7 @@ struct QuestionDetector: Sendable {
             score += 0.15
         }
         if Self.modalLeads.contains(where: { cleaned.hasPrefix($0 + " ") }) {
-            score += 0.45
+            score += 0.5
         }
 
         if lower.contains(" you ") || lower.hasPrefix("you ") || lower.hasSuffix(" you") {
@@ -55,7 +85,50 @@ struct QuestionDetector: Sendable {
             score -= 0.15
         }
 
+        if Self.isClearQuestion(cleaned: cleaned, words: words, hasQuestionMark: hasQuestionMark) {
+            score = max(score, clearQuestionFloor)
+        }
+
         return max(0, min(1, score))
+    }
+
+    /// Just above the trigger threshold, so any one clear signal is enough to fire.
+    private static let clearQuestionFloor = 0.65
+
+    /// Shapes that are a question on their own. Speech recognition often drops the
+    /// "?", so the no-"?" shapes matter as much as the "?" itself. The word minimums
+    /// keep tag questions ("right?") and half-said sentences ("tell me about") out.
+    private static func isClearQuestion(cleaned: String, words: Int, hasQuestionMark: Bool) -> Bool {
+        if hasQuestionMark, words >= 3 { return true }
+        // "Tell me about your experience with Kotlin in production"
+        if words >= 5, requestLeads.contains(where: { cleaned.hasPrefix($0 + " ") }) { return true }
+        // "What would give the team confidence that you can ramp up fast"
+        if words >= 4, interrogativeStarters.contains(where: { starter in
+            questionVerbs.contains { cleaned.hasPrefix("\(starter) \($0) ") }
+        }) { return true }
+        // "Can you start the interview", "Do you have experience with Swift"
+        if words >= 4, modalLeads.contains(where: { cleaned.hasPrefix($0 + " ") }) { return true }
+        return false
+    }
+
+    /// Splits on ".", "?", "!", ":" or ";" followed by whitespace, keeping the
+    /// punctuation. The colon lets "my main question is: what would..." score
+    /// the part after the colon on its own.
+    private static func sentences(in text: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var previous: Character?
+        for char in text {
+            if char.isWhitespace, let p = previous, ".?!:;".contains(p) {
+                result.append(current)
+                current = ""
+            } else {
+                current.append(char)
+            }
+            previous = char
+        }
+        result.append(current)
+        return result
     }
 
     /// Repeatedly trims leading filler-or-connector tokens (with the punctuation /
@@ -94,7 +167,24 @@ struct QuestionDetector: Sendable {
     private static let modalLeads: Set<String> = [
         "can you", "could you", "would you", "do you", "did you",
         "have you", "are you", "is there", "is it", "should we",
+        "will you", "were you", "was it", "have we", "do we",
         "tell me", "walk me", "explain"
+    ]
+
+    /// Ways an interviewer asks for an answer without phrasing it as a question.
+    private static let requestLeads: [String] = [
+        "tell me", "tell us", "walk me", "walk us", "talk me", "talk us",
+        "explain", "describe", "give me an example", "give us an example",
+        "share", "i'd love to hear", "i'd like to hear", "i'd love to know",
+        "i'd like to know", "i want to know", "i'm curious"
+    ]
+
+    /// Words that, right after "what" / "how" / "why" / ..., make the sentence a
+    /// question rather than a statement like "what I did was...".
+    private static let questionVerbs: Set<String> = [
+        "is", "are", "was", "were", "do", "does", "did", "would", "will", "can",
+        "could", "should", "have", "has", "had", "made", "makes", "led",
+        "long", "much", "many", "often", "come", "kind", "type", "sort"
     ]
 
     private static let fillerStarts: [String] = [
@@ -106,6 +196,6 @@ struct QuestionDetector: Sendable {
     /// filler onto the actual question.
     private static let leadingTrimTokens: [String] = [
         "yeah", "yes", "no", "okay", "ok", "sure", "right", "uh", "um", "hmm",
-        "so", "and", "but", "well", "like", "i mean"
+        "so", "and", "but", "well", "like", "i mean", "now", "alright", "all right"
     ]
 }

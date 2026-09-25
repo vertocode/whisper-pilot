@@ -2401,6 +2401,18 @@ final class AppCoordinator {
                     wpInfo("[Coordinator] trigger fired but no API key for active model — skipping")
                     continue
                 }
+                if trigger.needsCheck {
+                    do {
+                        guard try await liveAI.isQuestionToAnswer(trigger.text) else {
+                            wpInfo("[Coordinator] possible question rejected by the AI check — skipping")
+                            continue
+                        }
+                    } catch {
+                        // Missing a real interview question is worse than one extra
+                        // answer, and the answer call will surface the error if it's real.
+                        wpWarn("Question check failed, answering anyway: \(error.localizedDescription)")
+                    }
+                }
                 self.log.info("→ Trigger fired, building prompt")
                 // Surface the detected question as a user-style bubble in the AI pane so
                 // the user can see *what* the detector picked up — without this, a fired
@@ -2470,20 +2482,12 @@ final class AppCoordinator {
         // fire on the post-utterance VAD pause, not on the eventual finalize.
         // Gated on the per-channel auto-detect toggle so we don't waste cycles
         // scoring segments on a channel the user has disabled.
-        let vadChannel = vadChannelFor(event)
-        if shouldAutoDetectQuestion(on: vadChannel),
+        // Only on speech end: on speech start the last segment is the utterance
+        // that just finished, and re-queuing it would fire it after the new one.
+        if case .speechEnded(let vadChannel, _, _, _) = event,
+           shouldAutoDetectQuestion(on: vadChannel),
            let last = await transcriptBuffer.lastSegment(on: vadChannel) {
             await triggerEngine.consider(segment: last)
-        }
-    }
-
-    /// Channel selector used by `handleVADEvent` to forward the right utterance
-    /// to the trigger engine. Both VAD event variants carry a channel; this
-    /// just unwraps it.
-    private nonisolated func vadChannelFor(_ event: VoiceActivityEvent) -> AudioChannel {
-        switch event {
-        case .speechStarted(let channel, _): return channel
-        case .speechEnded(let channel, _, _, _): return channel
         }
     }
 

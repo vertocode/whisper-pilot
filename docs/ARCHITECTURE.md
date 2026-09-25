@@ -108,7 +108,7 @@ When the user has set the AI to Paused, the trigger engine's events still come t
 ```swift
 protocol AIProvider {
     func streamCompletion(prompt: Prompt) -> AsyncThrowingStream<String, Error>
-    func classifyQuestion(_ text: String) async throws -> QuestionClass
+    func isQuestionToAnswer(_ text: String) async throws -> Bool
     func extractTopics(from text: String) async throws -> [String]
     func summarize(_ text: String) async throws -> String
 }

@@ -10,7 +10,7 @@ import OSLog
 /// Mirrors `GeminiProvider`'s shape: same `AIProvider` conformance, same
 /// `Prompt → AsyncThrowingStream<AIStreamEvent, Error>` contract, same
 /// `AIFinishReason` mapping, same `singleShot`-based helpers for the
-/// non-streaming utility calls (`classifyQuestion`, `extractTopics`,
+/// non-streaming utility calls (`isQuestionToAnswer`, `extractTopics`,
 /// `summarize`). Anything that already consumes `AIProvider` (the coordinator,
 /// the trigger pipeline) works against Claude with zero changes once the right
 /// instance lands in `aiProvider`.
@@ -54,17 +54,9 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         }
     }
 
-    func classifyQuestion(_ text: String) async throws -> QuestionClass {
-        let instruction = """
-        Classify the following question into exactly one of these categories: \
-        technical, conversational, status, interview, sales_objection, follow_up, other. \
-        Respond with only the category string.
-
-        Question: \(text)
-        """
-        let raw = try await singleShot(prompt: instruction, maxTokens: 32)
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return QuestionClass(rawValue: trimmed) ?? .other
+    func isQuestionToAnswer(_ text: String) async throws -> Bool {
+        let raw = try await singleShot(prompt: PromptBuilder.buildQuestionCheck(text), maxTokens: 5)
+        return PromptBuilder.parseQuestionCheck(raw)
     }
 
     func extractTopics(from text: String) async throws -> [String] {

@@ -10,6 +10,8 @@ struct TriggerEvent: Sendable {
     /// double-check the per-channel auto-detect toggle before actually calling
     /// the AI (defense in depth against settings flipping mid-stream).
     let channel: AudioChannel
+    /// The text only *might* be a question, so the AI must confirm it before answering.
+    let needsCheck: Bool
 }
 
 private let triggerLog = Logger(subsystem: "com.whisperpilot.app", category: "Trigger")
@@ -43,7 +45,11 @@ actor TriggerEngine {
     private var lastFiredText: String = ""
 
     private var pendingCandidate: [AudioChannel: TranscriptSegment] = [:]
+    private var pendingNeedsCheck: [AudioChannel: Bool] = [:]
     private var lastSpeechEndedAt: [AudioChannel: Date] = [:]
+    /// Without this, a partial like "Tell me about your" that scores high could
+    /// fire mid-sentence, using the pause from the speaker's *previous* utterance.
+    private var isSpeaking: [AudioChannel: Bool] = [:]
     /// Re-arm timers, one per channel. When `attemptFire` holds because the pause
     /// or cooldown hasn't elapsed *yet*, nothing external is guaranteed to call it
     /// again (the recognizer may already have delivered its last hypothesis), so a
@@ -64,10 +70,10 @@ actor TriggerEngine {
         case .speechStarted(let channel, _):
             // Speaker resumed — kill any pending candidate on that channel so we
             // don't fire mid-utterance.
-            pendingCandidate[channel] = nil
-            retryTasks[channel]?.cancel()
-            retryTasks[channel] = nil
+            dropCandidate(on: channel)
+            isSpeaking[channel] = true
         case .speechEnded(let channel, let at, _, _):
+            isSpeaking[channel] = false
             lastSpeechEndedAt[channel] = at
             attemptFire(on: channel)
         }
@@ -85,7 +91,17 @@ actor TriggerEngine {
         // sysdiagnoses and readable in Console.app, and leaking meeting audio
         // transcripts there contradicts the app's local-privacy promise.
         triggerLog.debug("Considered segment (channel=\(String(describing: segment.channel), privacy: .public), final=\(segment.isFinal, privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .private)\"")
-        guard score >= threshold else { return }
+        let needsCheck = score < threshold
+        guard !needsCheck || detector.mightBeQuestion(segment) else {
+            // A newer hypothesis for this channel no longer reads as a question
+            // (e.g. "tell me about your..." became "...actually, never mind"), so
+            // the older candidate must not fire at the next pause.
+            if pendingCandidate[segment.channel]?.id == segment.id {
+                dropCandidate(on: segment.channel)
+            }
+            return
+        }
+        pendingNeedsCheck[segment.channel] = needsCheck
         triggerLog.info("Pending candidate (channel=\(String(describing: segment.channel), privacy: .public), score=\(score, privacy: .public)): \"\(segment.text, privacy: .private)\"")
         pendingCandidate[segment.channel] = segment
         attemptFire(on: segment.channel)
@@ -93,6 +109,8 @@ actor TriggerEngine {
 
     private func attemptFire(on channel: AudioChannel) {
         guard let candidate = pendingCandidate[channel] else { return }
+        // speechEnded calls back in here, so a held candidate is not lost.
+        guard isSpeaking[channel] != true else { return }
         guard let endedAt = lastSpeechEndedAt[channel] else {
             triggerLog.debug("Holding fire — no speech-ended observed on \(String(describing: channel), privacy: .public) yet")
             return
@@ -106,6 +124,7 @@ actor TriggerEngine {
             return
         }
         let sinceLast = now.timeIntervalSince(lastFireAt)
+        let needsCheck = pendingNeedsCheck[channel] ?? false
         guard sinceLast >= cooldown else {
             triggerLog.info("Holding fire — cooldown (\(sinceLast, privacy: .public)s < \(self.cooldown, privacy: .public)s)")
             scheduleRetry(on: channel, after: cooldown - sinceLast)
@@ -118,20 +137,28 @@ actor TriggerEngine {
             return
         }
 
-        lastFireAt = now
+        // A line the AI may still reject must not start the cooldown, or it
+        // could block a real question asked right after it.
+        if !needsCheck { lastFireAt = now }
         lastFiredText = normalized
-        pendingCandidate[channel] = nil
-        retryTasks[channel]?.cancel()
-        retryTasks[channel] = nil
+        dropCandidate(on: channel)
 
         let event = TriggerEvent(
             text: candidate.text,
             score: detector.score(candidate),
             firedAt: now,
-            channel: channel
+            channel: channel,
+            needsCheck: needsCheck
         )
         triggerLog.info("🔔 FIRE (\(String(describing: channel), privacy: .public)): \"\(candidate.text, privacy: .private)\" (score=\(event.score, privacy: .public))")
         continuation.yield(event)
+    }
+
+    private func dropCandidate(on channel: AudioChannel) {
+        pendingCandidate[channel] = nil
+        pendingNeedsCheck[channel] = nil
+        retryTasks[channel]?.cancel()
+        retryTasks[channel] = nil
     }
 
     /// Retry `attemptFire` once the remaining gate time has elapsed. Replaces any

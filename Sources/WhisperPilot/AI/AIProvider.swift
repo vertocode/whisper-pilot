@@ -46,16 +46,6 @@ struct Prompt: Sendable {
     var imageJPEGBase64: String? = nil
 }
 
-enum QuestionClass: String, Codable, Sendable {
-    case technical
-    case conversational
-    case status
-    case interview
-    case salesObjection = "sales_objection"
-    case followUp = "follow_up"
-    case other
-}
-
 /// Why an AI stream ended. Mirrors Gemini's `finishReason` enum, but the abstraction
 /// is provider-agnostic so a future Ollama / Anthropic provider can populate the
 /// same value. `.stop` is the only "clean" outcome — every other case means the
@@ -113,7 +103,7 @@ enum AIStreamEvent: Sendable {
 
 protocol AIProvider: AnyObject, Sendable {
     func streamCompletion(prompt: Prompt) -> AsyncThrowingStream<AIStreamEvent, Error>
-    func classifyQuestion(_ text: String) async throws -> QuestionClass
+    func isQuestionToAnswer(_ text: String) async throws -> Bool
     func extractTopics(from text: String) async throws -> [String]
     func summarize(_ text: String) async throws -> String
 }
