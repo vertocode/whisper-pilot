@@ -39,6 +39,9 @@ enum ResponseStyle: String, CaseIterable, Codable, Sendable {
 struct Prompt: Sendable {
     let systemInstruction: String
     let context: String
+    /// Leading part of `context` that doesn't change between calls in a session.
+    /// Providers that support prompt caching cache it; others can ignore it.
+    var stableContext: String = ""
     let question: String
     let style: ResponseStyle
     /// Optional base64-encoded JPEG attached as multimodal input (e.g. "see my screen"

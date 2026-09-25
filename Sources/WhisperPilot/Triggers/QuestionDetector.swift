@@ -14,21 +14,61 @@ struct QuestionDetector: Sendable {
         // joining. ... could you walk me through your last project?". Scoring the whole
         // line buried the question under the small talk before it, so each sentence
         // is scored on its own and the best one wins.
-        Self.sentences(in: segment.text).map(Self.scoreSentence).max() ?? 0
+        Self.realSentences(in: segment.text).map(Self.scoreSentence).max() ?? 0
     }
 
     /// Looser than `score`: true when a line has a question word or phrase anywhere.
     /// Those lines are worth a quick yes/no check with the AI, because speech
     /// recognition often loses the "?" and the heuristics miss oddly phrased questions.
     func mightBeQuestion(_ segment: TranscriptSegment) -> Bool {
-        let words = segment.text.lowercased()
-            .components(separatedBy: CharacterSet.letters.inverted)
-            .filter { !$0.isEmpty }
+        let sentences = Self.realSentences(in: segment.text)
+        let words = sentences.flatMap(Self.words)
         guard words.count >= 4 else { return false }
-        if segment.text.contains("?") { return true }
+        if sentences.contains(where: { $0.contains("?") }) { return true }
         let padded = " " + words.joined(separator: " ") + " "
         return Self.questionCues.contains { padded.contains(" \($0) ") }
     }
+
+    /// Sentences minus small talk. "How are you?" and "Can you hear me?" are
+    /// questions, but answering them with the AI is noise, and firing on them
+    /// would start the cooldown right before the real question.
+    private static func realSentences(in text: String) -> [String] {
+        sentences(in: text).filter { !isSmallTalk($0) }
+    }
+
+    /// The whole sentence has to be small talk: "hi Sam, how are you doing today"
+    /// is, "how are you handling state in that app" is not.
+    private static func isSmallTalk(_ sentence: String) -> Bool {
+        var words = words(in: sentence)
+        while let last = words.last, smallTalkTrailers.contains(last) { words.removeLast() }
+        let joined = " " + words.joined(separator: " ")
+        return smallTalk.contains { phrase in
+            let phraseWords = phrase.split(separator: " ").count
+            return joined.hasSuffix(" " + phrase) && words.count <= phraseWords + 3
+        }
+    }
+
+    private static let smallTalkTrailers: Set<String> = [
+        "today", "doing", "guys", "everyone", "all", "there", "now", "okay", "ok", "so", "well"
+    ]
+
+    /// Lowercased letter runs, so "how's" becomes "how", "s".
+    private static func words(in text: String) -> [String] {
+        text.lowercased()
+            .components(separatedBy: CharacterSet.letters.inverted)
+            .filter { !$0.isEmpty }
+    }
+
+    /// Written the way `words(in:)` splits them, e.g. "how s it going".
+    private static let smallTalk: [String] = [
+        "how are you", "how s it going", "how is it going",
+        "how have you been", "how was your weekend", "how was your day",
+        "how s your day", "how is your day",
+        "can you hear me", "can you hear us", "can everyone hear me",
+        "can you see my screen", "can you see me", "can you see it",
+        "are you there", "did i lose you", "am i audible", "is my audio",
+        "nice to meet you", "good to meet you", "are you ready"
+    ]
 
     private static let questionCues: [String] = [
         "what", "how", "why", "which", "where", "when", "who",

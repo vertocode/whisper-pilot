@@ -18,9 +18,8 @@ struct ConversationSnapshot: Sendable {
     var globalContextBlock: String? = nil
 }
 
-/// Rolling memory the LLM sees on every prompt. We keep the recent transcript verbatim and a small
-/// set of extracted topics/entities so the model has continuity across turns without us re-sending
-/// the whole transcript.
+/// Rolling memory the LLM sees on every prompt. We keep the session's transcript verbatim (the
+/// prompt builder trims it to a size budget) and a small set of extracted topics/entities.
 actor ConversationContext {
     /// One line per finalized utterance. Keyed by `id` so a second isFinal for
     /// the same segment (e.g., the natural SFSpeech final following our
@@ -35,7 +34,9 @@ actor ConversationContext {
     private var lines: [Line] = []
     private var topics = OrderedSet(maxSize: 24)
     private var entities = OrderedSet(maxSize: 32)
-    private let retentionSeconds: TimeInterval = 300
+    /// A line cap rather than a time window: the AI needs what the user said at the
+    /// start of a long interview. Far more than the prompt budget ever uses.
+    private let maxLines = 1_000
 
     private let extractor = TopicExtractor()
 
@@ -124,9 +125,8 @@ actor ConversationContext {
     }
 
     private func prune() {
-        let cutoff = Date().addingTimeInterval(-retentionSeconds)
-        while let first = lines.first, first.at < cutoff {
-            lines.removeFirst()
+        if lines.count > maxLines {
+            lines.removeFirst(lines.count - maxLines)
         }
     }
 }

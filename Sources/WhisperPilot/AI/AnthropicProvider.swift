@@ -198,14 +198,23 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
     }
 
     private func requestBody(for prompt: Prompt, stream: Bool) -> AnthropicRequest {
+        var content: [AnthropicRequest.ContentBlock] = []
+        var liveContext = prompt.context
+        // Cache the notes/files part so later questions in the session reuse it
+        // instead of paying to re-read it. Below the model's minimum size Claude
+        // just doesn't cache, with no error.
+        if !prompt.stableContext.isEmpty, prompt.context.hasPrefix(prompt.stableContext) {
+            content.append(.cachedText(prompt.stableContext))
+            liveContext = String(prompt.context.dropFirst(prompt.stableContext.count))
+        }
         let userText = """
-        \(prompt.context)
+        \(liveContext.trimmingCharacters(in: .newlines))
 
         Question for you: \(prompt.question)
 
         Respond now in the requested style.
         """
-        var content: [AnthropicRequest.ContentBlock] = [.text(userText)]
+        content.append(.text(userText))
         if let imageData = prompt.imageJPEGBase64, !imageData.isEmpty {
             content.append(.image(mediaType: "image/jpeg", data: imageData))
         }
@@ -254,10 +263,11 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
 private struct AnthropicRequest: Encodable {
     enum ContentBlock: Encodable {
         case text(String)
+        case cachedText(String)
         case image(mediaType: String, data: String)
 
         private enum CodingKeys: String, CodingKey {
-            case type, text, source
+            case type, text, source, cache_control
         }
         private struct ImageSource: Encodable {
             let type: String  // "base64"
@@ -270,6 +280,10 @@ private struct AnthropicRequest: Encodable {
             case .text(let s):
                 try c.encode("text", forKey: .type)
                 try c.encode(s, forKey: .text)
+            case .cachedText(let s):
+                try c.encode("text", forKey: .type)
+                try c.encode(s, forKey: .text)
+                try c.encode(["type": "ephemeral"], forKey: .cache_control)
             case .image(let mt, let data):
                 try c.encode("image", forKey: .type)
                 try c.encode(ImageSource(type: "base64", media_type: mt, data: data), forKey: .source)

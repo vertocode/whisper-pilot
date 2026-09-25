@@ -27,6 +27,12 @@ enum PromptBuilder {
     - No preamble or filler: no "Great question", no restating the question, no sign-off. \
     Never say "as an AI" or "I'd be happy to help".
     - Reply in the same language the question was asked in.
+    - Facts about the user (jobs, projects, years, tools, numbers) come only from the \
+    user's notes and what they already said in the transcript. Never invent experience \
+    they don't have: they will say your words out loud, maybe in a job interview. If the \
+    notes don't cover what was asked, give an honest answer that links to the closest \
+    real experience they do have, or that says they haven't done it yet and how they'd \
+    approach it.
     """
 
     /// Yes/no check for transcript lines the question detector isn't sure about.
@@ -53,6 +59,10 @@ enum PromptBuilder {
         the user a question, and the user is about to answer it out loud. They can't type to \
         you and will glance at your reply while they talk, so lead with the answer.
 
+        If they're asking whether the user has any questions for them (common at the end of \
+        an interview), reply with two or three short questions the user could ask, based on \
+        the role, team or company in the user's notes and what came up in the conversation.
+
         \(speakingVoice)
 
         Style: \(style.rawValue) — \(style.description)
@@ -60,6 +70,7 @@ enum PromptBuilder {
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
             question: question,
             style: style
         )
@@ -102,6 +113,7 @@ enum PromptBuilder {
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
             question: query,
             style: style
         )
@@ -137,6 +149,7 @@ enum PromptBuilder {
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
             question: "Identify and answer the most recent unanswered question in the transcript.",
             style: style
         )
@@ -164,6 +177,7 @@ enum PromptBuilder {
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
             question: "Summarize the meeting so far based on the transcript and AI chat above.",
             // .detailed framing matches the directive's expectation of a multi-section reply.
             style: .detailed
@@ -199,6 +213,7 @@ enum PromptBuilder {
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
             question: "List the pending action items from the meeting so far.",
             style: .detailed
         )
@@ -246,6 +261,7 @@ enum PromptBuilder {
         return Prompt(
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
             question: "Read my screen and answer the question shown, following the rules above.",
             style: style
         )
@@ -263,6 +279,9 @@ enum PromptBuilder {
     static let contextFileBudget = 16_000
     static let priorTranscriptBudget = 20_000
     static let priorChatBudget = 10_000
+    /// About 30 minutes of two-way conversation, so the AI remembers what the user
+    /// said early in a long interview.
+    static let liveTranscriptBudget = 32_000
 
     /// Keeps the first `limit` characters, marking the cut.
     static func clampHead(_ text: String, to limit: Int) -> String {
@@ -276,7 +295,10 @@ enum PromptBuilder {
         return "[… earlier content truncated to fit the prompt budget …]\n" + text.suffix(limit)
     }
 
-    private static func contextBlock(transcript: ConversationSnapshot, history: [ChatTurn]) -> String {
+    /// The part of the context that stays the same from one call to the next in a
+    /// session (the user's notes and files, and a resumed session's history). It goes
+    /// first so Claude can cache it and skip re-reading it on every question.
+    private static func stableContextBlock(transcript: ConversationSnapshot) -> String {
         var sections: [String] = []
 
         // Global context (applies to every session) goes first as the broadest
@@ -297,8 +319,16 @@ enum PromptBuilder {
         if let priorChat = transcript.priorChatMarkdown {
             sections.append("Prior session AI chat (resumed):\n\(clampTail(priorChat, to: priorChatBudget))")
         }
+        return sections.joined(separator: "\n\n")
+    }
 
-        let recent = transcript.recentLines.suffix(20).joined(separator: "\n")
+    /// The whole prompt context: the stable part first, then what changes every call.
+    private static func contextBlock(transcript: ConversationSnapshot, history: [ChatTurn]) -> String {
+        var sections: [String] = []
+        let stable = stableContextBlock(transcript: transcript)
+        if !stable.isEmpty { sections.append(stable) }
+
+        let recent = clampTail(transcript.recentLines.joined(separator: "\n"), to: liveTranscriptBudget)
         if !recent.isEmpty {
             sections.append("Live meeting transcript (most recent at the bottom):\n\(recent)")
         }

@@ -114,7 +114,7 @@ protocol AIProvider {
 }
 ```
 
-`Prompt` carries `systemInstruction`, `context`, `question`, `style`, and an optional `imageJPEGBase64` for multimodal input. `GeminiProvider` packages those into `streamGenerateContent?alt=sse` requests, parses the SSE stream of partial JSON via `URLSession.bytes(for:)`, and yields decoded text deltas. When `imageJPEGBase64` is set, it ships as a second `inline_data` part so vision-capable models reason about the screenshot.
+`Prompt` carries `systemInstruction`, `context`, `question`, `style`, and an optional `imageJPEGBase64` for multimodal input. `stableContext` is the start of `context` that stays the same for a whole session (the user's notes and files); `AnthropicProvider` sends it as its own block with `cache_control` so later questions read it from Claude's prompt cache. `GeminiProvider` packages those into `streamGenerateContent?alt=sse` requests, parses the SSE stream of partial JSON via `URLSession.bytes(for:)`, and yields decoded text deltas. When `imageJPEGBase64` is set, it ships as a second `inline_data` part so vision-capable models reason about the screenshot.
 
 Both providers (`GeminiProvider`, `AnthropicProvider`) share the same failure handling. `AIRetryPolicy.withRetry` retries once, and only before any text has reached the user, for 429, 5xx, Anthropic overloaded events and dropped connections; it honors `Retry-After` up to 8 seconds. A stream that yields no text and only undecodable chunks fails with `unexpectedFormat` instead of looking like a network drop. Error bodies are cut to one line by `AIErrorBody`. For auto-detected questions, an identical error note is shown once (`RepeatedNote`).
 

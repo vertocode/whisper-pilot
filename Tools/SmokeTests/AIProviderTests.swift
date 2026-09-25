@@ -11,6 +11,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
 
     nonisolated(unsafe) private static var replies: [Reply] = []
     nonisolated(unsafe) private static var requestCount = 0
+    nonisolated(unsafe) private static var lastBody = Data()
     private static let lock = NSLock()
 
     /// Each request consumes the next reply; the last one repeats.
@@ -23,6 +24,11 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     static var requests: Int {
         lock.lock(); defer { lock.unlock() }
         return requestCount
+    }
+
+    static var lastRequestBody: String {
+        lock.lock(); defer { lock.unlock() }
+        return String(data: lastBody, encoding: .utf8) ?? ""
     }
 
     static func session() -> URLSession {
@@ -39,6 +45,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             Self.lock.lock(); defer { Self.lock.unlock() }
             let index = min(Self.requestCount, Self.replies.count - 1)
             Self.requestCount += 1
+            Self.lastBody = Self.readBody(of: request)
             return Self.replies[index]
         }()
         let response = HTTPURLResponse(
@@ -51,6 +58,21 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+
+    /// URLSession hands the body to a URLProtocol as a stream, not `httpBody`.
+    private static func readBody(of request: URLRequest) -> Data {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open(); defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            guard read > 0 else { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
 }
 
 extension SmokeTestRunner {
@@ -60,9 +82,11 @@ extension SmokeTestRunner {
         var error: Error?
     }
 
-    static func collect(_ provider: AIProvider) async -> StreamOutcome {
+    static func collect(
+        _ provider: AIProvider,
+        prompt: Prompt = Prompt(systemInstruction: "s", context: "c", question: "q", style: .concise)
+    ) async -> StreamOutcome {
         var outcome = StreamOutcome()
-        let prompt = Prompt(systemInstruction: "s", context: "c", question: "q", style: .concise)
         do {
             for try await event in provider.streamCompletion(prompt: prompt) {
                 switch event {
@@ -84,6 +108,28 @@ extension SmokeTestRunner {
             AnthropicProvider(apiKey: "test", model: "claude-sonnet-4-6", session: StubURLProtocol.session())
         }
         func sse(_ lines: String...) -> String { lines.joined(separator: "\n") + "\n" }
+
+        await suite("Claude prompt caching and question check") {
+            StubURLProtocol.install([.init(status: 200, body: sse(
+                #"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}"#, "",
+                #"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#, ""
+            ))])
+            let cached = Prompt(systemInstruction: "s", context: "NOTES-BLOCK\n\nLIVE-BLOCK", stableContext: "NOTES-BLOCK", question: "q", style: .concise)
+            _ = await collect(claude(), prompt: cached)
+            let body = StubURLProtocol.lastRequestBody
+            await expect(body.contains(#""cache_control":{"type":"ephemeral"}"#) && body.contains(#""text":"NOTES-BLOCK""#),
+                         "stable context is sent as its own cached block")
+            await expect(!body.contains("NOTES-BLOCK\\n\\nLIVE-BLOCK"), "stable context isn't sent twice")
+            await expect(body.contains("LIVE-BLOCK"), "live context is still sent")
+
+            _ = await collect(claude())
+            await expect(!StubURLProtocol.lastRequestBody.contains("cache_control"), "no cache marker without stable context")
+
+            StubURLProtocol.install([.init(status: 200, body: #"{"content":[{"type":"text","text":"YES"}]}"#)])
+            await expect((try? await claude().isQuestionToAnswer("tell me about your last role")) == true, "YES reply means a question")
+            StubURLProtocol.install([.init(status: 200, body: #"{"content":[{"type":"text","text":"NO"}]}"#)])
+            await expect((try? await claude().isQuestionToAnswer("sure, one sec")) == false, "NO reply means not a question")
+        }
 
         await suite("Gemini stream parsing") {
             StubURLProtocol.install([.init(status: 200, body: sse(

@@ -192,6 +192,16 @@ struct SmokeTestRunner {
             await expect(detector.score(systemSegment("Sure, one sec.")) < 0.6,
                          "plain statement must not fire")
 
+            for text in ["How are you?", "Hi Sam, how are you doing today?", "Can you hear me okay?",
+                         "Can you see my screen?", "How's it going?", "Nice to meet you!"] {
+                await expect(detector.score(systemSegment(text)) < 0.6 && !detector.mightBeQuestion(systemSegment(text)),
+                             "small talk must not fire or reach the AI check: \(text)")
+            }
+            await expect(detector.score(systemSegment("How are you handling state in that app?")) >= 0.6,
+                         "a real question that starts like small talk still fires")
+            await expect(detector.score(systemSegment("Hey, how are you? Tell me about the last project you shipped.")) >= 0.6,
+                         "small talk before a real question doesn't hide it")
+
             // Real interview lines where speech recognition dropped the "?".
             let noMarkQuestions = [
                 "the detail. That's a fair way to put it. And it sounds like you know where the hard parts are. I'll be open about this, since part of my job is to be clear. This position asks for a few years of Kotlin on the backend, and the group cares about that a lot, because in the first month you'd be changing billing code that real customers depend on. So my main question is: what would show the group that you can learn the stack quickly enough to own that part without a long warm-up",
@@ -261,6 +271,24 @@ struct SmokeTestRunner {
                 let (result, path) = await answered(text)
                 await expect(!result, "statement answered (\(path)): \(text.suffix(70))")
             }
+
+            // Grounding: the notes never mention React Native, so the answer must not claim it.
+            let notes = "Candidate notes: 5 years building iOS apps in Swift and SwiftUI at a fintech startup. Led the offline sync rewrite. Some TypeScript for internal tools. No React Native or Android experience."
+            var snapshot = ConversationSnapshot(recentLines: ["Other: This team ships a React Native app."], topics: [], entities: [])
+            snapshot.sessionContextBlock = notes
+            let question = "Tell me about your experience with React Native in production"
+            let prompt = PromptBuilder.build(context: snapshot, history: [], question: question, style: .auto)
+            let answer = await collect(ai, prompt: prompt).deltas.joined()
+            print("  ⓘ Answer: \(answer)")
+            let judge = Prompt(
+                systemInstruction: "You check interview answers for made-up claims. Reply with only YES or NO.",
+                context: notes,
+                question: "Does this answer claim React Native or Android experience in production that the notes above don't support? Answer: \(answer)",
+                style: .concise
+            )
+            let verdict = await collect(ai, prompt: judge).deltas.joined()
+            await expect(!answer.isEmpty && !PromptBuilder.parseQuestionCheck(verdict),
+                         "answer must not invent React Native experience (judge said \(verdict))")
         }
     }
 
@@ -337,6 +365,11 @@ struct SmokeTestRunner {
             await context5.absorb(.init(id: UUID(), text: "we ship on friday", isFinal: true, channel: .microphone, timestamp: Date()))
             await context5.absorb(.init(id: UUID(), text: "We ship on Friday.", isFinal: true, channel: .microphone, timestamp: Date()))
             let snap5 = await context5.snapshot()
+            let context6 = ConversationContext()
+            await context6.absorb(.init(id: UUID(), text: "I led the payments rewrite.", isFinal: true, channel: .microphone, timestamp: Date().addingTimeInterval(-40 * 60)))
+            await context6.absorb(.init(id: UUID(), text: "Tell me about a hard bug.", isFinal: true, channel: .system, timestamp: Date()))
+            let snap6 = await context6.snapshot()
+            await expect(snap6.recentLines.first == "Me: I led the payments rewrite.", "lines from 40 minutes ago stay in context")
             await expect(snap5.recentLines.count == 1, "duplicate finals merged into one context line (got \(snap5.recentLines.count))")
             await expect(snap5.recentLines.first == "Me: We ship on Friday.", "merged line keeps the more complete text (got \(snap5.recentLines.first ?? "nil"))")
         }
@@ -354,7 +387,23 @@ struct SmokeTestRunner {
             let lines = (0..<50).map { "Other: line \($0)" }
             let p3 = PromptBuilder.build(context: snapshotFor(lines: lines), history: [], question: "?", style: .concise)
             await expect(p3.context.contains("line 49"), "most recent line preserved")
-            await expect(!p3.context.contains("line 0\n"), "earliest line trimmed")
+            await expect(p3.context.contains("line 0\n"), "a 50-line conversation is sent whole")
+
+            let longLines = (0..<3000).map { "Other: line \($0) of a very long interview" }
+            let pLong = PromptBuilder.build(context: snapshotFor(lines: longLines), history: [], question: "?", style: .concise)
+            await expect(pLong.context.contains("line 2999 "), "long transcript keeps the newest line")
+            await expect(!pLong.context.contains("line 0 "), "long transcript is trimmed from the start")
+
+            var withNotes = snapshotFor(lines: ["Other: LIVE-LINE"])
+            withNotes.sessionContextBlock = "SESSION-NOTES"
+            let pNotes = PromptBuilder.build(context: withNotes, history: [], question: "?", style: .concise)
+            await expect(pNotes.stableContext.contains("SESSION-NOTES") && !pNotes.stableContext.contains("LIVE-LINE"),
+                         "stable context holds the notes, not the live transcript")
+            await expect(pNotes.context.hasPrefix(pNotes.stableContext), "stable context is the start of the full context")
+            await expect(pNotes.systemInstruction.contains("Never invent experience"),
+                         "answers are told to stick to the user's real experience")
+            await expect(pNotes.systemInstruction.contains("any questions for them"),
+                         "end-of-interview questions get suggested questions")
 
             let p4 = PromptBuilder.build(context: snapshotFor(topics: ["postgres", "scaling"]), history: [], question: "What about sharding?", style: .detailed)
             await expect(p4.context.contains("postgres") && p4.context.contains("scaling"), "topics listed when present")
