@@ -59,6 +59,10 @@ final class TranscriptStreamSegmenter {
     private var lastTokenEnd: TimeInterval?
     /// Set when `takePendingFinal` flushed the current text; cleared by new tokens.
     private var flushedPendingFinal = false
+    /// The segment closed most recently. The model often decodes the "?" or "." that
+    /// ends a sentence after the pause that closed it, so that mark belongs here and
+    /// not at the start of the next line.
+    private var lastClosed: SegmenterFinal?
 
     init(config: Config = Config()) {
         self.config = config
@@ -77,6 +81,13 @@ final class TranscriptStreamSegmenter {
         var finals: [SegmenterFinal] = []
         for token in tokens {
             guard !token.piece.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            if words.isEmpty, openWord.isEmpty, let closed = lastClosed,
+               Self.isTrailingPunctuation(token.piece) {
+                let fixed = SegmenterFinal(segmentId: closed.segmentId, text: closed.text + token.piece)
+                lastClosed = fixed
+                finals.append(fixed)
+                continue
+            }
             let startsNewWord = token.piece.hasPrefix(" ") || (openWord.isEmpty && words.isEmpty)
 
             if startsNewWord {
@@ -125,6 +136,11 @@ final class TranscriptStreamSegmenter {
         finalizeOpenSegment(includeOpenWord: true)
     }
 
+    /// A mark like "?" or "." with no leading space, so it attaches to the word before it.
+    private static func isTrailingPunctuation(_ piece: String) -> Bool {
+        !piece.hasPrefix(" ") && piece.allSatisfy { ".,?!;:…".contains($0) }
+    }
+
     private func commitOpenWord() {
         let trimmed = openWord.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty { words.append(trimmed) }
@@ -150,6 +166,8 @@ final class TranscriptStreamSegmenter {
         // the gap-cut path re-seeds it from the incoming token immediately.
         lastTokenEnd = nil
         guard !text.isEmpty else { return nil }
-        return SegmenterFinal(segmentId: id, text: text)
+        let final = SegmenterFinal(segmentId: id, text: text)
+        lastClosed = final
+        return final
     }
 }

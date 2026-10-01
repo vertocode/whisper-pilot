@@ -107,6 +107,9 @@ enum AIStreamEvent: Sendable {
 protocol AIProvider: AnyObject, Sendable {
     func streamCompletion(prompt: Prompt) -> AsyncThrowingStream<AIStreamEvent, Error>
     func isQuestionToAnswer(_ text: String) async throws -> Bool
+    /// Runs a prompt whose reply is one short word (YES/NO, NEW/SKIP) on the vendor's
+    /// fastest model, so the check doesn't slow down the answer that follows it.
+    func quickCheck(_ prompt: Prompt) async throws -> String
     func extractTopics(from text: String) async throws -> [String]
     func summarize(_ text: String) async throws -> String
 }

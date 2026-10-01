@@ -659,6 +659,7 @@ struct OverlayView: View {
         if transcriptCollapsed {
             TranscriptLane(
                 segments: state.transcript,
+                history: state.transcriptHistory,
                 isCollapsed: true,
                 onToggleCollapse: { transcriptCollapsed.toggle() }
             )
@@ -667,6 +668,7 @@ struct OverlayView: View {
             VStack(spacing: 0) {
                 TranscriptLane(
                     segments: state.transcript,
+                    history: state.transcriptHistory,
                     isCollapsed: false,
                     showContent: false,
                     onToggleCollapse: { transcriptCollapsed.toggle() },
@@ -679,6 +681,7 @@ struct OverlayView: View {
                         VStack(alignment: .leading, spacing: WP.Space.md) {
                             TranscriptLane(
                                 segments: state.transcript,
+                                history: state.transcriptHistory,
                                 isCollapsed: false,
                                 showHeader: false,
                                 onToggleCollapse: nil
@@ -738,7 +741,7 @@ struct OverlayView: View {
             transcriptHasUnseen = true
             return
         }
-        guard let last = state.transcript.last?.id else { return }
+        guard let last = (state.transcript.last ?? state.transcriptHistory.last)?.id else { return }
         withAnimation(.easeOut(duration: 0.15)) {
             proxy.scrollTo(last, anchor: .bottom)
         }

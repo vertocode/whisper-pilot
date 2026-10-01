@@ -123,6 +123,21 @@ struct SmokeTestRunner {
         }
     }
 
+    /// Every event the engine fires within the window, read through one iterator.
+    static func collectEvents(from engine: TriggerEngine, within seconds: TimeInterval) async -> [TriggerEvent] {
+        let collector = Task { () -> [TriggerEvent] in
+            var events: [TriggerEvent] = []
+            for await event in engine.events {
+                events.append(event)
+                if Task.isCancelled { break }
+            }
+            return events
+        }
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        collector.cancel()
+        return await collector.value
+    }
+
     // MARK: - Suites
 
     static func runQuestionDetectorSuite() async {
@@ -148,6 +163,17 @@ struct SmokeTestRunner {
 
             await expect(detector.score(systemSegment("Can you walk us through your approach")) >= 0.6,
                          "modal lead must clear threshold even without ?")
+
+            await expect(detector.score(systemSegment("Great, so to lock in the plan, do you have any trips or a move planned within the next year")) >= 0.6,
+                         "question hidden behind a comma preamble must clear threshold")
+            await expect(detector.score(systemSegment("Okay, and tell me how much you are expecting for a role like this one")) >= 0.6,
+                         "request lead after a comma must clear threshold")
+            await expect(detector.score(systemSegment("Everything's fine. What about you?")) < 0.6,
+                         "what-about-you is small talk")
+
+            await expect(PromptBuilder.parseHelpAICheck(" new\n"), "Help AI check: NEW means answer")
+            await expect(!PromptBuilder.parseHelpAICheck("SKIP"), "Help AI check: SKIP means ignore the click")
+            await expect(!PromptBuilder.parseHelpAICheck(""), "Help AI check: empty reply is not NEW")
 
             await expect(detector.score(systemSegment("yeah right okay sure that makes sense")) < 0.6,
                          "filler starts must be downweighted")
@@ -290,6 +316,65 @@ struct SmokeTestRunner {
             let verdict = await collect(ai, prompt: judge).deltas.joined()
             await expect(!answer.isEmpty && !PromptBuilder.parseQuestionCheck(verdict),
                          "answer must not invent React Native experience (judge said \(verdict))")
+
+            // Personal facts the notes don't hold must come back as a blank to fill
+            // in, never as a guess the user would read out loud.
+            let logistics = PromptBuilder.build(
+                context: snapshot,
+                history: [],
+                question: "To lock in the logistics, do you have any trips or vacations planned in the next six months",
+                style: .auto
+            )
+            let logisticsAnswer = await collect(ai, prompt: logistics).deltas.joined()
+            print("  ⓘ Logistics answer: \(logisticsAnswer)")
+            await expect(logisticsAnswer.contains("["), "missing personal facts become a [blank], not a guess")
+            let outsideBrackets = logisticsAnswer.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression).lowercased()
+            await expect(!["no trips", "don't have any", "do not have any", "fully available", "i have a trip", "nothing planned"].contains { outsideBrackets.contains($0) },
+                         "the fact itself is only inside the brackets")
+
+            // How a spoken answer should look: short, plain sentences.
+            let story = PromptBuilder.build(
+                context: snapshot,
+                history: [],
+                question: "Walk me through a project you're proud of and what you owned",
+                style: .auto
+            )
+            let storyAnswer = await collect(ai, prompt: story).deltas.joined()
+            print("  ⓘ Story answer: \(storyAnswer)")
+            let wordCount = storyAnswer.split(whereSeparator: \.isWhitespace).count
+            await expect(wordCount > 0 && wordCount <= 130, "spoken answer stays short (\(wordCount) words)")
+            await expect(!storyAnswer.contains("—") && !storyAnswer.contains(";") && !storyAnswer.contains("\n-"),
+                         "spoken answer has no dashes, semicolons, or lists")
+            let storyJudge = Prompt(
+                systemInstruction: "You check interview answers for made-up claims. Reply with only YES or NO.",
+                context: notes,
+                question: "Does this answer add specific results, numbers, or technical details that the notes above don't mention? Answer: \(storyAnswer)",
+                style: .concise
+            )
+            let storyVerdict = await collect(ai, prompt: storyJudge).deltas.joined()
+            await expect(!PromptBuilder.parseQuestionCheck(storyVerdict), "story answer must not invent details (judge said \(storyVerdict))")
+            let buzzwords = ["leverage", "seamless", "robust", "synergy", "passionate", "super ", "gonna", "kinda"]
+            await expect(!buzzwords.contains { storyAnswer.lowercased().contains($0) }, "spoken answer avoids slang and buzzwords")
+
+            // Help AI: a question already on screen is skipped, a new one is answered.
+            let helpSnapshot = ConversationSnapshot(
+                recentLines: [
+                    "Other: Have you worked with GraphQL pagination?",
+                    "Me: Yes, I used cursor based pagination on a product list."
+                ],
+                topics: [],
+                entities: []
+            )
+            let handled = ["Question: Have you worked with GraphQL pagination", "Reply: Yes, I use cursor based pagination."]
+            let skip = (try? await ai.quickCheck(PromptBuilder.buildHelpAICheck(context: helpSnapshot, history: [], handled: handled))) ?? "error"
+            await expect(!PromptBuilder.parseHelpAICheck(skip), "Help AI skips a question that was already answered (got \(skip))")
+            let newSnapshot = ConversationSnapshot(
+                recentLines: helpSnapshot.recentLines + ["Other: Great. And how do you deal with rate limits on that API?"],
+                topics: [],
+                entities: []
+            )
+            let new = (try? await ai.quickCheck(PromptBuilder.buildHelpAICheck(context: newSnapshot, history: [], handled: handled))) ?? "error"
+            await expect(PromptBuilder.parseHelpAICheck(new), "Help AI answers a new question (got \(new))")
         }
     }
 
@@ -309,6 +394,8 @@ struct SmokeTestRunner {
             "Okay, let's change topics a little. This team works mostly with Kotlin, since all our services run on the JVM.",
             "What I did was move the cache in front of the database, and how it worked was pretty simple.",
             "Your trial ends next week, so the dashboard may lock soon.",
+            "Hey, good morning. How are you doing today?",
+            "Everything's fine. What about you?",
         ]
     )
 
@@ -418,8 +505,12 @@ struct SmokeTestRunner {
             await expect(pNotes.stableContext.contains("SESSION-NOTES") && !pNotes.stableContext.contains("LIVE-LINE"),
                          "stable context holds the notes, not the live transcript")
             await expect(pNotes.context.hasPrefix(pNotes.stableContext), "stable context is the start of the full context")
-            await expect(pNotes.systemInstruction.contains("Never invent experience"),
+            await expect(pNotes.systemInstruction.contains("Never invent jobs"),
                          "answers are told to stick to the user's real experience")
+            await expect(pNotes.systemInstruction.contains("don't guess") && pNotes.systemInstruction.contains("square brackets"),
+                         "personal facts missing from the notes become blanks, not guesses")
+            await expect(pNotes.systemInstruction.contains("speech recognition"),
+                         "answers are told the transcript has recognition mistakes")
             await expect(pNotes.systemInstruction.contains("any questions for them"),
                          "end-of-interview questions get suggested questions")
 
@@ -540,6 +631,23 @@ struct SmokeTestRunner {
             func update(_ text: String, final: Bool, channel: AudioChannel = .system,
                         id: UUID = UUID(), at: Date = Date()) -> TranscriptUpdate {
                 TranscriptUpdate(id: id, text: text, isFinal: final, channel: channel, timestamp: at)
+            }
+
+            // A long session keeps every line: old lines leave the buffer in order
+            // and the overlay keeps them as history, nothing is dropped.
+            do {
+                let buffer = TranscriptBuffer()
+                let start = Date()
+                var kept: [TranscriptSegment] = []
+                for i in 0..<320 {
+                    await buffer.apply(update("Line number \(i) of the class.", final: true, at: start.addingTimeInterval(Double(i) * 20)))
+                    kept.append(contentsOf: await buffer.takeEvicted())
+                }
+                let all = kept + (await buffer.snapshot())
+                await expect(all.count == 320, "every line is kept between history and the live buffer (got \(all.count))")
+                await expect(all.first?.text == "Line number 0 of the class." && all.last?.text == "Line number 319 of the class.",
+                             "history keeps the original order")
+                await expect((await buffer.snapshot()).count <= 200, "the live buffer itself stays small")
             }
 
             // 1. Volatile refinements replace in place — never extra rows.
@@ -713,6 +821,18 @@ struct SmokeTestRunner {
             await expect(gapFinals.count == 1 && gapFinals[0].text == "how are you?",
                          "≥1 s pause between words cuts the segment")
             await expect(gap.currentText == "Great", "word after the pause opens the next segment")
+
+            // A "?" decoded after the pause that closed its sentence belongs to
+            // that sentence, re-emitted under the same id, not to the next line.
+            let late = TranscriptStreamSegmenter()
+            _ = late.absorb([token(" what", 0.0, 0.2), token(" do", 0.25, 0.4), token(" you", 0.45, 0.6), token(" think", 0.65, 0.9)])
+            let lateCut = late.tick(decodedThrough: 2.5)
+            let lateFix = late.absorb([token("?", 0.9, 0.95)])
+            await expect(lateFix.count == 1 && lateFix[0].text == "what do you think?" && lateFix[0].segmentId == lateCut?.segmentId,
+                         "late question mark is re-emitted on the closed line (got \(lateFix.map(\.text)))")
+            await expect(late.currentText.isEmpty, "late question mark does not open a new line")
+            _ = late.absorb([token(" Great", 3.0, 3.2)])
+            await expect(late.currentText == "Great", "next words still open a new line")
 
             // Idle cut fires only once the decoded frontier is past the last
             // token by idleSeconds — not while decode is merely catching up.
@@ -1494,6 +1614,62 @@ struct SmokeTestRunner {
 
     static func runTriggerEngineSuite() async {
         await suite("TriggerEngine") {
+            // One question reaches the engine many times as the line grows and as
+            // each pause ends. It must answer once, and a longer version replaces it.
+            do {
+                let engine = TriggerEngine(cooldown: 0)
+                func pause() async {
+                    await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1.0), duration: 2.0, silenceLeading: 0))
+                }
+                await engine.consider(segment: systemSegment("Have you shipped mobile apps"))
+                await pause()
+                await engine.consider(segment: systemSegment("Have you shipped mobile apps"))
+                await pause()
+                await engine.consider(segment: systemSegment("So have you shipped mobile apps in production"))
+                await pause()
+                await engine.consider(segment: systemSegment("have you shipped mobile apps in production"))
+                await pause()
+                await engine.consider(segment: systemSegment("So have you shipped mobile apps in production? Okay, and how do you handle testing"))
+                await pause()
+                let events = await collectEvents(from: engine, within: 0.6)
+                await expect(events.count == 3, "one fire per question plus one for the longer version (got \(events.map(\.text)))")
+                await expect(events.count == 3 && events[1].supersedes == "Have you shipped mobile apps",
+                             "longer version replaces the cut-off question")
+                await expect(events.count == 3 && events[2].text == "Okay, and how do you handle testing" && events[2].supersedes == nil,
+                             "a new question added to the same line fires on its own")
+            }
+
+            let after = TriggerEngine.wordsAfter("Have you used Swift", in: "Have you used Swift? Or only Kotlin")
+            await expect(after.text == "Or only Kotlin" && after.afterSentenceEnd,
+                         "wordsAfter keeps the original words and sees the question mark before them")
+            await expect(TriggerEngine.wordsAfter("unrelated words here", in: "Have you used Swift").text == "",
+                         "wordsAfter is empty when there is no match")
+
+            // A teacher who keeps talking after a question grows the same line for a
+            // long time. The answer may be replaced once, then it must stay put.
+            do {
+                let engine = TriggerEngine(cooldown: 0)
+                let id = UUID()
+                let growth = [
+                    "So what do you think makes some birds",
+                    "So what do you think makes some birds travel so far",
+                    "So what do you think makes some birds travel so far? It is a fun one",
+                    "So what do you think makes some birds travel so far? It is a fun one and I love it",
+                    "So what do you think makes some birds travel so far? It is a fun one and I love it, really I do"
+                ]
+                for text in growth {
+                    await engine.consider(segment: TranscriptSegment(id: id, text: text, isFinal: false, channel: .system, startedAt: Date(), updatedAt: Date()))
+                    await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1.0), duration: 2.0, silenceLeading: 0))
+                    await engine.absorb(.speechStarted(channel: .system, at: Date()))
+                    await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1.0), duration: 2.0, silenceLeading: 0))
+                }
+                let events = await collectEvents(from: engine, within: 0.6)
+                await expect(events.count == 2 && events[1].supersedes != nil,
+                             "a growing monologue gives one answer, replaced at most once (got \(events.map(\.text)))")
+            }
+            let split = TriggerEngine.splitAtFirstSentenceEnd("in production? Okay, and testing")
+            await expect(split.0 == "in production?" && split.1 == "Okay, and testing", "split stops at the first sentence end")
+
             do {
                 let engine = TriggerEngine()
                 await engine.consider(segment: systemSegment("How would you scale this?"))
@@ -1508,6 +1684,17 @@ struct SmokeTestRunner {
                 await engine.consider(segment: systemSegment("How would you scale this?"))
                 let event = await collectFirstEvent(from: engine, within: 0.4)
                 await expect(event == nil, "no fire without speech-ended event")
+            }
+
+            do {
+                let engine = TriggerEngine()
+                await engine.consider(segment: systemSegment("Thanks for that. Have you built or modified"))
+                await engine.absorb(.speechStarted(channel: .system, at: Date()))
+                await engine.consider(segment: systemSegment("storefront themes in production, or was most of your work custom"))
+                await engine.absorb(.speechEnded(channel: .system, at: Date().addingTimeInterval(-1.0), duration: 2.0, silenceLeading: 0))
+                let event = await collectFirstEvent(from: engine, within: 0.5)
+                await expect(event?.text.contains("Have you built or modified storefront themes") == true,
+                             "question split across two lines fires as one")
             }
 
             do {
@@ -2270,6 +2457,25 @@ struct SmokeTestRunner {
     }
 
     static func runTranslationQueueSuite() async {
+        await suite("Translation pack re-check") {
+            // macOS can call an installed pack missing right after launch. The
+            // session must keep checking instead of giving up on translation.
+            final class Answers: @unchecked Sendable { var list: [TranslationAvailability] = [.downloadRequired, .downloadRequired, .installed]; var asked = 0 }
+            let answers = Answers()
+            let installed = await TranslationSupport.waitUntilInstalled(
+                interval: .milliseconds(5),
+                keepTrying: { true },
+                check: { answers.asked += 1; return answers.list.removeFirst() }
+            )
+            await expect(installed && answers.asked == 3, "translation starts once the pack shows up")
+            let stopped = await TranslationSupport.waitUntilInstalled(
+                interval: .milliseconds(5),
+                keepTrying: { false },
+                check: { .installed }
+            )
+            await expect(!stopped, "re-checking stops when the session ends")
+        }
+
         await suite("TranslationQueue scheduling") {
             // Finalized system line translates without waiting for a debounce.
             let fake = FakeTranslator()

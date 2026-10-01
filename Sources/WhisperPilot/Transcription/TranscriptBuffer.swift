@@ -135,7 +135,11 @@ actor TranscriptBuffer {
     private var finalIndexByID: [UUID: Int] = [:]
     private var volatileByChannel: [AudioChannel: TranscriptSegment] = [:]
 
+    /// Lines kept here for merging and translation. Older lines move out in chunks
+    /// (so the screen's history list changes rarely) and the overlay keeps them.
     private static let maxFinals = 150
+    private static let evictionChunk = 50
+    private var evicted: [TranscriptSegment] = []
 
     func apply(_ update: TranscriptUpdate) {
         let trimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -279,8 +283,9 @@ actor TranscriptBuffer {
     private func appendFinal(_ segment: TranscriptSegment) {
         finals.append(segment)
         finalIndexByID[segment.id] = finals.count - 1
-        if finals.count > Self.maxFinals {
+        if finals.count > Self.maxFinals + Self.evictionChunk {
             let excess = finals.count - Self.maxFinals
+            evicted.append(contentsOf: finals.prefix(excess))
             finals.removeFirst(excess)
             finalIndexByID = Dictionary(
                 uniqueKeysWithValues: finals.enumerated().map { ($0.element.id, $0.offset) }
@@ -347,7 +352,14 @@ actor TranscriptBuffer {
         return nil
     }
 
+    /// Lines that left the buffer since the last call, oldest first.
+    func takeEvicted() -> [TranscriptSegment] {
+        defer { evicted.removeAll() }
+        return evicted
+    }
+
     func clear() {
+        evicted.removeAll()
         finals.removeAll()
         finalIndexByID.removeAll()
         volatileByChannel.removeAll()

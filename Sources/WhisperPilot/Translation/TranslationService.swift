@@ -109,6 +109,22 @@ enum TranslationSupport {
     ///
     /// Returns `[(identifier, localizedName)]` — the identifier is what gets
     /// persisted in `SettingsStore.translationTargetIdentifier`.
+    /// macOS sometimes reports an installed language pack as missing for the first
+    /// moments after launch or an update, then as installed a few seconds later.
+    /// Checks again every `interval` until it's installed or `keepTrying` says stop.
+    static func waitUntilInstalled(
+        interval: Duration,
+        keepTrying: @escaping () async -> Bool,
+        check: @escaping () async -> TranslationAvailability
+    ) async -> Bool {
+        while await keepTrying() {
+            if await check() == .installed { return true }
+            try? await Task.sleep(for: interval)
+            if Task.isCancelled { return false }
+        }
+        return false
+    }
+
     static func supportedTargets() async -> [(identifier: String, name: String)] {
         guard #available(macOS 15.0, *) else { return [] }
         let languages = await LanguageAvailability().supportedLanguages

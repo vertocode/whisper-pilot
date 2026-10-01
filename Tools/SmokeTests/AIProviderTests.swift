@@ -129,6 +129,21 @@ extension SmokeTestRunner {
             await expect((try? await claude().isQuestionToAnswer("tell me about your last role")) == true, "YES reply means a question")
             StubURLProtocol.install([.init(status: 200, body: #"{"content":[{"type":"text","text":"NO"}]}"#)])
             await expect((try? await claude().isQuestionToAnswer("sure, one sec")) == false, "NO reply means not a question")
+
+            // One-word checks run on the fast model, and fall back to the picked
+            // model when the key can't use it.
+            let check = Prompt(systemInstruction: "s", context: "c", question: "q", style: .concise)
+            StubURLProtocol.install([.init(status: 200, body: #"{"content":[{"type":"text","text":"NEW"}]}"#)])
+            let fast = try? await claude().quickCheck(check)
+            await expect(fast == "NEW" && StubURLProtocol.lastRequestBody.contains(#""model":"claude-haiku-4-5""#),
+                         "quick check uses the fast model")
+            StubURLProtocol.install([
+                .init(status: 404, body: #"{"error":{"type":"not_found_error"}}"#),
+                .init(status: 200, body: #"{"content":[{"type":"text","text":"SKIP"}]}"#)
+            ])
+            let fallback = try? await claude().quickCheck(check)
+            await expect(fallback == "SKIP" && StubURLProtocol.requests == 2 && !StubURLProtocol.lastRequestBody.contains("haiku"),
+                         "quick check falls back to the picked model when the fast one is unavailable")
         }
 
         await suite("Gemini stream parsing") {

@@ -196,6 +196,9 @@ final class OverlayState: ObservableObject {
         didSet { statusContinuation.yield(status) }
     }
     @Published var transcript: [TranscriptSegment] = []
+    /// Earlier lines of this session: lines that left the live buffer, and on resume
+    /// the whole saved transcript. Shown above `transcript`, and changes rarely.
+    @Published var transcriptHistory: [TranscriptSegment] = []
     @Published var permissionStatus: PermissionsSnapshot = PermissionsSnapshot()
 
     /// Whether the AI is currently allowed to be invoked. When paused, neither detected
@@ -203,10 +206,10 @@ final class OverlayState: ObservableObject {
     @Published var isAIPaused: Bool = false
     @Published var composerText: String = ""
 
-    /// Chronological chat history, oldest first. Trimmed to a small window so the overlay
-    /// doesn't grow unbounded.
+    /// Chronological chat history, oldest first. Capped well above a long meeting
+    /// so the whole session stays visible without letting the list grow forever.
     @Published var messages: [ChatMessage] = []
-    private let maxMessages = 24
+    private let maxMessages = 600
 
     @Published var audioFrameCount: Int = 0
     @Published var transcriptCount: Int = 0
@@ -285,12 +288,24 @@ final class OverlayState: ObservableObject {
         return msg.id
     }
 
+    /// With `replacing`, the new answer takes the old one's place in the list and
+    /// shows its text until the first new words arrive, so the chat doesn't jump.
     @discardableResult
-    func beginAssistantStream(origin: ChatMessage.Origin) -> UUID {
-        let msg = ChatMessage(id: UUID(), role: .assistant, origin: origin, text: "", timestamp: Date(), isStreaming: true, category: .ai)
+    func beginAssistantStream(origin: ChatMessage.Origin, replacing oldID: UUID? = nil) -> UUID {
+        var msg = ChatMessage(id: UUID(), role: .assistant, origin: origin, text: "", timestamp: Date(), isStreaming: true, category: .ai)
+        if let oldID, let idx = messages.firstIndex(where: { $0.id == oldID }) {
+            msg.text = messages[idx].text
+            messages[idx] = msg
+            return msg.id
+        }
         messages.append(msg)
         trim()
         return msg.id
+    }
+
+    func replaceText(of id: UUID, with text: String) {
+        guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[idx].text = text
     }
 
     func appendDelta(to id: UUID, _ delta: String) {

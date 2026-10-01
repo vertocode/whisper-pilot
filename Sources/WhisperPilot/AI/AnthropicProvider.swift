@@ -24,6 +24,9 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
     /// breaking API revision can't silently change shape under us.
     private static let apiVersion = "2023-06-01"
 
+    /// Used for the one-word checks that run before an answer.
+    static let fastModel = "claude-haiku-4-5"
+
     init(apiKey: String, model: String, session: URLSession = .shared) {
         self.apiKey = apiKey
         self.model = model
@@ -55,8 +58,31 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
     }
 
     func isQuestionToAnswer(_ text: String) async throws -> Bool {
-        let raw = try await singleShot(prompt: PromptBuilder.buildQuestionCheck(text), maxTokens: 5)
+        let raw = try await withFastModel { model in
+            try await self.singleShot(prompt: PromptBuilder.buildQuestionCheck(text), maxTokens: 5, model: model)
+        }
         return PromptBuilder.parseQuestionCheck(raw)
+    }
+
+    func quickCheck(_ prompt: Prompt) async throws -> String {
+        try await withFastModel { model in
+            let body = try self.encode(self.requestBody(for: prompt, stream: false, model: model, maxTokens: 10))
+            let (data, response) = try await self.session.data(for: self.makeRequest(body: body))
+            try self.ensureSuccess(response: response, data: data)
+            return try JSONDecoder().decode(AnthropicMessage.self, from: data).firstText ?? ""
+        }
+    }
+
+    /// Tries the fast model first. A key without access to it gets a 400 or 404,
+    /// and then the check runs on the model the user picked.
+    private func withFastModel(_ run: (String) async throws -> String) async throws -> String {
+        guard model != Self.fastModel else { return try await run(model) }
+        do {
+            return try await run(Self.fastModel)
+        } catch AnthropicError.http(let status, _) where status == 400 || status == 404 {
+            log.info("Fast model unavailable (\(status, privacy: .public)); checking with \(self.model, privacy: .public)")
+            return try await run(model)
+        }
     }
 
     func extractTopics(from text: String) async throws -> [String] {
@@ -84,7 +110,7 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         continuation: AsyncThrowingStream<AIStreamEvent, Error>.Continuation,
         attempt: StreamAttempt
     ) async throws -> AIFinishReason {
-        let body = try encode(requestBody(for: prompt, stream: true))
+        let body = try encode(requestBody(for: prompt, stream: true, model: model, maxTokens: 2000))
         let request = makeRequest(body: body)
 
         let (bytes, response) = try await session.bytes(for: request)
@@ -177,8 +203,8 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         }
     }
 
-    private func singleShot(prompt: String, maxTokens: Int) async throws -> String {
-        let body = try encode(AnthropicRequest.singleUserTurn(model: model, prompt: prompt, maxTokens: maxTokens))
+    private func singleShot(prompt: String, maxTokens: Int, model: String? = nil) async throws -> String {
+        let body = try encode(AnthropicRequest.singleUserTurn(model: model ?? self.model, prompt: prompt, maxTokens: maxTokens))
         let request = makeRequest(body: body)
         let (data, response) = try await session.data(for: request)
         try ensureSuccess(response: response, data: data)
@@ -197,7 +223,7 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         return request
     }
 
-    private func requestBody(for prompt: Prompt, stream: Bool) -> AnthropicRequest {
+    private func requestBody(for prompt: Prompt, stream: Bool, model: String, maxTokens: Int) -> AnthropicRequest {
         var content: [AnthropicRequest.ContentBlock] = []
         var liveContext = prompt.context
         // Cache the notes/files part so later questions in the session reuse it
@@ -220,15 +246,12 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         }
         return AnthropicRequest(
             model: model,
-            // Match Gemini's 2000-token output budget so style + answer length
-            // feel consistent across providers. Detailed / Strategic styles
-            // can easily produce 800+ tokens; 2000 is well within Anthropic's
-            // per-request limit and matches what the coordinator users see
-            // from the Gemini path.
-            max_tokens: 2000,
+            // 2000 for answers, matching Gemini, so Detailed / Strategic styles
+            // have room to finish. One-word checks pass a tiny cap.
+            max_tokens: maxTokens,
             system: prompt.systemInstruction,
             messages: [.init(role: "user", content: content)],
-            temperature: 0.7,
+            temperature: 0.4,
             stream: stream
         )
     }

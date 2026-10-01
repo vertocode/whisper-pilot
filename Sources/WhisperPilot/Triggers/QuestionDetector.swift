@@ -14,7 +14,7 @@ struct QuestionDetector: Sendable {
         // joining. ... could you walk me through your last project?". Scoring the whole
         // line buried the question under the small talk before it, so each sentence
         // is scored on its own and the best one wins.
-        Self.realSentences(in: segment.text).map(Self.scoreSentence).max() ?? 0
+        Self.realSentences(in: segment.text).flatMap(Self.clauses).map(Self.scoreSentence).max() ?? 0
     }
 
     /// Looser than `score`: true when a line has a question word or phrase anywhere.
@@ -28,6 +28,32 @@ struct QuestionDetector: Sendable {
         let padded = " " + words.joined(separator: " ") + " "
         return Self.questionCues.contains { padded.contains(" \($0) ") }
     }
+
+    /// The sentence plus the pieces that start after a comma or a connector word. Speech
+    /// recognition often drops the full stop, so "Everything, to lock in the logistics, do
+    /// you have any trips" is one sentence, and the question hides behind the preamble.
+    private static func clauses(of sentence: String) -> [String] {
+        var result = [sentence]
+        let tokens = sentence.split(separator: " ").map(String.init)
+        for index in 1..<max(1, tokens.count - 3) {
+            let previous = tokens[index - 1]
+            let afterComma = previous.hasSuffix(",")
+            let afterConnector = clauseConnectors.contains(previous.lowercased().trimmingCharacters(in: .punctuationCharacters))
+            guard afterComma || afterConnector else { continue }
+            let clause = tokens[index...].joined(separator: " ")
+            if startsLikeQuestion(clause.lowercased()) { result.append(clause) }
+        }
+        return result
+    }
+
+    private static func startsLikeQuestion(_ lower: String) -> Bool {
+        let cleaned = strippingLeadingFillers(lower)
+        return interrogativeStarters.contains { cleaned.hasPrefix($0 + " ") }
+            || modalLeads.contains { cleaned.hasPrefix($0 + " ") }
+            || requestLeads.contains { cleaned.hasPrefix($0 + " ") }
+    }
+
+    private static let clauseConnectors: Set<String> = ["so", "and", "but", "basically", "also", "then"]
 
     /// Sentences minus small talk. "How are you?" and "Can you hear me?" are
     /// questions, but answering them with the AI is noise, and firing on them
@@ -67,7 +93,9 @@ struct QuestionDetector: Sendable {
         "can you hear me", "can you hear us", "can everyone hear me",
         "can you see my screen", "can you see me", "can you see it",
         "are you there", "did i lose you", "am i audible", "is my audio",
-        "nice to meet you", "good to meet you", "are you ready"
+        "nice to meet you", "good to meet you", "are you ready",
+        "what about you", "and you",
+        "may i ask", "can i ask", "can i ask you something", "can i ask you a question"
     ]
 
     private static let questionCues: [String] = [

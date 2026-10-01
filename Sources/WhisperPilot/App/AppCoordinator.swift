@@ -106,6 +106,9 @@ final class AppCoordinator {
     /// enqueueing, no session, no CPU, and `TranscriptSegment.translatedText`
     /// stays nil so the lane renders exactly as it did before the feature.
     private var translationQueue: TranslationQueue?
+    /// Re-checks a language pack that macOS reported as missing at start.
+    private var translationRetryTask: Task<Void, Never>?
+    private var translationMissingNoteID: UUID?
     /// The macOS 15.0-25.x service awaiting a session from the overlay's
     /// SwiftUI host. Held as the un-gated protocol type because a stored
     /// property can't carry an availability annotation; `adoptTranslationSession`
@@ -695,11 +698,21 @@ final class AppCoordinator {
             // Never prompt for a download here. The sheet can only be raised
             // from the SwiftUI `.translationTask` path in Settings, and mid-
             // meeting is the worst possible moment for a modal regardless.
-            overlayState.appendSystemNote(
-                "Live translation is on, but the \(languageName(targetIdentifier)) language pack isn't installed. Open Settings → Translation to download it. Transcription is unaffected.",
-                category: .transcript
-            )
+            wpWarn("[Coordinator] live translation waiting: \(sourceIdentifier) → \(targetIdentifier) reported \(availability)")
+            if translationMissingNoteID == nil {
+                translationMissingNoteID = overlayState.appendSystemNote(
+                    "Live translation is on, but the \(languageName(targetIdentifier)) language pack isn't installed. Open Settings → Translation to download it. Transcription is unaffected.",
+                    category: .transcript
+                )
+            }
+            retryTranslationWhenInstalled(from: sourceIdentifier, to: targetIdentifier)
             return
+        }
+        translationRetryTask?.cancel()
+        translationRetryTask = nil
+        if let note = translationMissingNoteID {
+            overlayState.removeMessage(id: note)
+            translationMissingNoteID = nil
         }
         guard
             let source = TranslationSupport.language(from: sourceIdentifier),
@@ -776,7 +789,30 @@ final class AppCoordinator {
         }
     }
 
+    /// The pack check can say "missing" for a pack that is installed (seen right
+    /// after launch), or the user may download it mid-session. Either way,
+    /// translation starts as soon as the pack shows up.
+    private func retryTranslationWhenInstalled(from source: String, to target: String) {
+        guard translationRetryTask == nil else { return }
+        translationRetryTask = Task { [weak self] in
+            let installed = await TranslationSupport.waitUntilInstalled(
+                interval: .seconds(5),
+                keepTrying: { [weak self] in
+                    guard let self else { return false }
+                    return await MainActor.run { self.isRunning && self.translationQueue == nil && self.settings.translationIsConfigured }
+                },
+                check: { await TranslationSupport.availability(from: source, to: target) }
+            )
+            guard let self else { return }
+            self.translationRetryTask = nil
+            if installed { await self.startTranslationIfNeeded() }
+        }
+    }
+
     private func stopTranslation() async {
+        translationRetryTask?.cancel()
+        translationRetryTask = nil
+        translationMissingNoteID = nil
         // Clearing the pair cancels the overlay's `.translationTask`, which
         // releases the session. Done first so nothing new can be issued against
         // a session that's going away.
@@ -1320,6 +1356,7 @@ final class AppCoordinator {
 
         currentSession = session
         overlayState.transcript = []
+        overlayState.transcriptHistory = []
         overlayState.clearChat()
         // `clearChat()` wipes the messages array but our tracked note IDs are
         // separate state — nil them out so the next `startListening` doesn't see
@@ -1360,7 +1397,9 @@ final class AppCoordinator {
             let chat = await SessionStore.shared.loadChatMarkdown(session.id)
             let segments = await SessionStore.shared.loadTranscriptSegments(session.id)
             let messages = await SessionStore.shared.loadChatMessages(session.id)
-            overlayState.transcript = segments
+            // Saved lines go to the history list: the live list is replaced by the
+            // buffer on every update, which would wipe them as soon as anyone spoke.
+            overlayState.transcriptHistory = segments
             overlayState.messages = messages
             // Strip persisted translation lines before the model sees this.
             // `seedFromMarkdown` assigns the raw blob straight into the prompt
@@ -1471,41 +1510,57 @@ final class AppCoordinator {
         }
     }
 
-    /// "Help AI" button: the user thinks there's an unanswered question in the recent
-    /// transcript that the auto-detector missed. We don't pre-extract the question
-    /// (the heuristic is what failed in the first place); instead we hand the model
-    /// the same context block a user prompt would get and instruct it to find the
-    /// question on its own. Honored even when AI is paused — it's an explicit manual
-    /// invocation, like the composer.
+    /// "Help AI" button: the user thinks Other asked something that wasn't answered.
+    /// A silent AI check reads the latest turn first. If every question there is
+    /// already answered (or being answered) by the auto-detector, the click does
+    /// nothing and nothing shows on screen. Otherwise the AI answers it. Honored even
+    /// when AI is paused — it's an explicit manual invocation, like the composer.
     func requestHelpAI() {
         guard let ai = aiProvider else {
             overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
             return
         }
-        overlayState.appendAutoTriggerPreamble(
-            origin: .helpAI,
-            text: "Scanning recent transcript for a question…"
-        )
-        overlayState.status = .thinking
         wpInfo("[Coordinator] Help AI requested")
         let history = chatHistorySnapshot(excludingLast: false)
+        let handled = handledForHelpAI()
         let sessionID = currentSession?.id
         Task { [weak self] in
             guard let self else { return }
-            await self.persistChatTurn(
-                role: "You",
-                text: "Scanning recent transcript for a question…",
-                origin: .helpAI,
-                to: sessionID
-            )
             await self.absorbPendingTranscripts()
-            let snapshot = await self.context.snapshotWithPrior()
+            let snapshot = self.filteredSnapshot(await self.context.snapshotWithPrior())
+            let filteredHistory = self.filteredHistory(history)
+            do {
+                let check = PromptBuilder.buildHelpAICheck(context: snapshot, history: filteredHistory, handled: handled)
+                guard PromptBuilder.parseHelpAICheck(try await ai.quickCheck(check)) else {
+                    wpInfo("[Coordinator] Help AI ignored — latest question already handled")
+                    return
+                }
+            } catch {
+                // Missing a real question is worse than one extra answer.
+                wpWarn("Help AI check failed, answering anyway: \(error.localizedDescription)")
+            }
+            self.overlayState.status = .thinking
             let prompt = PromptBuilder.buildHelpAI(
-                context: self.filteredSnapshot(snapshot),
-                history: self.filteredHistory(history),
+                context: snapshot,
+                history: filteredHistory,
+                handled: handled,
                 style: self.settings.responseStyle
             )
             await self.runCompletion(prompt: prompt, ai: ai, origin: .helpAI, sessionID: sessionID)
+        }
+    }
+
+    /// The last few auto-detected questions and the replies shown for them or for
+    /// earlier Help AI clicks. A question still streaming counts as handled too,
+    /// because its question bubble is added before the answer starts.
+    private func handledForHelpAI() -> [String] {
+        overlayState.messages.suffix(12).compactMap { msg -> String? in
+            guard msg.origin == .detectedQuestion || msg.origin == .helpAI, !msg.text.isEmpty else { return nil }
+            switch msg.role {
+            case .user where msg.origin == .detectedQuestion: return "Question: \(msg.text)"
+            case .assistant: return "Reply: \(String(msg.text.prefix(200)))"
+            default: return nil
+            }
         }
     }
 
@@ -2328,6 +2383,8 @@ final class AppCoordinator {
                 let now = ContinuousClock.now
                 if update.isFinal || now - lastTranscriptUIPublish >= .milliseconds(250) {
                     let snapshot = await buffer.snapshot()
+                    let evicted = await buffer.takeEvicted()
+                    if !evicted.isEmpty { self?.overlayState.transcriptHistory.append(contentsOf: evicted) }
                     self?.overlayState.transcript = snapshot
                     lastTranscriptUIPublish = now
                     // Feed the same snapshot to the translation queue. Diffing
@@ -2401,50 +2458,87 @@ final class AppCoordinator {
                     wpInfo("[Coordinator] trigger fired but no API key for active model — skipping")
                     continue
                 }
-                if trigger.needsCheck {
-                    do {
-                        guard try await liveAI.isQuestionToAnswer(trigger.text) else {
-                            wpInfo("[Coordinator] possible question rejected by the AI check — skipping")
-                            continue
-                        }
-                    } catch {
-                        // Missing a real interview question is worse than one extra
-                        // answer, and the answer call will surface the error if it's real.
-                        wpWarn("Question check failed, answering anyway: \(error.localizedDescription)")
-                    }
+                // Each question runs on its own, so a new question (or a longer
+                // version of one) doesn't wait for the previous answer to finish.
+                Task { [weak self] in
+                    await self?.answerDetectedQuestion(trigger, ai: liveAI)
                 }
-                self.log.info("→ Trigger fired, building prompt")
-                // Surface the detected question as a user-style bubble in the AI pane so
-                // the user can see *what* the detector picked up — without this, a fired
-                // trigger only shows up as an unlabeled assistant reply, and a failed call
-                // shows up as nothing at all.
-                let sessionID = self.currentSession?.id
-                self.overlayState.appendAutoTriggerPreamble(origin: .detectedQuestion, text: trigger.text)
-                await self.persistChatTurn(
-                    role: "You",
-                    text: trigger.text,
-                    origin: .detectedQuestion,
-                    to: sessionID
-                )
-                self.overlayState.status = .thinking
-                await self.absorbPendingTranscripts()
-            let snapshot = await self.context.snapshotWithPrior()
-                let style = self.settings.responseStyle
-                let history = self.chatHistorySnapshot(excludingLast: false)
-                let prompt = PromptBuilder.build(
-                    context: self.filteredSnapshot(snapshot),
-                    history: self.filteredHistory(history),
-                    question: trigger.text,
-                    style: style
-                )
-                await self.runCompletion(
-                    prompt: prompt,
-                    ai: liveAI,
-                    origin: .detectedQuestion,
-                    sessionID: sessionID
-                )
             }
         })
+    }
+
+    /// The question and answer bubbles shown for each auto-detected question, by
+    /// question text, so a longer version of the same question can replace them.
+    private var detectedBubbles: [String: (question: UUID, answer: UUID?, at: Date)] = [:]
+    /// Questions replaced while their own AI check was still running.
+    private var supersededQuestions: Set<String> = []
+
+    private func answerDetectedQuestion(_ trigger: TriggerEvent, ai: AIProvider) async {
+        if trigger.needsCheck {
+            do {
+                guard try await ai.isQuestionToAnswer(trigger.text) else {
+                    wpInfo("[Coordinator] possible question rejected by the AI check — skipping")
+                    return
+                }
+            } catch {
+                // Missing a real interview question is worse than one extra
+                // answer, and the answer call will surface the error if it's real.
+                wpWarn("Question check failed, answering anyway: \(error.localizedDescription)")
+            }
+        }
+        if supersededQuestions.remove(trigger.text) != nil { return }
+        let earlierBubbles = trigger.supersedes.flatMap(takeDetectedBubbles(for:))
+        self.log.info("→ Trigger fired, building prompt")
+        // Surface the detected question as a user-style bubble in the AI pane so
+        // the user can see *what* the detector picked up — without this, a fired
+        // trigger only shows up as an unlabeled assistant reply, and a failed call
+        // shows up as nothing at all.
+        let sessionID = currentSession?.id
+        let questionID: UUID
+        if let earlierBubbles {
+            // The fuller question takes the cut-off one's place.
+            questionID = earlierBubbles.question
+            overlayState.replaceText(of: questionID, with: trigger.text)
+        } else {
+            questionID = overlayState.appendAutoTriggerPreamble(origin: .detectedQuestion, text: trigger.text)
+        }
+        detectedBubbles = detectedBubbles.filter { Date().timeIntervalSince($0.value.at) < 60 }
+        detectedBubbles[trigger.text] = (questionID, nil, Date())
+        await persistChatTurn(role: "You", text: trigger.text, origin: .detectedQuestion, to: sessionID)
+        overlayState.status = .thinking
+        await absorbPendingTranscripts()
+        let snapshot = await context.snapshotWithPrior()
+        let history = chatHistorySnapshot(excludingLast: false)
+        let prompt = PromptBuilder.build(
+            context: filteredSnapshot(snapshot),
+            history: filteredHistory(history),
+            question: trigger.text,
+            style: settings.responseStyle
+        )
+        await runCompletion(
+            prompt: prompt,
+            ai: ai,
+            origin: .detectedQuestion,
+            sessionID: sessionID,
+            replacingAnswer: earlierBubbles?.answer,
+            onStart: { [weak self] answerID in
+                if self?.detectedBubbles[trigger.text] != nil {
+                    self?.detectedBubbles[trigger.text]?.answer = answerID
+                }
+            }
+        )
+    }
+
+    /// Hands back the bubbles of a question that was cut short, so the full version
+    /// can reuse them. When they don't exist yet (its AI check is still running),
+    /// remembers to drop that question once the check ends.
+    private func takeDetectedBubbles(for questionText: String) -> (question: UUID, answer: UUID?)? {
+        guard let bubbles = detectedBubbles.removeValue(forKey: questionText) else {
+            supersededQuestions.insert(questionText)
+            return nil
+        }
+        wpInfo("[Coordinator] replacing the answer to a question that was cut short")
+        return (bubbles.question, bubbles.answer)
     }
 
     /// Debounce between a VAD speech-end event and the utterance-boundary
@@ -2507,14 +2601,19 @@ final class AppCoordinator {
         ai: AIProvider,
         origin: ChatMessage.Origin,
         sessionID: SessionID?,
-        hasAttemptedFallback: Bool = false
+        hasAttemptedFallback: Bool = false,
+        replacingAnswer: UUID? = nil,
+        onStart: ((UUID) -> Void)? = nil
     ) async {
         // Reserve the assistant bubble + register the task BEFORE starting the stream
         // so concurrent completions each have their own slot in `inFlightCompletions`
         // and their own message ID. Multiple completions can stream in parallel —
         // this is intentional: a follow-up detected question shouldn't cut off the
         // previous answer.
-        let messageId = overlayState.beginAssistantStream(origin: origin)
+        let messageId = overlayState.beginAssistantStream(origin: origin, replacing: replacingAnswer)
+        // Cancelled only after its bubble is gone, so the old reply isn't saved to chat.md.
+        if let replacingAnswer { inFlightCompletions[replacingAnswer]?.cancel() }
+        onStart?(messageId)
         overlayState.status = .streaming
         let task = Task { [weak self] in
             guard let self else { return }
@@ -2530,7 +2629,11 @@ final class AppCoordinator {
                     switch event {
                     case .delta(let text):
                         deltaCount += 1
-                        self.overlayState.appendDelta(to: messageId, text)
+                        if deltaCount == 1, replacingAnswer != nil {
+                            self.overlayState.replaceText(of: messageId, with: text)
+                        } else {
+                            self.overlayState.appendDelta(to: messageId, text)
+                        }
                     case .finish(let reason):
                         finishReason = reason
                     }

@@ -12,10 +12,6 @@ private struct LaneWidthKey: PreferenceKey {
 }
 
 struct TranscriptLane: View {
-    /// Upper bound on rows rendered in the lane. Long sessions accumulate
-    /// thousands of segments; the view only ever shows the recent window.
-    static let maxRenderedSegments = 150
-
     /// Horizontal budget a row spends before its text starts: the channel chip's
     /// `minWidth` plus the `HStack` spacing next to it. Subtracted from the
     /// measured lane width so the layout decision is made on the width text
@@ -27,6 +23,10 @@ struct TranscriptLane: View {
     static let chipGutter: CGFloat = 44 + WP.Space.sm
 
     let segments: [TranscriptSegment]
+    /// Earlier lines of the session, drawn above `segments`. Kept apart because
+    /// they rarely change, so their rows skip the redraw that every live update
+    /// triggers (redrawing a whole long session was what froze the overlay).
+    var history: [TranscriptSegment] = []
     /// When true, only the header row is rendered (chevron flips to indicate
     /// expand). The body — segment list / "waiting for audio" placeholder — is
     /// omitted so the lane collapses to one tappable bar.
@@ -70,8 +70,9 @@ struct TranscriptLane: View {
                     if let display = translationDisplay, let onSetColumnMode {
                         LanguageVisibilityChips(display: display, onSetColumnMode: onSetColumnMode)
                     }
-                    if !segments.isEmpty {
-                        Text("\(segments.count) line\(segments.count == 1 ? "" : "s")")
+                    let lineCount = history.count + segments.count
+                    if lineCount > 0 {
+                        Text("\(lineCount) line\(lineCount == 1 ? "" : "s")")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.tertiary)
                             .monospacedDigit()
@@ -84,7 +85,7 @@ struct TranscriptLane: View {
             }
 
             if !isCollapsed && showContent {
-                if segments.isEmpty {
+                if segments.isEmpty && history.isEmpty {
                     HStack(spacing: WP.Space.sm) {
                         Image(systemName: "waveform.path")
                             .font(.system(size: 12))
@@ -101,21 +102,10 @@ struct TranscriptLane: View {
                             .fill(.quinary)
                     )
                 } else {
-                    // Render only the most recent window. Each utterance is its own
-                    // row (VAD-driven); the parent ScrollView in OverlayView handles
-                    // overflow, and explicit `.id()` lets the parent's
-                    // ScrollViewReader auto-scroll to the most recent line as it
-                    // arrives. Rendering the full history made every 250 ms publish
-                    // re-diff a lane that grows without bound in long sessions —
-                    // the full transcript is always on disk in transcript.md.
                     LazyVStack(alignment: .leading, spacing: WP.Space.xs + 2) {
-                        if segments.count > Self.maxRenderedSegments {
-                            Text("… earlier transcript trimmed from view (full history is in the session's transcript.md)")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .padding(.horizontal, WP.Space.md - 2)
-                        }
-                        ForEach(segments.suffix(Self.maxRenderedSegments)) { segment in
+                        TranscriptHistoryRows(segments: history, textWidth: max(0, laneWidth - Self.chipGutter))
+                            .equatable()
+                        ForEach(segments) { segment in
                             TranscriptRow(
                                 segment: segment,
                                 textWidth: max(0, laneWidth - Self.chipGutter)
@@ -247,6 +237,26 @@ private struct LanguageVisibilityChips: View {
         switch display.columnMode.toggling(source: isSource) {
         case .both: return "Show \(label) and \(other)"
         case .sourceOnly, .translationOnly: return "Hide \(label) — show only \(other)"
+        }
+    }
+}
+
+/// The session's earlier lines. Equatable on what can change (more lines, or the
+/// lane width), so a live update doesn't redraw hundreds of rows.
+private struct TranscriptHistoryRows: View, Equatable {
+    let segments: [TranscriptSegment]
+    let textWidth: CGFloat
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.textWidth == rhs.textWidth
+            && lhs.segments.count == rhs.segments.count
+            && lhs.segments.last == rhs.segments.last
+    }
+
+    var body: some View {
+        ForEach(segments) { segment in
+            TranscriptRow(segment: segment, textWidth: textWidth)
+                .id(segment.id)
         }
     }
 }

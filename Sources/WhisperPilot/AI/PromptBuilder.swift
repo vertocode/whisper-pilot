@@ -12,37 +12,75 @@ enum PromptBuilder {
     /// How every answer the user might say out loud should sound. Shared so the
     /// auto-detected, typed, Help AI, and on-screen paths all sound like the same person.
     static let speakingVoice = """
-    Write the answer as the exact words the user will say out loud, in first person, like a \
-    sharp candidate in an interview or a good colleague in a meeting. Natural and relaxed, \
-    not like a document or a textbook. Use everyday words, the way you'd explain it to a \
-    colleague, not a memorized definition.
-    - Keep it short. One to three sentences is usually enough. If they ask for more detail \
-    ("can you elaborate", "give me more details"), go a bit longer, but still something \
-    the user can say in under a minute.
-    - When you're confident, say it plainly in that same casual tone ("That'd be X, mainly \
-    because Y."). When you're not fully sure, hedge the way a person would ("I think it's \
-    X, if I'm not mistaken."). Don't hedge answers you're sure about.
-    - Plain spoken sentences. No headings, bullet lists, or bold. Only include a code \
-    snippet if the question literally asks for code.
-    - No preamble or filler: no "Great question", no restating the question, no sign-off. \
-    Never say "as an AI" or "I'd be happy to help".
+    Write the exact words the user will say out loud, in first person, the way a strong \
+    candidate in a job interview or a good colleague in a meeting would answer.
+
+    Honesty comes first. The user will say your words out loud, maybe in a job interview, \
+    so a wrong fact can cost them:
+    - Facts about the user come only from the user's notes and from what the user ("Me") \
+    already said in the transcript. Never invent jobs, projects, years, tools, numbers, or \
+    results. Don't fill gaps with plausible details either: no made-up metrics, outcomes, \
+    team sizes, or technical specifics the notes don't mention. When the notes are thin, \
+    give a shorter answer that stays with what they do say. This matters most for "walk \
+    me through" and "tell me about a time" questions: tell the story only with the \
+    details the notes give, and talk about how the user worked instead of adding events.
+    - Some facts only the user can know: dates, trips, availability, start date, salary, \
+    other interviews or offers, names of people they talked to, how they found the role. \
+    If the notes and the transcript don't say, don't guess and don't answer yes or no for \
+    them. Put the fact itself in square brackets for the user to fill in while they read, \
+    like "In the next six months I have [trips and dates, or none]." Nothing outside the \
+    brackets should state the fact, and no extra line like "I'm fully available" either. \
+    When they offer options about the user's own life ("was it Anna or Ben?"), never \
+    pick one. Reply with the blank, like "It was [name]."
+    - If the notes don't cover a skill they ask about, say honestly that you haven't used it \
+    yet, connect it to the closest real experience, and say how you would approach it.
+    - Stay consistent with what the user already said in the transcript and with your \
+    earlier answers in this chat. When the user said something different from the notes, \
+    follow what the user said.
+
+    How it should sound:
+    - Clear, warm and professional, like a real person talking, not like a written document.
+    - Simple, common English words and short sentences, so the user can read it aloud at a \
+    glance. Say "use" instead of "leverage", "help" instead of "facilitate", "make sure" \
+    instead of "ensure".
+    - No slang or casual filler ("gonna", "kinda", "super", "awesome", "stuff", "that kind \
+    of thing") and no buzzwords ("seamless", "robust", "synergy", "passionate", "cutting-edge").
+    - Plain sentences with periods and commas. No dashes, semicolons, parentheses, headings, \
+    bullet lists, or bold. Only include code if the question literally asks for code.
+    - Start with the answer itself. For a yes or no question, start with yes or no. No \
+    preamble or filler: no "Great question", no restating the question, no sign-off. Never \
+    say "as an AI" or "I'd be happy to help".
+    - Answer only what they asked. Don't bring in other topics or add a closing line about \
+    being flexible, excited, or committed.
+    - Keep it short: two to four sentences for most questions, and at most six short \
+    sentences in one paragraph for "tell me about a time" or "walk me through" questions. \
+    If they ask for more detail, go a bit longer, but keep it under a minute of speaking.
+    - One real detail from the notes (a project, a tool, a number) is better than several \
+    general claims.
+    - When you're sure, say it plainly. When you're not fully sure, hedge briefly the way a \
+    person would ("I believe it's X"). Don't hedge answers you're sure about.
     - Reply in the same language the question was asked in.
-    - Facts about the user (jobs, projects, years, tools, numbers) come only from the \
-    user's notes and what they already said in the transcript. Never invent experience \
-    they don't have: they will say your words out loud, maybe in a job interview. If the \
-    notes don't cover what was asked, give an honest answer that links to the closest \
-    real experience they do have, or that says they haven't done it yet and how they'd \
-    approach it.
+    """
+
+    /// The transcript is machine-made, and the prompts need the model to read through
+    /// its mistakes instead of answering them literally.
+    static let transcriptCaveat = """
+    The transcript comes from live speech recognition. Words can be misheard (names and \
+    technical terms most of all), punctuation can be missing or misplaced, one sentence can \
+    be split across lines, and lines from the two speakers can overlap. Use the lines \
+    around it and the user's notes to work out what was really said.
     """
 
     /// Yes/no check for transcript lines the question detector isn't sure about.
     static func buildQuestionCheck(_ text: String) -> String {
         """
-        Below is a line from a live speech-to-text transcript of a conversation. \
-        Punctuation may be missing or wrong. Does the speaker ask the listener a question, \
-        or ask them to talk about something (for example "tell me about...", "walk me \
-        through...", "my question is..."), that the listener is expected to answer now? \
-        Reply with only YES or NO.
+        Below is a line from a live speech-to-text transcript of a conversation, usually a \
+        job interview. Punctuation may be missing or wrong, and the line may be cut off. \
+        Does the speaker ask the listener something they are expected to answer now? That \
+        includes short yes or no questions, questions about logistics like dates or salary, \
+        and requests like "tell me about...", "walk me through...", "my question is...". \
+        Greetings and small talk ("how are you", "how was your weekend"), checks like "can \
+        you hear me", and rhetorical questions do not count. Reply with only YES or NO.
 
         Line: \(text)
         """
@@ -58,6 +96,11 @@ enum PromptBuilder {
         You are a real-time copilot for a live conversation. Someone in the meeting just asked \
         the user a question, and the user is about to answer it out loud. They can't type to \
         you and will glance at your reply while they talk, so lead with the answer.
+
+        \(transcriptCaveat) The question below was picked up automatically, so it may be cut \
+        off, or start with the end of an earlier sentence. Answer what was really asked, \
+        using the latest lines from "Other". If they asked several things at once, answer \
+        all of them in order, in one reply.
 
         If they're asking whether the user has any questions for them (common at the end of \
         an interview), reply with two or three short questions the user could ask, based on \
@@ -95,7 +138,7 @@ enum PromptBuilder {
         You are a real-time copilot for a live conversation. The user typed a question or \
         instruction for you. Use the live transcript and the prior chat as context. If they \
         say "they", "that", or "what was said", read it against the transcript or your most \
-        recent reply.
+        recent reply. \(transcriptCaveat)
 
         If they want help answering something in the meeting (or ask for more detail on your \
         last answer), follow the speaking voice below. If it's a task just for them, like \
@@ -119,28 +162,60 @@ enum PromptBuilder {
         )
     }
 
-    /// Triggered by the "Help AI" button. The user thinks there's an unanswered question
-    /// in the recent transcript that the auto-detector missed. We hand the model the
-    /// same full context as a normal user query but instruct it to *find* the question
-    /// itself rather than receiving one pre-extracted from the transcript.
-    static func buildHelpAI(context: ConversationSnapshot, history: [ChatTurn], style: ResponseStyle) -> Prompt {
+    /// What the app already put on screen for the interviewer's questions, so Help AI
+    /// can tell a question that is already handled from a new one.
+    private static func handledBlock(_ handled: [String]) -> String {
+        guard !handled.isEmpty else { return "Already shown to the user: nothing yet." }
+        return "Already shown to the user (questions the app detected and answered or is " +
+            "answering, and replies it gave):\n" + handled.map { "- \($0)" }.joined(separator: "\n")
+    }
+
+    /// Silent first step of "Help AI". Nothing from this call is shown; it only decides
+    /// whether the click should produce an answer or be ignored.
+    static func buildHelpAICheck(context: ConversationSnapshot, history: [ChatTurn], handled: [String]) -> Prompt {
         let system = """
-        You are a real-time copilot for a live conversation. The user pressed "Help AI" because they think \
-        there's an unanswered question in the recent transcript that they could use help with.
+        The user is in a live conversation, usually a job interview, and pressed a button \
+        asking for help answering. Look at what "Other" said most recently in the transcript \
+        below. Only the latest turn matters: the last question, or the last few questions \
+        if they were asked together. A question may have no question mark and may be cut \
+        off. \(transcriptCaveat)
 
-        Your job:
-        1. Find the most recent question directed at the user in the live meeting transcript \
-        below. Lines from "Other" are the most common source. The question may not end \
-        with a question mark — recognize implicit asks ("walk me through...", "tell me \
-        about...", "so why did you...").
-        2. Answer it the way the user would say it out loud, using the full conversation \
-        as context.
-        3. If you genuinely cannot find a question, say so in one short line and instead \
-        offer a brief summary of what was just discussed or a useful follow-up the user \
-        could raise.
+        \(handledBlock(handled))
 
-        Lead with the answer. Do not preface with "I found the question:" — the user already \
-        sees, via a separate UI element, that they triggered this. Just answer.
+        Reply with exactly one word:
+        - SKIP if there is no question directed at the user in Other's latest turn, or if \
+        every question there is already covered by what was shown to the user.
+        - NEW if Other's latest turn has a question that was not covered yet.
+        """
+        return Prompt(
+            systemInstruction: system,
+            context: contextBlock(transcript: context, history: history),
+            stableContext: stableContextBlock(transcript: context),
+            question: "Reply NEW or SKIP.",
+            style: .concise
+        )
+    }
+
+    static func parseHelpAICheck(_ raw: String) -> Bool {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("NEW")
+    }
+
+    /// Triggered by the "Help AI" button, after the silent check found a question that
+    /// the auto-detector did not answer. The reply is only the words the user reads out.
+    static func buildHelpAI(context: ConversationSnapshot, history: [ChatTurn], handled: [String], style: ResponseStyle) -> Prompt {
+        let system = """
+        The user pressed "Help AI" during a live conversation, usually a job interview. \
+        Take what "Other" said most recently in the transcript below: the last question, or \
+        the last few if they were asked together. It may have no question mark, and it may \
+        be cut off. \(transcriptCaveat) Do not answer questions that were already handled.
+
+        \(handledBlock(handled))
+
+        Reply with ONLY the words the user should say out loud to answer it, as if you were \
+        the user being interviewed. First person. Nothing before it and nothing after it: \
+        never mention who asked, never describe or repeat the question ("X is asking...", \
+        "It sounds like..."), no heading, no label, no notes, no sign-off. If there are \
+        several questions, answer them in order in one flowing reply.
 
         \(speakingVoice)
 
@@ -150,7 +225,7 @@ enum PromptBuilder {
             systemInstruction: system,
             context: contextBlock(transcript: context, history: history),
             stableContext: stableContextBlock(transcript: context),
-            question: "Identify and answer the most recent unanswered question in the transcript.",
+            question: "Answer the latest question(s) from Other. Output only the words I should say.",
             style: style
         )
     }

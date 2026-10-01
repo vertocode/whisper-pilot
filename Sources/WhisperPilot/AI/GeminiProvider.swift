@@ -10,6 +10,9 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
     private let session: URLSession
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "Gemini")
 
+    /// Used for the one-word checks that run before an answer.
+    static let fastModel = "gemini-2.5-flash-lite"
+
     init(apiKey: String, model: String, session: URLSession = .shared) {
         self.apiKey = apiKey
         self.model = model
@@ -41,8 +44,36 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
     }
 
     func isQuestionToAnswer(_ text: String) async throws -> Bool {
-        let raw = try await singleShot(prompt: PromptBuilder.buildQuestionCheck(text))
+        let raw = try await withFastModel { model in
+            try await self.send(GeminiRequest.singleUserTurn(PromptBuilder.buildQuestionCheck(text)), model: model)
+        }
         return PromptBuilder.parseQuestionCheck(raw)
+    }
+
+    func quickCheck(_ prompt: Prompt) async throws -> String {
+        try await withFastModel { model in
+            // Room for the reasoning tokens some Gemini models spend before the word.
+            try await self.send(self.requestBody(for: prompt, maxOutputTokens: 400), model: model)
+        }
+    }
+
+    /// Tries the fast model first. A key without access to it gets a 400 or 404,
+    /// and then the check runs on the model the user picked.
+    private func withFastModel(_ run: (String) async throws -> String) async throws -> String {
+        guard model != Self.fastModel else { return try await run(model) }
+        do {
+            return try await run(Self.fastModel)
+        } catch GeminiError.http(let status, _) where status == 400 || status == 404 {
+            log.info("Fast model unavailable (\(status, privacy: .public)); checking with \(self.model, privacy: .public)")
+            return try await run(model)
+        }
+    }
+
+    private func send(_ request: GeminiRequest, model: String) async throws -> String {
+        let body = try encode(request)
+        let (data, response) = try await session.data(for: makeRequest(url: endpoint(streaming: false, model: model), body: body))
+        try ensureSuccess(response: response, data: data)
+        return try JSONDecoder().decode(GeminiResponse.self, from: data).firstText ?? ""
     }
 
     func extractTopics(from text: String) async throws -> [String] {
@@ -151,9 +182,9 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         return decoded.firstText ?? ""
     }
 
-    private func endpoint(streaming: Bool) -> URL {
+    private func endpoint(streaming: Bool, model: String? = nil) -> URL {
         let method = streaming ? "streamGenerateContent" : "generateContent"
-        var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):\(method)")!
+        var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model ?? self.model):\(method)")!
         if streaming { components.queryItems = [URLQueryItem(name: "alt", value: "sse")] }
         return components.url!
     }
@@ -170,7 +201,7 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
         return request
     }
 
-    private func requestBody(for prompt: Prompt) -> GeminiRequest {
+    private func requestBody(for prompt: Prompt, maxOutputTokens: Int = 2000) -> GeminiRequest {
         let userText = """
         \(prompt.context)
 
@@ -190,7 +221,7 @@ final class GeminiProvider: AIProvider, @unchecked Sendable {
             // limits and gives the model room to finish a thought (~1500 words of
             // English output). If users report truncation we'll see `MAX_TOKENS`
             // surfaced in the assistant bubble's diagnostic note now.
-            generationConfig: .init(temperature: 0.7, maxOutputTokens: 2000)
+            generationConfig: .init(temperature: 0.4, maxOutputTokens: maxOutputTokens)
         )
     }
 
