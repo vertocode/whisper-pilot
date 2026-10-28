@@ -72,7 +72,7 @@ enum SessionTitler {
             } else if let value = value(after: "summary:", in: trimmed) {
                 summaryLines = [value]
                 inSummary = true
-            } else if inSummary {
+            } else if inSummary, !trimmed.isEmpty {
                 summaryLines.append(trimmed)
             }
         }

@@ -59,6 +59,27 @@ Display name + created/last-used timestamps. Not strictly required — if it's m
 - **Deleted** from the Sessions window's overflow menu. The entire folder is moved to the Trash so you can recover from accidents.
 - **Exported** from the overlay's `…` menu → *Export transcript…* (⌘E). Writes a copy of the active session's `transcript.md` to a path you pick. The original on-disk file is untouched.
 
+## Projects
+
+Projects group related sessions, like a recurring meeting. The Sessions window has a sidebar with a search box, your projects as expandable folders, and the sessions that are not in one.
+
+- **Create, rename, delete** from the sidebar (`+` next to *Projects*, or right-click a folder). Deleting a project never deletes its sessions: they move back to the ungrouped list. The dialog also offers to move them to the Trash, behind a second confirmation.
+- **Move sessions** by dragging them onto a folder (or onto the *Sessions* list to take them out), or with *Move to project* in a session's menu.
+- **Start a session inside a project** from the project page or the folder's right-click menu. It is created already assigned.
+- **Instructions and files** are edited on the project page (text, markdown, html, json, txt, pdf). They are sent with every AI prompt in that project's sessions.
+- **Earlier sessions as context** (on by default, per project): the prompt gets short summaries of the project's earlier sessions, newest first, within a 12,000-character budget. A session with no summary yet contributes the end of its transcript.
+- **Search** matches titles, project names, transcripts and summaries, across all projects.
+
+### Auto-title and summary
+
+When you stop a session, the app asks the active AI model for a short title and a recap of the transcript. The title is only applied to sessions that still have the placeholder name and were never named by you; a name you typed, or a rename made while the AI was working, always wins. The recap is saved as `summary.json` in the session folder. If there is no AI key, too little was said, or the call fails, nothing changes.
+
+### Storage
+
+- `metadata.json` gains two optional fields: `projectID` and `titleSource` (`user` or `auto`). Older files without them load as ungrouped sessions with no title source, and are not rewritten until you change something about that session.
+- `<App Support>/<bundle>/projects.json` holds the projects (`schemaVersion` 1), next to `global-context.json`.
+- On first launch with this version, every `metadata.json` is copied to `<App Support>/<bundle>/backups/pre-projects/` and `storage-version.json` is written so the copy happens once.
+
 ## Resume costs more in tokens
 
 The blue tip in the Sessions window says it explicitly, and it's worth restating here: **resuming a session re-includes its prior transcript and chat in every AI prompt** from that point forward. The longer the prior content, the more tokens each prompt costs. Prefer starting a fresh session unless you actually need the prior context — for a new meeting with a new agenda, fresh is almost always right.
