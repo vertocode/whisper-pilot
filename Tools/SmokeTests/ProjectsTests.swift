@@ -182,6 +182,57 @@ extension SmokeTestRunner {
             await expect(prompt.stableContext.contains("Earlier sessions in this project"), "history is in the cacheable part")
         }
 
+        await suite("Projects: creating during first load keeps saved projects") {
+            let root = tempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let sessionsDir = root.appendingPathComponent("sessions", isDirectory: true)
+            let storage = ProjectStorage(directory: root, sessionsDirectory: sessionsDir)
+            do {
+                try await storage.save([Project(name: "Existing", instructions: "keep me")])
+                let store = await ProjectsStore(storage: storage)
+                await store.create(name: "Brand new")
+                await store.flush()
+                let onDisk = await storage.load()
+                let names = onDisk.map(\.name).sorted()
+                await expect(names == ["Brand new", "Existing"], "both projects are on disk")
+                await expect(onDisk.first { $0.name == "Existing" }?.instructions == "keep me", "old instructions survive")
+            } catch {
+                await expect(false, "store setup failed: \(error.localizedDescription)")
+            }
+        }
+
+        await suite("Projects: Other speaker stays out of history and recaps") {
+            let root = tempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+            do {
+                let markdown = "**Me** [10:00:00] my line\n**Other** [10:00:05] secret line\n> pt-BR — linha secreta\n**Me** [10:00:09] again"
+                let stripped = SessionStore.strippingOtherSpeaker(markdown)
+                await expect(!stripped.contains("secret") && !stripped.contains("secreta"), "Other lines and their translations are removed")
+                await expect(stripped.contains("my line") && stripped.contains("again"), "Me lines are kept")
+
+                let projectID = UUID()
+                let older = try await store.createSession(name: "Older", projectID: projectID)
+                await store.appendTranscriptLine(channel: .system, text: "secret line", at: Date(), to: older.id)
+                await store.appendTranscriptLine(channel: .microphone, text: "my line", at: Date(), to: older.id)
+                let current = try await store.createSession(name: "Now", projectID: projectID)
+
+                let withOther = await store.projectHistoryEntries(projectID: projectID, excluding: current.id)
+                await expect(withOther.first?.text.contains("secret line") == true, "Other is used when allowed")
+                let without = await store.projectHistoryEntries(projectID: projectID, excluding: current.id, includeOther: false)
+                await expect(without.first?.text.contains("secret line") == false, "fallback drops Other when excluded")
+
+                await store.saveSummary(SessionSummary(summary: "mixed recap", transcriptBytes: 1, generatedAt: Date(), excludesOther: nil), for: older.id)
+                let mixed = await store.projectHistoryEntries(projectID: projectID, excluding: current.id, includeOther: false)
+                await expect(mixed.first?.text.contains("mixed recap") == false, "old recap is not reused when Other is excluded")
+                await store.saveSummary(SessionSummary(summary: "safe recap", transcriptBytes: 1, generatedAt: Date(), excludesOther: true), for: older.id)
+                let safe = await store.projectHistoryEntries(projectID: projectID, excluding: current.id, includeOther: false)
+                await expect(safe.first?.text == "safe recap", "recap written without Other is reused")
+            } catch {
+                await expect(false, "history setup failed: \(error.localizedDescription)")
+            }
+        }
+
         await suite("Projects: search across title and transcript") {
             let root = tempRoot()
             defer { try? FileManager.default.removeItem(at: root) }

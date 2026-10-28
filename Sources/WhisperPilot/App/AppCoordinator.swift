@@ -216,7 +216,16 @@ final class AppCoordinator {
     private(set) var currentSession: SessionMeta?
     /// Summaries of earlier sessions in the current session's project, loaded when the
     /// session opens. Nil when the session has no project or the project has no history.
-    private var projectHistoryBlock: String?
+    private var projectHistory: ProjectHistoryCache?
+    /// Bumped on every history load or clear, so a slow load can tell it is out of date.
+    private var projectHistoryGeneration = 0
+
+    private struct ProjectHistoryCache {
+        let sessionID: SessionID
+        let projectID: UUID
+        let includesOther: Bool
+        let block: String
+    }
     /// Title-and-summary jobs started when a session ends, so one session never has two.
     private var wrapUpTasks: [SessionID: Task<Void, Never>] = [:]
     /// Reopens onboarding. Set by `AppDelegate`; the coordinator calls it when
@@ -1335,13 +1344,16 @@ final class AppCoordinator {
         let store = SessionStore.shared
         guard let meta = await store.metadata(for: sessionID) else { return }
         let bytes = await store.transcriptByteCount(sessionID)
-        let summaryIsCurrent = await store.loadSummary(sessionID)?.transcriptBytes == bytes
+        let includeOther = settings.includeSystemAudioInPrompt
+        let saved = await store.loadSummary(sessionID)
+        let summaryIsCurrent = saved?.transcriptBytes == bytes && (includeOther || saved?.excludesOther == true)
         guard meta.canAutoTitle || !summaryIsCurrent else { return }
-        let transcript = await store.loadTranscriptMarkdown(sessionID)
+        var transcript = await store.loadTranscriptMarkdown(sessionID)
+        if !includeOther { transcript = SessionStore.strippingOtherSpeaker(transcript) }
         guard let result = await SessionTitler.generate(using: ai, transcriptMarkdown: transcript) else { return }
         if let summary = result.summary {
             await store.saveSummary(
-                SessionSummary(summary: summary, transcriptBytes: bytes, generatedAt: Date()),
+                SessionSummary(summary: summary, transcriptBytes: bytes, generatedAt: Date(), excludesOther: !includeOther),
                 for: sessionID
             )
         }
@@ -1361,19 +1373,46 @@ final class AppCoordinator {
         currentSession?.displayName = meta.displayName
         currentSession?.titleSource = meta.titleSource
         currentSession?.projectID = meta.projectID
-        if projectChanged { await loadProjectHistory(for: meta) }
+        if projectChanged {
+            projectHistory = nil
+            projectHistoryGeneration += 1
+            await loadProjectHistory(for: meta)
+        }
     }
 
     private func loadProjectHistory(for session: SessionMeta) async {
-        guard let projectID = session.projectID else {
-            projectHistoryBlock = nil
-            return
-        }
-        let entries = await SessionStore.shared.projectHistoryEntries(projectID: projectID, excluding: session.id)
+        projectHistoryGeneration += 1
+        let generation = projectHistoryGeneration
+        projectHistory = nil
+        guard let projectID = session.projectID else { return }
+        let includeOther = settings.includeSystemAudioInPrompt
+        let entries = await SessionStore.shared.projectHistoryEntries(
+            projectID: projectID,
+            excluding: session.id,
+            includeOther: includeOther
+        )
         let block = ProjectHistory.block(entries: entries, budget: PromptBuilder.projectHistoryBudget)
-        // The user may have switched sessions while this loaded.
-        guard currentSession?.id == session.id else { return }
-        projectHistoryBlock = block
+        // The user may have switched sessions or projects while this loaded.
+        guard generation == projectHistoryGeneration,
+              currentSession?.id == session.id,
+              currentSession?.projectID == projectID,
+              let block else { return }
+        projectHistory = ProjectHistoryCache(
+            sessionID: session.id,
+            projectID: projectID,
+            includesOther: includeOther,
+            block: block
+        )
+    }
+
+    /// The cached history, only if it belongs to the open session and its current project
+    /// and respects the "Other" speaker setting.
+    private func currentProjectHistoryBlock() -> String? {
+        guard let cache = projectHistory,
+              cache.sessionID == currentSession?.id,
+              cache.projectID == currentSession?.projectID,
+              settings.includeSystemAudioInPrompt || !cache.includesOther else { return nil }
+        return cache.block
     }
 
     func toggleListening() async {
@@ -1479,7 +1518,6 @@ final class AppCoordinator {
             await context.seedFromMarkdown(transcript: transcriptForAI, chat: chatForAI)
         }
 
-        projectHistoryBlock = nil
         await loadProjectHistory(for: session)
 
         // Apply the session's stored model selection. On resume we honor the
@@ -3013,7 +3051,7 @@ final class AppCoordinator {
         enriched.globalContextBlock = globalContext.context.promptBlock
         let project = projects.project(id: currentSession?.projectID)
         enriched.projectContextBlock = project?.promptBlock
-        enriched.projectHistoryBlock = project?.usesPriorSessions == true ? projectHistoryBlock : nil
+        enriched.projectHistoryBlock = project?.usesPriorSessions == true ? currentProjectHistoryBlock() : nil
         return ConversationSnapshot(
             recentLines: includeT ? enriched.recentLines : [],
             topics: includeT ? enriched.topics : [],

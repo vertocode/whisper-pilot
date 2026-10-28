@@ -17,9 +17,11 @@ final class ProjectsStore: ObservableObject {
     /// load lands, the load is merged under the edit instead of replacing it.
     private var hasLocalEdit = false
 
+    private var loadTask: Task<Void, Never>?
+
     init(storage: ProjectStorage = .shared) {
         self.storage = storage
-        Task { [weak self] in
+        loadTask = Task { [weak self] in
             let loaded = await storage.load()
             await MainActor.run { self?.applyLoaded(loaded) }
         }
@@ -34,6 +36,7 @@ final class ProjectsStore: ObservableObject {
         }
         projects = Self.sorted(projects)
         isLoaded = true
+        if hasLocalEdit { saveNow() }
     }
 
     static func sorted(_ projects: [Project]) -> [Project] {
@@ -100,6 +103,9 @@ final class ProjectsStore: ObservableObject {
     private func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
+        // Before the first load lands, memory holds only the new edits. Saving now would
+        // overwrite the projects on disk. applyLoaded saves the merged list instead.
+        guard isLoaded else { return }
         let snapshot = projects
         let storage = storage
         let previous = saveChain
@@ -111,6 +117,7 @@ final class ProjectsStore: ObservableObject {
 
     /// Writes any pending debounced edit. Called on shutdown.
     func flush() async {
+        await loadTask?.value
         if pendingSave != nil { saveNow() }
         await saveChain?.value
     }

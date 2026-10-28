@@ -59,6 +59,9 @@ struct SessionSummary: Codable, Sendable, Equatable {
     /// Size of `transcript.md` when this was written, so an unchanged transcript is not summarized again.
     var transcriptBytes: Int
     var generatedAt: Date
+    /// False when the recap was written without the "Other" speaker. Nil for recaps from
+    /// before this field existed, which may contain "Other" speech.
+    var excludesOther: Bool?
 }
 
 enum SessionStoreError: Error {
@@ -317,9 +320,12 @@ actor SessionStore {
 
     /// Earlier sessions of a project, most recently used first, as text for the AI prompt.
     /// A summary is preferred; a session without one contributes the end of its transcript.
+    /// With `includeOther` false, only recaps written without "Other" are used, and the
+    /// transcript fallback drops "Other" lines.
     func projectHistoryEntries(
         projectID: UUID,
         excluding current: SessionID?,
+        includeOther: Bool = true,
         limit: Int = 15
     ) -> [ProjectHistory.Entry] {
         let earlier = listSessions()
@@ -328,10 +334,12 @@ actor SessionStore {
         var entries: [ProjectHistory.Entry] = []
         for meta in earlier {
             let text: String
-            if let summary = loadSummary(meta.id)?.summary, !summary.isEmpty {
-                text = summary
+            if let saved = loadSummary(meta.id), !saved.summary.isEmpty,
+               includeOther || saved.excludesOther == true {
+                text = saved.summary
             } else {
-                let raw = Self.strippingTranslations(loadTranscriptMarkdown(meta.id))
+                var raw = Self.strippingTranslations(loadTranscriptMarkdown(meta.id))
+                if !includeOther { raw = Self.strippingOtherSpeaker(raw) }
                 text = ProjectHistory.transcriptFallback(raw)
             }
             guard !text.isEmpty else { continue }
@@ -561,6 +569,22 @@ actor SessionStore {
             .split(separator: "\n", omittingEmptySubsequences: false)
             .filter { $0.firstMatch(of: transcriptTranslationRegex) == nil }
             .joined(separator: "\n")
+    }
+
+    /// Removes "Other" lines, and the translation lines right under them, from raw
+    /// transcript markdown. Used when the user keeps system audio out of AI context.
+    static func strippingOtherSpeaker(_ markdown: String) -> String {
+        var dropping = false
+        var kept: [Substring] = []
+        for line in markdown.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.firstMatch(of: transcriptTranslationRegex) != nil {
+                if !dropping { kept.append(line) }
+                continue
+            }
+            dropping = line.hasPrefix("**Other**")
+            if !dropping { kept.append(line) }
+        }
+        return kept.joined(separator: "\n")
     }
 
     /// Line-based parse: a `## ` line starts a new turn only when its remainder matches

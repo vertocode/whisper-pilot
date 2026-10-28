@@ -95,10 +95,9 @@ final class SessionsViewModel: ObservableObject {
     private func scheduleContentSearch() {
         searchTask?.cancel()
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            contentMatches = []
-            return
-        }
+        // Old matches belong to the old query, so drop them right away.
+        contentMatches = []
+        guard !query.isEmpty else { return }
         // Wait for a pause in typing, then read files off the main thread.
         searchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
