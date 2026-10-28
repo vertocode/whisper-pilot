@@ -2,17 +2,47 @@ import AppKit
 import Combine
 import SwiftUI
 
+/// What the right-hand pane of the Sessions window shows.
+enum SessionsSelection: Hashable {
+    case home
+    case project(UUID)
+    case session(SessionID)
+}
+
 @MainActor
 final class SessionsViewModel: ObservableObject {
     @Published var sessions: [SessionMeta] = []
     @Published var newSessionName: String = ""
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published var selection: SessionsSelection = .home
+    @Published var expandedProjects: Set<UUID> = []
+    @Published var searchText: String = "" {
+        didSet { scheduleContentSearch() }
+    }
+    /// Folder names of sessions whose transcript or summary matches the search text.
+    @Published private(set) var contentMatches: Set<String> = []
+
+    let projects: ProjectsStore
+    private var searchTask: Task<Void, Never>?
+    private var projectsObserver: AnyCancellable?
+
+    init(projects: ProjectsStore) {
+        self.projects = projects
+        // The window reads project names through this model, so a project change
+        // must redraw it too.
+        projectsObserver = projects.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
 
     /// Set by the AppDelegate. Called when the user picks an action that should drop them
     /// into the live overlay.
     var onStartNew: ((SessionMeta) -> Void)?
     var onResume: ((SessionMeta) -> Void)?
+    /// Called after a session's name or project changed, so a session that is open in the
+    /// overlay keeps using the right project.
+    var onSessionChanged: ((SessionMeta) -> Void)?
     /// Set by the AppDelegate. Invoked by the gear button in the Sessions header
     /// so users can jump straight into Settings without going through the menu
     /// bar — discoverability fix for first-time users who haven't found the
@@ -25,11 +55,71 @@ final class SessionsViewModel: ObservableObject {
         sessions = await SessionStore.shared.listSessions()
     }
 
-    func createNew() async {
+    // MARK: - Grouping and search
+
+    var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The project a session sits in. Nil when it has none, or when the project no longer exists.
+    func project(of session: SessionMeta) -> Project? {
+        projects.project(id: session.projectID)
+    }
+
+    func sessions(in projectID: UUID) -> [SessionMeta] {
+        sessions.filter { $0.projectID == projectID }
+    }
+
+    var ungroupedSessions: [SessionMeta] {
+        sessions.filter { projects.project(id: $0.projectID) == nil }
+    }
+
+    /// Sessions matching the search, across every project. Matches the title, the project
+    /// name, and (once the background read finishes) the transcript and summary.
+    var searchResults: [SessionMeta] {
+        sessions.filter { matchesSearch($0) }
+    }
+
+    func matchesSearch(_ session: SessionMeta) -> Bool {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        if Self.contains(session.displayName, query) { return true }
+        if let name = project(of: session)?.name, Self.contains(name, query) { return true }
+        return contentMatches.contains(session.folderName)
+    }
+
+    private static func contains(_ text: String, _ query: String) -> Bool {
+        text.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    private func scheduleContentSearch() {
+        searchTask?.cancel()
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            contentMatches = []
+            return
+        }
+        // Wait for a pause in typing, then read files off the main thread.
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            let hits = await SessionStore.shared.sessionsMatchingContent(query)
+            guard !Task.isCancelled else { return }
+            self?.contentMatches = hits
+        }
+    }
+
+    // MARK: - Sessions
+
+    func createNew(name: String? = nil, in projectID: UUID? = nil) async {
         do {
-            let trimmed = newSessionName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let meta = try await SessionStore.shared.createSession(name: trimmed.isEmpty ? nil : trimmed)
-            newSessionName = ""
+            let raw = name ?? newSessionName
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let meta = try await SessionStore.shared.createSession(
+                name: trimmed.isEmpty ? nil : trimmed,
+                projectID: projectID
+            )
+            if name == nil { newSessionName = "" }
             onStartNew?(meta)
             await refresh()
         } catch {
@@ -44,6 +134,7 @@ final class SessionsViewModel: ObservableObject {
     func delete(_ meta: SessionMeta) async {
         do {
             try await SessionStore.shared.deleteSession(meta.id)
+            if selection == .session(meta.id) { selection = .home }
             await refresh()
         } catch {
             errorMessage = "Couldn’t move \(meta.displayName) to Trash: \(error.localizedDescription)"
@@ -54,7 +145,9 @@ final class SessionsViewModel: ObservableObject {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != meta.displayName else { return }
         do {
-            _ = try await SessionStore.shared.renameSession(meta.id, to: trimmed)
+            if let updated = try await SessionStore.shared.renameSession(meta.id, to: trimmed) {
+                onSessionChanged?(updated)
+            }
             await refresh()
         } catch {
             errorMessage = error.localizedDescription
@@ -65,13 +158,65 @@ final class SessionsViewModel: ObservableObject {
         let url = await SessionStore.shared.sessionFolder(for: meta.id)
         NSWorkspace.shared.open(url)
     }
+
+    /// Moves a session into a project, or out of all projects when `projectID` is nil.
+    func move(_ session: SessionMeta, to projectID: UUID?) async {
+        guard session.projectID != projectID else { return }
+        do {
+            if let updated = try await SessionStore.shared.setProject(projectID, for: session.id) {
+                onSessionChanged?(updated)
+            }
+            if let projectID { expandedProjects.insert(projectID) }
+            await refresh()
+        } catch {
+            errorMessage = "Couldn’t move \(session.displayName): \(error.localizedDescription)"
+        }
+    }
+
+    /// Used by drag and drop, which only knows the folder name.
+    func moveSession(folderName: String, to projectID: UUID?) async {
+        guard let session = sessions.first(where: { $0.folderName == folderName }) else { return }
+        await move(session, to: projectID)
+    }
+
+    // MARK: - Projects
+
+    func createProject(named name: String) {
+        guard let project = projects.create(name: name) else { return }
+        expandedProjects.insert(project.id)
+        selection = .project(project.id)
+    }
+
+    func renameProject(_ id: UUID, to name: String) {
+        projects.rename(id, to: name)
+    }
+
+    /// Deletes the project. Its sessions stay and move to ungrouped, unless `deleteSessions`
+    /// is true (the caller has asked the user to confirm), in which case they go to the Trash.
+    func deleteProject(_ id: UUID, deleteSessions: Bool) async {
+        if deleteSessions {
+            for member in sessions(in: id) {
+                do {
+                    try await SessionStore.shared.deleteSession(member.id)
+                } catch {
+                    errorMessage = "Couldn’t move \(member.displayName) to Trash: \(error.localizedDescription)"
+                }
+            }
+        }
+        // Whatever is left (all of them when keeping sessions) becomes ungrouped.
+        await SessionStore.shared.clearProject(id)
+        projects.delete(id)
+        expandedProjects.remove(id)
+        if selection == .project(id) { selection = .home }
+        await refresh()
+    }
 }
 
 @MainActor
 final class SessionsWindowController: NSWindowController {
     init(viewModel: SessionsViewModel, globalContext: GlobalContextStore) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 580),
+            contentRect: NSRect(x: 0, y: 0, width: 1020, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -102,22 +247,25 @@ struct SessionsView: View {
     @State private var sessionPendingDeletion: SessionMeta?
     @State private var sessionPendingRename: SessionMeta?
     @State private var renameDraft: String = ""
+    @State private var showingNewProject = false
+    @State private var newProjectDraft: String = ""
+    @State private var projectPendingRename: Project?
+    @State private var projectRenameDraft: String = ""
+    @State private var projectPendingDeletion: Project?
+    @State private var projectPendingSessionDeletion: Project?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().opacity(0.4)
-            ScrollView {
-                VStack(alignment: .leading, spacing: WP.Space.xl) {
-                    globalContextSection
-                    newSessionSection
-                    historySection
-                }
-                .padding(.horizontal, 28)
-                .padding(.vertical, WP.Space.xl)
+            HStack(spacing: 0) {
+                SessionsSidebar(vm: vm, actions: sidebarActions)
+                    .frame(width: 270)
+                Divider().opacity(0.4)
+                detail
             }
         }
-        .frame(minWidth: 640, minHeight: 480)
+        .frame(minWidth: 900, minHeight: 520)
         // Solid system colour rather than the `.windowBackground` material — the
         // material can pick up colour from anything behind the window (translucent
         // titlebar, accessibility "reduce transparency" off, etc.), which hurt text
@@ -155,6 +303,141 @@ struct SessionsView: View {
         } message: { _ in
             Text("Only the display name changes — the transcript, chat, and files on disk stay where they are.")
         }
+        .alert("New project", isPresented: $showingNewProject) {
+            TextField("Project name", text: $newProjectDraft)
+            Button("Create") { vm.createProject(named: newProjectDraft) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A project groups related sessions, like a weekly meeting. You can add instructions and files for the AI inside it.")
+        }
+        .alert(
+            "Rename project",
+            isPresented: Binding(
+                get: { projectPendingRename != nil },
+                set: { if !$0 { projectPendingRename = nil } }
+            ),
+            presenting: projectPendingRename
+        ) { project in
+            TextField("Project name", text: $projectRenameDraft)
+            Button("Rename") {
+                vm.renameProject(project.id, to: projectRenameDraft)
+                projectPendingRename = nil
+            }
+            Button("Cancel", role: .cancel) { projectPendingRename = nil }
+        } message: { _ in
+            Text("Only the project name changes. Its sessions stay in it.")
+        }
+        .alert(
+            "Delete project?",
+            isPresented: Binding(
+                get: { projectPendingDeletion != nil },
+                set: { if !$0 { projectPendingDeletion = nil } }
+            ),
+            presenting: projectPendingDeletion
+        ) { project in
+            let count = vm.sessions(in: project.id).count
+            Button("Delete project, keep sessions") {
+                Task { await vm.deleteProject(project.id, deleteSessions: false) }
+                projectPendingDeletion = nil
+            }
+            if count > 0 {
+                Button("Also delete \(count) session\(count == 1 ? "" : "s")…", role: .destructive) {
+                    projectPendingSessionDeletion = project
+                    projectPendingDeletion = nil
+                }
+            }
+            Button("Cancel", role: .cancel) { projectPendingDeletion = nil }
+        } message: { project in
+            Text("“\(project.name)” and its instructions and files will be removed. Its sessions are not deleted — they move back to your ungrouped sessions.")
+        }
+        .alert(
+            "Move sessions to Trash?",
+            isPresented: Binding(
+                get: { projectPendingSessionDeletion != nil },
+                set: { if !$0 { projectPendingSessionDeletion = nil } }
+            ),
+            presenting: projectPendingSessionDeletion
+        ) { project in
+            let count = vm.sessions(in: project.id).count
+            Button("Move \(count) session\(count == 1 ? "" : "s") to Trash", role: .destructive) {
+                Task { await vm.deleteProject(project.id, deleteSessions: true) }
+                projectPendingSessionDeletion = nil
+            }
+            Button("Cancel", role: .cancel) { projectPendingSessionDeletion = nil }
+        } message: { project in
+            Text("This deletes the project “\(project.name)” and moves all of its transcripts and chats to the Trash. You can restore them from there.")
+        }
+        .alert("Something went wrong", isPresented: errorPresentationBinding) {
+            Button("OK", role: .cancel) { vm.errorMessage = nil }
+        } message: {
+            Text(vm.errorMessage ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch vm.selection {
+        case .home:
+            ScrollView {
+                VStack(alignment: .leading, spacing: WP.Space.xl) {
+                    globalContextSection
+                    newSessionSection
+                    historySection
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, WP.Space.xl)
+            }
+        case .project(let id):
+            if let project = vm.projects.project(id: id) {
+                ProjectDetailView(vm: vm, projects: vm.projects, project: project, actions: sidebarActions, sessionActions: sessionRowActions)
+            } else {
+                EmptyProjectSelection()
+            }
+        case .session(let id):
+            if let session = vm.sessions.first(where: { $0.id == id }) {
+                SessionDetailView(vm: vm, session: session, actions: sessionRowActions)
+            } else {
+                EmptyProjectSelection()
+            }
+        }
+    }
+
+    private var sidebarActions: SessionsSidebarActions {
+        SessionsSidebarActions(
+            requestDeleteSession: { sessionPendingDeletion = $0 },
+            requestRenameSession: { session in
+                renameDraft = session.displayName
+                sessionPendingRename = session
+            },
+            requestNewProject: {
+                newProjectDraft = ""
+                showingNewProject = true
+            },
+            requestRenameProject: { project in
+                projectRenameDraft = project.name
+                projectPendingRename = project
+            },
+            requestDeleteProject: { projectPendingDeletion = $0 }
+        )
+    }
+
+    private var sessionRowActions: (delete: (SessionMeta) -> Void, rename: (SessionMeta) -> Void) {
+        (
+            delete: { sessionPendingDeletion = $0 },
+            rename: { session in
+                renameDraft = session.displayName
+                sessionPendingRename = session
+            }
+        )
+    }
+
+    private var errorPresentationBinding: Binding<Bool> {
+        Binding(
+            get: { vm.errorMessage != nil },
+            set: { isPresented in
+                if !isPresented { vm.errorMessage = nil }
+            }
+        )
     }
 
     private var renamePresentationBinding: Binding<Bool> {
@@ -285,13 +568,17 @@ struct SessionsView: View {
         }
     }
 
+    private var visibleHistory: [SessionMeta] {
+        vm.isSearching ? vm.searchResults : vm.sessions
+    }
+
     private var historySection: some View {
         VStack(alignment: .leading, spacing: WP.Space.md) {
             HStack(alignment: .firstTextBaseline) {
                 SectionHeader(title: "Past sessions", subtitle: nil)
                 Spacer()
                 if !vm.sessions.isEmpty {
-                    Text("\(vm.sessions.count)")
+                    Text("\(visibleHistory.count)")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 7)
@@ -306,9 +593,13 @@ struct SessionsView: View {
 
             if vm.sessions.isEmpty {
                 EmptyHistoryState()
+            } else if visibleHistory.isEmpty {
+                Text("No sessions match “\(vm.searchText)”.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
             } else {
                 LazyVStack(spacing: WP.Space.sm) {
-                    ForEach(vm.sessions) { session in
+                    ForEach(visibleHistory) { session in
                         SessionRow(
                             session: session,
                             isHovered: hoveredSessionID == session.id,
@@ -329,7 +620,7 @@ struct SessionsView: View {
     }
 }
 
-private struct SectionHeader: View {
+struct SectionHeader: View {
     let title: String
     let subtitle: String?
 
@@ -393,7 +684,7 @@ private struct EmptyHistoryState: View {
     }
 }
 
-private struct SessionRow: View {
+struct SessionRow: View {
     let session: SessionMeta
     let isHovered: Bool
     let vm: SessionsViewModel
@@ -423,6 +714,14 @@ private struct SessionRow: View {
 
             Spacer()
 
+            if let project = vm.project(of: session) {
+                Label(project.name, systemImage: "folder")
+                    .font(.system(size: 10, weight: .medium))
+                    .lineLimit(1)
+                    .chip(.neutral)
+                    .help("Project: \(project.name)")
+            }
+
             if let modelBadge = modelBadgeContent {
                 Text(modelBadge.label)
                     .font(.system(size: 10, weight: .medium))
@@ -450,6 +749,9 @@ private struct SessionRow: View {
             Menu {
                 Button(action: onRequestRename) {
                     Label("Rename…", systemImage: "pencil")
+                }
+                MoveToProjectMenu(session: session, projects: vm.projects) { target in
+                    Task { await vm.move(session, to: target) }
                 }
                 Button {
                     Task { await vm.openInFinder(session) }

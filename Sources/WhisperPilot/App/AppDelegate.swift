@@ -147,10 +147,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] new in self?.registerAnswerScreenHotKey(new) }
             .store(in: &settingsCancellables)
 
-        let vm = SessionsViewModel()
+        let vm = SessionsViewModel(projects: coordinator.projects)
         vm.onStartNew = { [weak self] meta in self?.openSession(meta, resumed: false) }
         vm.onResume = { [weak self] meta in self?.openSession(meta, resumed: true) }
         vm.onOpenSettings = { [weak self] in self?.showSettings() }
+        vm.onSessionChanged = { [weak self] meta in
+            Task { await self?.coordinator.sessionMetaDidChange(meta) }
+        }
         sessionsViewModel = vm
 
         let sessions = SessionsWindowController(viewModel: vm, globalContext: coordinator.globalContext)

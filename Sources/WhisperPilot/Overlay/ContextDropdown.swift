@@ -23,6 +23,10 @@ struct ContextDropdown: View {
     /// global panel to surface its token-cost warning right where the user is
     /// about to type something.
     var notice: AnyView? = nil
+    /// Label above the text box and in the collapsed summary ("Notes", "Instructions").
+    var notesLabel: String = "Notes"
+    /// Opens the panel the first time it appears. The toggle still works afterwards.
+    var startExpanded: Bool = false
 
     @State private var isExpanded: Bool = false
     @State private var isDropTargeted: Bool = false
@@ -43,6 +47,7 @@ struct ContextDropdown: View {
                 expandedBody
             }
         }
+        .onAppear { if startExpanded { isExpanded = true } }
         .padding(WP.Space.sm)
         .background(
             RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
@@ -81,7 +86,7 @@ struct ContextDropdown: View {
     private var summary: String {
         var parts: [String] = []
         let notesChars = context.customText.trimmingCharacters(in: .whitespacesAndNewlines).count
-        if notesChars > 0 { parts.append("\(notesChars) chars of notes") }
+        if notesChars > 0 { parts.append("\(notesChars) chars of \(notesLabel.lowercased())") }
         if !context.files.isEmpty {
             parts.append("\(context.files.count) file\(context.files.count == 1 ? "" : "s")")
         }
@@ -94,7 +99,7 @@ struct ContextDropdown: View {
                 notice
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text("Notes")
+                Text(notesLabel)
                     .font(WP.TextStyle.micro)
                     .foregroundStyle(.tertiary)
                 TextEditor(text: $context.customText)
