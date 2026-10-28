@@ -25,15 +25,44 @@ struct SessionMeta: Identifiable, Sendable, Codable, Equatable {
     /// user picks a model in the overlay during this session; reapplied on
     /// resume so each session sticks to the model it was started with.
     var selectedModel: String? = nil
+    /// Project this session belongs to. Nil means ungrouped. A value that matches no
+    /// project is treated as ungrouped by the UI, so a stale id never hides a session.
+    var projectID: UUID? = nil
+    /// Who set `displayName`. Nil on sessions saved before auto-titles existed.
+    var titleSource: TitleSource? = nil
     /// Filled in on every list refresh — not persisted.
     var transcriptLineCount: Int = 0
     var chatTurnCount: Int = 0
 
     var id: SessionID { SessionID(folderName: folderName) }
 
-    private enum CodingKeys: String, CodingKey {
-        case folderName, displayName, createdAt, lastUsedAt, selectedModel
+    enum TitleSource: String, Codable, Sendable {
+        case user
+        case auto
     }
+
+    /// True only for a session nobody named: still the placeholder and not set by the user.
+    /// A title the user typed (or any name other than the placeholder) is never replaced.
+    var canAutoTitle: Bool {
+        titleSource != .user && displayName == SessionStore.untitledName
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case folderName, displayName, createdAt, lastUsedAt, selectedModel, projectID, titleSource
+    }
+}
+
+/// Short AI-written recap of a session, kept next to its transcript. Used for search and
+/// as compact "earlier sessions" context for the project's later sessions.
+struct SessionSummary: Codable, Sendable, Equatable {
+    var summary: String
+    /// Size of `transcript.md` when this was written, so an unchanged transcript is not summarized again.
+    var transcriptBytes: Int
+    var generatedAt: Date
+}
+
+enum SessionStoreError: Error {
+    case unreadableMetadata
 }
 
 actor SessionStore {
@@ -80,6 +109,8 @@ actor SessionStore {
         try? FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
     }
 
+    static let untitledName = "Untitled session"
+
     nonisolated var rootURL: URL { baseURL }
 
     func sessionFolder(for id: SessionID) -> URL {
@@ -121,10 +152,10 @@ actor SessionStore {
         return metas
     }
 
-    func createSession(name: String?) throws -> SessionMeta {
+    func createSession(name: String?, projectID: UUID? = nil) throws -> SessionMeta {
         let now = Date()
         let cleaned = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayName = cleaned.isEmpty ? "Untitled session" : cleaned
+        let displayName = cleaned.isEmpty ? Self.untitledName : cleaned
         let slug = cleaned.isEmpty ? "session" : cleaned.slugify()
         let dateString = Self.dateFormatter.string(from: now)
         // The timestamp only has minute precision — two same-named sessions
@@ -144,7 +175,9 @@ actor SessionStore {
             folderName: folderName,
             displayName: displayName,
             createdAt: now,
-            lastUsedAt: now
+            lastUsedAt: now,
+            projectID: projectID,
+            titleSource: cleaned.isEmpty ? nil : .user
         )
         try writeMetadata(meta, to: folder)
         // Seed empty md files so users can open the folder right away and see it.
@@ -168,8 +201,143 @@ actor SessionStore {
         guard let data = try? Data(contentsOf: metaURL),
               var meta = try? makeDecoder().decode(SessionMeta.self, from: data) else { return nil }
         meta.displayName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        meta.titleSource = .user
         try writeMetadata(meta, to: folder)
         return meta
+    }
+
+    // MARK: - Projects, auto-titles, summaries
+
+    /// Reads a session's metadata for a change. A missing file falls back to what the list
+    /// shows. A file that exists but can't be read throws, so it is never overwritten.
+    private func metaForUpdate(_ id: SessionID) throws -> SessionMeta? {
+        let folder = sessionFolder(for: id)
+        let metaURL = folder.appendingPathComponent("metadata.json")
+        if FileManager.default.fileExists(atPath: metaURL.path) {
+            guard let data = try? Data(contentsOf: metaURL),
+                  let meta = try? makeDecoder().decode(SessionMeta.self, from: data) else {
+                throw SessionStoreError.unreadableMetadata
+            }
+            return meta
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return nil }
+        return fallbackMetadata(for: id.folderName, folder: folder)
+    }
+
+    func metadata(for id: SessionID) -> SessionMeta? {
+        try? metaForUpdate(id)
+    }
+
+    /// Puts a session in a project, or takes it out when `projectID` is nil. Does not change
+    /// `lastUsedAt`, so tidying up never reshuffles the list.
+    @discardableResult
+    func setProject(_ projectID: UUID?, for id: SessionID) throws -> SessionMeta? {
+        guard var meta = try metaForUpdate(id) else { return nil }
+        guard meta.projectID != projectID else { return meta }
+        meta.projectID = projectID
+        try writeMetadata(meta, to: sessionFolder(for: id))
+        return meta
+    }
+
+    /// Takes every session out of a project. Used when the project is deleted and the user
+    /// keeps its sessions. Returns how many sessions were changed.
+    @discardableResult
+    func clearProject(_ projectID: UUID) -> Int {
+        var changed = 0
+        for meta in listSessions() where meta.projectID == projectID {
+            if (try? setProject(nil, for: meta.id)) != nil { changed += 1 }
+        }
+        return changed
+    }
+
+    /// Saves an AI-made title, but only if the session still has no user-given name.
+    /// Checked again here, at write time, so a rename made while the AI was thinking wins.
+    @discardableResult
+    func applyAutoTitle(_ title: String, to id: SessionID) -> SessionMeta? {
+        guard var meta = try? metaForUpdate(id), meta.canAutoTitle else { return nil }
+        meta.displayName = title
+        meta.titleSource = .auto
+        do {
+            try writeMetadata(meta, to: sessionFolder(for: id))
+            return meta
+        } catch {
+            log.error("Auto-title save failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    private func summaryURL(_ id: SessionID) -> URL {
+        sessionFolder(for: id).appendingPathComponent("summary.json")
+    }
+
+    func loadSummary(_ id: SessionID) -> SessionSummary? {
+        guard let data = try? Data(contentsOf: summaryURL(id)) else { return nil }
+        return try? makeDecoder().decode(SessionSummary.self, from: data)
+    }
+
+    func saveSummary(_ summary: SessionSummary, for id: SessionID) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            try encoder.encode(summary).write(to: summaryURL(id), options: .atomic)
+        } catch {
+            log.error("Summary save failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    func transcriptByteCount(_ id: SessionID) -> Int {
+        let url = sessionFolder(for: id).appendingPathComponent("transcript.md")
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    /// Folder names of sessions whose transcript or summary contains `query`. Title matches
+    /// are done by the caller from the list it already has; this only reads files.
+    func sessionsMatchingContent(_ query: String) -> Set<String> {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return [] }
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: baseURL.path)) ?? []
+        var hits: Set<String> = []
+        for name in names {
+            if Task.isCancelled { break }
+            let id = SessionID(folderName: name)
+            if let summary = loadSummary(id), summary.summary.range(of: needle, options: options) != nil {
+                hits.insert(name)
+                continue
+            }
+            let transcript = loadTranscriptMarkdown(id)
+            if transcript.range(of: needle, options: options) != nil { hits.insert(name) }
+        }
+        return hits
+    }
+
+    /// Earlier sessions of a project, most recently used first, as text for the AI prompt.
+    /// A summary is preferred; a session without one contributes the end of its transcript.
+    func projectHistoryEntries(
+        projectID: UUID,
+        excluding current: SessionID?,
+        limit: Int = 15
+    ) -> [ProjectHistory.Entry] {
+        let earlier = listSessions()
+            .filter { $0.projectID == projectID && $0.id != current }
+            .prefix(limit)
+        var entries: [ProjectHistory.Entry] = []
+        for meta in earlier {
+            let text: String
+            if let summary = loadSummary(meta.id)?.summary, !summary.isEmpty {
+                text = summary
+            } else {
+                let raw = Self.strippingTranslations(loadTranscriptMarkdown(meta.id))
+                text = ProjectHistory.transcriptFallback(raw)
+            }
+            guard !text.isEmpty else { continue }
+            entries.append(ProjectHistory.Entry(title: meta.displayName, date: meta.createdAt, text: text))
+        }
+        return entries
     }
 
     func deleteSession(_ id: SessionID) throws {

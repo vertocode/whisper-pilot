@@ -31,9 +31,8 @@ struct ContextDropdown: View {
     /// File types we accept via drag-drop and the open panel. Plain text covers
     /// `.txt` and most code files; markdown / html / json are called out explicitly
     /// so the picker doesn't dim them when parent type-conformance is fuzzy.
-    private static let acceptedExtensions: Set<String> = ["md", "markdown", "html", "htm", "json", "txt", "text"]
     private static let acceptedTypes: [UTType] = [
-        .plainText, .text, .json, .html,
+        .plainText, .text, .json, .html, .pdf,
         UTType(filenameExtension: "md") ?? .plainText
     ]
 
@@ -184,7 +183,7 @@ struct ContextDropdown: View {
             }
             .buttonStyle(.plain)
 
-            Text(isDropTargeted ? "Drop to attach" : "or drag & drop .md / .html / .json / .txt")
+            Text(isDropTargeted ? "Drop to attach" : "or drag & drop .md / .html / .json / .txt / .pdf")
                 .font(WP.TextStyle.micro)
                 .foregroundStyle(isDropTargeted ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.tertiary))
             Spacer(minLength: 0)
@@ -217,7 +216,7 @@ struct ContextDropdown: View {
         panel.canChooseFiles = true
         panel.allowedContentTypes = Self.acceptedTypes
         panel.title = "Attach context files"
-        panel.message = "Pick .md, .html, .json, or .txt files to include in AI prompts."
+        panel.message = "Pick .md, .html, .json, .txt, or .pdf files to include in AI prompts."
         if panel.runModal() == .OK {
             for url in panel.urls { attach(url) }
         }
@@ -233,38 +232,17 @@ struct ContextDropdown: View {
     }
 
     private func attach(_ url: URL) {
-        let ext = url.pathExtension.lowercased()
-        guard Self.acceptedExtensions.contains(ext) else {
-            lastError = "Unsupported file type .\(ext). Accepted: md, html, json, txt."
-            return
+        switch ContextFileReader.read(url) {
+        case .failure(let error):
+            lastError = error.message
+        case .success(let file):
+            if let existingIndex = context.files.firstIndex(where: { $0.sourcePath == file.sourcePath }) {
+                context.files[existingIndex] = file
+            } else {
+                context.files.append(file)
+            }
+            lastError = nil
         }
-        let isAccessing = url.startAccessingSecurityScopedResource()
-        defer { if isAccessing { url.stopAccessingSecurityScopedResource() } }
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
-            lastError = "Couldn't read \(url.lastPathComponent) — make sure it's UTF-8 text."
-            return
-        }
-        let truncated: String
-        if raw.utf8.count > SessionContext.maxFileBytes {
-            let limited = String(raw.prefix(SessionContext.maxFileBytes))
-            truncated = limited + "\n\n…[truncated, file is larger than 200 KB]"
-        } else {
-            truncated = raw
-        }
-        let file = ContextFile(
-            id: UUID(),
-            filename: url.lastPathComponent,
-            sourcePath: url.path,
-            content: truncated,
-            byteCount: truncated.utf8.count,
-            attachedAt: Date()
-        )
-        if let existingIndex = context.files.firstIndex(where: { $0.sourcePath == file.sourcePath }) {
-            context.files[existingIndex] = file
-        } else {
-            context.files.append(file)
-        }
-        lastError = nil
     }
 
     private func fileIcon(for name: String) -> String {
@@ -272,6 +250,7 @@ struct ContextDropdown: View {
         case "md", "markdown": return "doc.text"
         case "html", "htm":    return "globe"
         case "json":           return "curlybraces.square"
+        case "pdf":            return "doc.richtext"
         default:               return "doc"
         }
     }

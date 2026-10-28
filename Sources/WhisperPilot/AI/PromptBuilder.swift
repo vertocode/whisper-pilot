@@ -354,6 +354,8 @@ enum PromptBuilder {
     static let contextFileBudget = 16_000
     static let priorTranscriptBudget = 20_000
     static let priorChatBudget = 10_000
+    static let projectContextBudget = 24_000
+    static let projectHistoryBudget = 12_000
     /// About 30 minutes of two-way conversation, so the AI remembers what the user
     /// said early in a long interview.
     static let liveTranscriptBudget = 32_000
@@ -383,6 +385,12 @@ enum PromptBuilder {
         // does the attached file say about X".
         if let globalContext = transcript.globalContextBlock {
             sections.append("Global context provided by the user (applies to every session):\n\(clampHead(globalContext, to: contextFileBudget))")
+        }
+        if let projectContext = transcript.projectContextBlock {
+            sections.append("Project context provided by the user (this session belongs to this project; follow its instructions):\n\(clampHead(projectContext, to: projectContextBudget))")
+        }
+        if let projectHistory = transcript.projectHistoryBlock {
+            sections.append("Earlier sessions in this project (most recent first, summarized; use them for continuity):\n\(clampHead(projectHistory, to: projectHistoryBudget))")
         }
         if let sessionContext = transcript.sessionContextBlock {
             sections.append("Session context provided by the user (specific to this session):\n\(clampHead(sessionContext, to: contextFileBudget))")

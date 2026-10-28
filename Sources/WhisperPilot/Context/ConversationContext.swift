@@ -16,6 +16,10 @@ struct ConversationSnapshot: Sendable {
     /// `sessionContextBlock` so the prompt builder can label them distinctly and
     /// the model understands they're general background versus session-specific.
     var globalContextBlock: String? = nil
+    /// Instructions and files of the project this session belongs to.
+    var projectContextBlock: String? = nil
+    /// Summaries of earlier sessions in the same project, newest first.
+    var projectHistoryBlock: String? = nil
 }
 
 /// Rolling memory the LLM sees on every prompt. We keep the session's transcript verbatim (the

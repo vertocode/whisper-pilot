@@ -21,6 +21,9 @@ final class AppCoordinator {
     /// the Sessions home page to bind its `ContextDropdown` against. Persisted to
     /// `<App Support>/<bundle>/global-context.json` independently of any session.
     let globalContext = GlobalContextStore()
+    /// Projects (folders of sessions with their own instructions and files). Shared with
+    /// the Sessions window; prompts read the active session's project from here.
+    let projects = ProjectsStore()
 
     private let log = Logger(subsystem: "com.whisperpilot.app", category: "Coordinator")
 
@@ -211,6 +214,11 @@ final class AppCoordinator {
     /// while audio capture is mid-setup, which would leave duplicate captures running.
     private var isStartingUp = false
     private(set) var currentSession: SessionMeta?
+    /// Summaries of earlier sessions in the current session's project, loaded when the
+    /// session opens. Nil when the session has no project or the project has no history.
+    private var projectHistoryBlock: String?
+    /// Title-and-summary jobs started when a session ends, so one session never has two.
+    private var wrapUpTasks: [SessionID: Task<Void, Never>] = [:]
     /// Reopens onboarding. Set by `AppDelegate`; the coordinator calls it when
     /// something needs a permission, instead of asking macOS itself.
     var requestSetup: (() -> Void)?
@@ -378,6 +386,7 @@ final class AppCoordinator {
         // is drained too — otherwise the last edit in the Sessions home page can
         // vanish when the app terminates mid-debounce.
         await globalContext.flush()
+        await projects.flush()
     }
 
     private func refreshDerivedState() {
@@ -1251,7 +1260,8 @@ final class AppCoordinator {
         await micCapture.stop()
     }
 
-    func stopListening() async {
+    /// `endsSession` is false for automatic restarts, which are not the user finishing a session.
+    func stopListening(endsSession: Bool = true) async {
         let hasActivePipeline = isRunning || isStartingUp || transcriber != nil || processTapStop != nil
         guard hasActivePipeline else {
             // Context can be edited before Play or after Stop. Quitting while idle
@@ -1307,6 +1317,63 @@ final class AppCoordinator {
         // Tear down any startup notes still floating from a stuck startup that the
         // user just bailed out of with Stop.
         dismissStartupNotes()
+        if endsSession { scheduleSessionWrapUp() }
+    }
+
+    /// After a session ends: write a short recap, and a title if nobody named the session.
+    /// Runs in the background and gives up quietly on any failure.
+    private func scheduleSessionWrapUp() {
+        guard let session = currentSession, let ai = aiProvider,
+              wrapUpTasks[session.id] == nil else { return }
+        wrapUpTasks[session.id] = Task { [weak self] in
+            await self?.wrapUp(sessionID: session.id, ai: ai)
+            self?.wrapUpTasks[session.id] = nil
+        }
+    }
+
+    private func wrapUp(sessionID: SessionID, ai: AIProvider) async {
+        let store = SessionStore.shared
+        guard let meta = await store.metadata(for: sessionID) else { return }
+        let bytes = await store.transcriptByteCount(sessionID)
+        let summaryIsCurrent = await store.loadSummary(sessionID)?.transcriptBytes == bytes
+        guard meta.canAutoTitle || !summaryIsCurrent else { return }
+        let transcript = await store.loadTranscriptMarkdown(sessionID)
+        guard let result = await SessionTitler.generate(using: ai, transcriptMarkdown: transcript) else { return }
+        if let summary = result.summary {
+            await store.saveSummary(
+                SessionSummary(summary: summary, transcriptBytes: bytes, generatedAt: Date()),
+                for: sessionID
+            )
+        }
+        if let title = result.title,
+           let updated = await store.applyAutoTitle(title, to: sessionID),
+           currentSession?.id == sessionID {
+            currentSession?.displayName = updated.displayName
+            currentSession?.titleSource = updated.titleSource
+        }
+    }
+
+    /// The Sessions window changed this session's name or project. Keeps the live copy in
+    /// step so the next prompt uses the right project.
+    func sessionMetaDidChange(_ meta: SessionMeta) async {
+        guard currentSession?.id == meta.id else { return }
+        let projectChanged = currentSession?.projectID != meta.projectID
+        currentSession?.displayName = meta.displayName
+        currentSession?.titleSource = meta.titleSource
+        currentSession?.projectID = meta.projectID
+        if projectChanged { await loadProjectHistory(for: meta) }
+    }
+
+    private func loadProjectHistory(for session: SessionMeta) async {
+        guard let projectID = session.projectID else {
+            projectHistoryBlock = nil
+            return
+        }
+        let entries = await SessionStore.shared.projectHistoryEntries(projectID: projectID, excluding: session.id)
+        let block = ProjectHistory.block(entries: entries, budget: PromptBuilder.projectHistoryBudget)
+        // The user may have switched sessions while this loaded.
+        guard currentSession?.id == session.id else { return }
+        projectHistoryBlock = block
     }
 
     func toggleListening() async {
@@ -1322,7 +1389,7 @@ final class AppCoordinator {
     /// in-session state the user set — currently the mic mute toggle.
     func restartListening() async {
         pendingMicMuteRestore = overlayState.isMicrophoneMuted
-        await stopListening()
+        await stopListening(endsSession: false)
         await startListening()
     }
 
@@ -1411,6 +1478,9 @@ final class AppCoordinator {
             let chatForAI = SessionStore.strippingChatMetadata(chat)
             await context.seedFromMarkdown(transcript: transcriptForAI, chat: chatForAI)
         }
+
+        projectHistoryBlock = nil
+        await loadProjectHistory(for: session)
 
         // Apply the session's stored model selection. On resume we honor the
         // value saved when the session was last used; on a brand-new session
@@ -2941,6 +3011,9 @@ final class AppCoordinator {
         var enriched = snapshot
         enriched.sessionContextBlock = overlayState.sessionContext.promptBlock
         enriched.globalContextBlock = globalContext.context.promptBlock
+        let project = projects.project(id: currentSession?.projectID)
+        enriched.projectContextBlock = project?.promptBlock
+        enriched.projectHistoryBlock = project?.usesPriorSessions == true ? projectHistoryBlock : nil
         return ConversationSnapshot(
             recentLines: includeT ? enriched.recentLines : [],
             topics: includeT ? enriched.topics : [],
@@ -2948,7 +3021,9 @@ final class AppCoordinator {
             priorTranscriptMarkdown: includeT ? snapshot.priorTranscriptMarkdown : nil,
             priorChatMarkdown: includeH ? snapshot.priorChatMarkdown : nil,
             sessionContextBlock: enriched.sessionContextBlock,
-            globalContextBlock: enriched.globalContextBlock
+            globalContextBlock: enriched.globalContextBlock,
+            projectContextBlock: enriched.projectContextBlock,
+            projectHistoryBlock: enriched.projectHistoryBlock
         )
     }
 
