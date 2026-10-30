@@ -995,7 +995,8 @@ final class AppCoordinator {
     private func engageTier1() {
         guard !tier1Engaged else { return }
         tier1Engaged = true
-        wpWarn("[Coordinator] Tier-1 safety valve engaged — high sustained load; pausing AI auto-suggestions")
+        let reason = resourceGovernor.trigger?.label ?? "load"
+        wpWarn("[Coordinator] Tier-1 safety valve engaged by \(reason) — \(resourceSampleSummary()); pausing AI auto-suggestions")
         // Pause auto-detect / auto-send. The trigger-events consumer checks this.
         // Only mark the pause as valve-owned (eligible for auto-resume on recovery)
         // when we actually flip it — if the user had already paused AI, that's their
@@ -1019,11 +1020,30 @@ final class AppCoordinator {
             Task { await queue.setMode(.finalsOnly) }
         }
         tier1NoteID = overlayState.appendSystemNote(
-            "⚠️ High system load — AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
+            "⚠️ \(tier1Headline(reason)) — AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
             category: .ai,
             actionLabel: "Disable my mic for this session",
             actionKind: .shedMicrophoneForSession
         )
+    }
+
+    private func tier1Headline(_ trigger: String) -> String {
+        resourceGovernor.trigger == .thermal ? "Your Mac is running hot" : "High \(trigger)"
+    }
+
+    private func tier2Cause(_ trigger: String) -> String {
+        if resourceGovernor.trigger == .thermal {
+            return overlayState.resourceSample?.thermalState == .critical
+                ? "thermal state is critical"
+                : "your Mac stayed too hot for too long"
+        }
+        return "\(trigger) stayed far too high"
+    }
+
+    private func resourceSampleSummary() -> String {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        guard let sample = overlayState.resourceSample else { return "no sample, cores=\(cores)" }
+        return "cpu=\(Int(sample.cpuPercent.rounded()))% (100=1 core), memory=\(sample.memoryBytes / 1_000_000) MB, thermal=\(sample.thermalState.rawValue), cores=\(cores)"
     }
 
     private func dismissTier1Note() {
@@ -1042,12 +1062,13 @@ final class AppCoordinator {
     private func engageTier2() {
         guard !tier2Engaged else { return }
         tier2Engaged = true
-        wpWarn("[Coordinator] Tier-2 safety valve engaged — sustained overload or thermal pressure; stopping listening")
+        let reason = resourceGovernor.trigger?.label ?? "load"
+        wpWarn("[Coordinator] Tier-2 safety valve engaged by \(reason) — \(resourceSampleSummary()); stopping listening")
         // Post the alert BEFORE teardown. `stopListening` preserves the transcript and
         // chat messages (it only zeroes counters and drops startup notes), so this note
         // remains visible after the stop to explain why listening ended.
         overlayState.appendSystemNote(
-            "🛑 System under heavy load — listening stopped automatically to keep your Mac responsive. Your transcript and session are saved; press ▶ to resume when load eases.",
+            "🛑 Listening stopped automatically: \(tier2Cause(reason)). Your transcript and session are saved; press ▶ to resume when load eases.",
             category: .ai
         )
         // stopListening is async; hop off this synchronous decision handler. It tears

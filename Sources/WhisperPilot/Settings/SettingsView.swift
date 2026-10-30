@@ -117,7 +117,7 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
-                    Slider(value: $store.safetyValveCPUPercent, in: 40...95, step: 5)
+                    Slider(value: $store.safetyValveCPUPercent, in: 100...800, step: 50)
                 }
                 .disabled(!store.safetyValveEnabled)
                 VStack(alignment: .leading, spacing: 2) {
@@ -133,12 +133,12 @@ struct SettingsView: View {
                             get: { Double(store.safetyValveMemoryMB) },
                             set: { store.safetyValveMemoryMB = Int($0) }
                         ),
-                        in: 500...4000,
+                        in: 1000...8000,
                         step: 100
                     )
                 }
                 .disabled(!store.safetyValveEnabled)
-                FormHint("The soft pause (Tier-1) trips when this app's own CPU stays above the threshold for ~20s, or its memory crosses the cap. Thermal pressure and sustained overload escalate to a full stop. Tune these to your Mac; threshold changes apply the next time you start listening.")
+                FormHint("CPU is shown as % of one core, so 200% means two cores. The soft pause (Tier-1) trips when this app's CPU stays above the threshold for ~30s, its memory crosses the cap, or the Mac gets hot. Listening only stops for runaway load held for minutes, or a critical temperature. Changes apply the next time you start listening.")
             }
         }
         .formStyle(.grouped)

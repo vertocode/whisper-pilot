@@ -53,8 +53,8 @@ The result: transcription and manual AI chat keep working smoothly through a ful
   ```
   Sample = (cpuPercent: Double, memBytes: UInt64, thermal: ThermalLevel, since: SecondsSinceTier1?)
   Decision = .ok | .tier1Pause | .tier2Stop
-  // Tier-1: cpuPercent > 70 sustained ≥20s  OR  memBytes > ~1.5GB
-  // Tier-2: thermal >= .serious             OR  (tier1 active AND load still high ≥15s)
+  // Tier-1: cpuPercent > 200 sustained ≥30s OR memBytes > ~3GB OR thermal .serious
+  // Tier-2: thermal .critical OR cpu > 90% of all cores ≥3min OR mem > 2x cap ≥2min OR .serious ≥10min
   ```
   (Shape only — encodes the trip rules; not a working impl.)
 
@@ -94,7 +94,7 @@ The result: transcription and manual AI chat keep working smoothly through a ful
 
 ## Further Notes
 
-- Default thresholds (tunable in Settings): Tier-1 = own-process CPU > ~70% sustained ~20s, or resident memory > ~1.5 GB; Tier-2 = `thermalState >= .serious`/`.critical`, or load still high ~15s after Tier-1. These are starting points expected to be tuned on real hardware.
+- Default thresholds (tunable in Settings): Tier-1 = own-process CPU > 200% (two cores) sustained ~30s, OR mem > ~3 GB, OR thermal `.serious`. Tier-2 (stop) = thermal `.critical`, OR CPU > 90% of ALL cores for ~3 min, OR mem > 2x the cap for ~2 min, OR thermal `.serious` for ~10 min. (Revised after normal meetings were stopped by the old 70% / 1.5 GB / 15 s rules; on-device transcription alone can use more than one core.)
 - The "Balanced" perf cadence was chosen over "Aggressive" and "Conservative": transcript ~3–4 Hz, question-detect debounced ~0.5 s + finals, accepting ~0.5 s added auto-answer latency for a large CPU reduction.
 - Sequencing suggestion (not a hard contract): land wake-word removal + the per-frame batching first (fastest measurable win on the main-thread saturation that most likely caused the webcam freeze), then the throttles, then the governor + monitor + Settings.
 - Core features preserved end-to-end: system transcription, mic transcription, manual AI chat, and auto question-detection (when enabled in Settings).

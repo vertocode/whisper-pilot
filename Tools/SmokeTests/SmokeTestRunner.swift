@@ -1483,132 +1483,189 @@ struct SmokeTestRunner {
         }
     }
 
-    /// Drives the `ResourceGovernor` state machine with a controllable clock (we pass
-    /// the monotonic `now` ourselves) and synthetic samples. Pins the tier transitions:
-    /// CPU sustain, memory cap, thermal short-circuit, and the Tier-1 → Tier-2/recover
-    /// fork. No real CPU/memory/thermal readings are involved — the module is pure.
+    /// Drives the `ResourceGovernor` state machine with a controllable clock and
+    /// synthetic samples. Pins the tiers: normal transcription load never stops,
+    /// thermal `.serious` degrades, `.critical` stops, and Tier-2 needs runaway
+    /// load held for minutes. Also pins the settings migration.
+    @MainActor
     static func runResourceGovernorSuite() async {
         await suite("ResourceGovernor") {
-            let config = ResourceGovernorConfig.default
+            var cfg = ResourceGovernorConfig.default
+            cfg.coreCount = 8   // Mac mini class: Tier-2 CPU = 720%
+            let config = cfg
 
             func nominal(cpu: Double = 10, mem: UInt64 = 200_000_000,
                          thermal: ProcessInfo.ThermalState = .nominal) -> ResourceSample {
                 ResourceSample(cpuPercent: cpu, memoryBytes: mem, thermalState: thermal)
             }
 
-            // Below every threshold → .ok.
+            // Normal meeting: ~1.5 cores of transcription for an hour, 1.2 GB memory.
             do {
                 let gov = ResourceGovernor(config: config)
-                await expect(gov.evaluate(nominal(), at: 0) == .ok,
-                             "below-threshold sample is .ok")
-                await expect(gov.evaluate(nominal(cpu: 65), at: 1) == .ok,
-                             "CPU under threshold stays .ok")
+                var stopped = false
+                var t = 0.0
+                while t <= 3600 {
+                    if gov.evaluate(nominal(cpu: 150, mem: 1_200_000_000), at: t) != .ok { stopped = true }
+                    t += 0.75
+                }
+                await expect(!stopped, "an hour of normal transcription load never trips anything")
             }
 
-            // CPU over threshold but not yet sustained → .ok; sustained → .tier1Pause.
+            // CPU over Tier-1 but not sustained → .ok; sustained → .tier1Pause.
             do {
                 let gov = ResourceGovernor(config: config)
-                await expect(gov.evaluate(nominal(cpu: 85), at: 0) == .ok,
-                             "CPU over threshold but t=0 is not yet sustained → .ok")
-                await expect(gov.evaluate(nominal(cpu: 85), at: 10) == .ok,
-                             "still within the sustain window → .ok")
-                await expect(gov.evaluate(nominal(cpu: 85), at: config.cpuSustainSeconds) == .tier1Pause,
+                await expect(gov.evaluate(nominal(cpu: 300), at: 0) == .ok, "CPU over threshold at t=0 is not yet sustained")
+                await expect(gov.evaluate(nominal(cpu: 300), at: 10) == .ok, "still within the sustain window")
+                await expect(gov.evaluate(nominal(cpu: 300), at: config.cpuSustainSeconds) == .tier1Pause,
                              "CPU sustained past the window → .tier1Pause")
+                await expect(gov.trigger == .cpu, "Tier-1 from CPU reports the CPU trigger")
             }
 
-            // A dip below threshold resets the sustain clock — no accumulation.
+            // A real dip resets the sustain clock.
             do {
                 let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(cpu: 85), at: 0)
-                await expect(gov.evaluate(nominal(cpu: 50), at: 10) == .ok,
-                             "CPU drops mid-window → clock resets")
-                await expect(gov.evaluate(nominal(cpu: 85), at: 25) == .ok,
-                             "re-crossing restarts the sustain window from scratch")
-                await expect(gov.evaluate(nominal(cpu: 85), at: 25 + config.cpuSustainSeconds) == .tier1Pause,
-                             "sustained again from the restart point → .tier1Pause")
+                _ = gov.evaluate(nominal(cpu: 300), at: 0)
+                _ = gov.evaluate(nominal(cpu: 50), at: 10)
+                await expect(gov.evaluate(nominal(cpu: 300), at: 25) == .ok, "re-crossing restarts the sustain window")
+                await expect(gov.evaluate(nominal(cpu: 300), at: 25 + config.cpuSustainSeconds) == .tier1Pause,
+                             "sustained again from the restart point")
             }
 
-            // Memory over cap → .tier1Pause immediately (no sustain requirement).
+            // Memory over cap → Tier-1 immediately, with the memory trigger.
             do {
                 let gov = ResourceGovernor(config: config)
                 await expect(gov.evaluate(nominal(mem: config.memoryTier1Bytes + 1), at: 0) == .tier1Pause,
                              "memory over cap engages Tier-1 immediately")
+                await expect(gov.trigger == .memory, "memory trigger is reported")
             }
 
-            // Thermal .serious → .tier2Stop (and .critical likewise), from normal.
+            // Thermal: serious degrades (no instant stop), critical stops.
             do {
                 let gov = ResourceGovernor(config: config)
-                await expect(gov.evaluate(nominal(thermal: .serious), at: 0) == .tier2Stop,
-                             "thermal .serious short-circuits to .tier2Stop")
+                await expect(gov.evaluate(nominal(thermal: .serious), at: 0) == .tier1Pause,
+                             "thermal .serious only pauses, it does not stop")
+                await expect(gov.trigger == .thermal, "thermal trigger is reported")
+                await expect(gov.evaluate(nominal(thermal: .serious), at: 120) == .tier1Pause,
+                             "a couple of minutes of .serious still doesn't stop")
+                await expect(gov.evaluate(nominal(thermal: .serious), at: config.thermalSeriousStopSeconds) == .tier2Stop,
+                             "very long .serious finally stops")
                 let gov2 = ResourceGovernor(config: config)
                 await expect(gov2.evaluate(nominal(thermal: .critical), at: 0) == .tier2Stop,
-                             "thermal .critical short-circuits to .tier2Stop")
+                             "thermal .critical stops immediately")
+                await expect(gov2.trigger == .thermal, "critical reports the thermal trigger")
             }
 
-            // Load still high 15s after Tier-1 → .tier2Stop.
+            // Transient .serious that clears: back to normal after the recovery window.
             do {
                 let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(cpu: 85), at: 0)
-                let t1 = config.cpuSustainSeconds
-                await expect(gov.evaluate(nominal(cpu: 85), at: t1) == .tier1Pause,
-                             "enters Tier-1 once sustained")
-                await expect(gov.evaluate(nominal(cpu: 85), at: t1 + 5) == .tier1Pause,
-                             "still within escalation window → remains .tier1Pause")
-                await expect(gov.evaluate(nominal(cpu: 85), at: t1 + config.tier2EscalationSeconds) == .tier2Stop,
-                             "load high through the escalation window → .tier2Stop")
+                _ = gov.evaluate(nominal(thermal: .serious), at: 0)
+                _ = gov.evaluate(nominal(), at: 1)
+                await expect(gov.evaluate(nominal(), at: 1 + config.recoverySeconds) == .ok,
+                             "transient .serious recovers to .ok")
             }
 
-            // Load recovering after Tier-1 → back to .ok, but only after the
-            // recovery sustain (hysteresis): a single calm sample must NOT
-            // release the tier, or load oscillating around the threshold flaps
-            // Tier-1 on/off and cancels in-flight AI completions each time.
+            // Tier-2 CPU: needs load beyond 90% of all cores for the long window.
             do {
                 let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(cpu: 85), at: 0)
+                _ = gov.evaluate(nominal(cpu: 300), at: 0)
+                _ = gov.evaluate(nominal(cpu: 300), at: config.cpuSustainSeconds)
+                let t0 = config.cpuSustainSeconds
+                await expect(gov.evaluate(nominal(cpu: 600), at: t0 + 120) == .tier1Pause,
+                             "heavy but below the all-cores level never escalates")
+                let runaway = config.cpuTier2Percent + 10
+                let start = t0 + 200
+                _ = gov.evaluate(nominal(cpu: runaway), at: start)
+                await expect(gov.evaluate(nominal(cpu: runaway), at: start + 60) == .tier1Pause,
+                             "runaway CPU for one minute does not stop")
+                await expect(gov.evaluate(nominal(cpu: runaway), at: start + config.cpuTier2SustainSeconds) == .tier2Stop,
+                             "runaway CPU held for minutes stops")
+                await expect(gov.trigger == .cpu, "CPU Tier-2 reports the CPU trigger")
+            }
+
+            // Tier-2 CPU scales with core count.
+            do {
+                var small = config
+                small.coreCount = 4
+                await expect(small.cpuTier2Percent < config.cpuTier2Percent, "fewer cores → lower Tier-2 CPU level")
+                await expect(config.cpuTier2Percent == 720, "8 cores at 90% → 720%")
+                var two = config
+                two.coreCount = 2
+                await expect(two.cpuTier2Percent >= two.cpuTier1Percent * 1.5, "2 cores: Tier-2 CPU stays well above Tier-1")
+                var high = config
+                high.cpuTier1Percent = 800
+                await expect(high.cpuTier2Percent == 1200, "a high Tier-1 setting pulls Tier-2 up with it")
+            }
+
+            // Tier-2 memory: double the cap, held for the window.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(mem: config.memoryTier1Bytes + 1), at: 0)
+                await expect(gov.evaluate(nominal(mem: config.memoryTier1Bytes + 1), at: 600) == .tier1Pause,
+                             "memory over the cap but under 2x never stops")
+                let huge = config.memoryTier2Bytes + 1
+                _ = gov.evaluate(nominal(mem: huge), at: 700)
+                await expect(gov.evaluate(nominal(mem: huge), at: 700 + config.memoryTier2SustainSeconds) == .tier2Stop,
+                             "runaway memory held for the window stops")
+                await expect(gov.trigger == .memory, "memory Tier-2 reports the memory trigger")
+            }
+
+            // Recovery hysteresis and middle band.
+            do {
+                let gov = ResourceGovernor(config: config)
+                _ = gov.evaluate(nominal(cpu: 300), at: 0)
                 let t1 = config.cpuSustainSeconds
-                await expect(gov.evaluate(nominal(cpu: 85), at: t1) == .tier1Pause,
-                             "enters Tier-1 once sustained")
-                await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5) == .tier1Pause,
-                             "first calm sample holds Tier-1 (recovery sustain running)")
+                _ = gov.evaluate(nominal(cpu: 300), at: t1)
+                await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5) == .tier1Pause, "first calm sample holds Tier-1")
                 await expect(gov.evaluate(nominal(cpu: 40), at: t1 + 5 + config.recoverySeconds) == .ok,
-                             "calm through the recovery window → back to .ok")
-                await expect(gov.tier == .normal, "recovery returns the governor to .normal")
+                             "calm through the recovery window → .ok")
+                await expect(gov.tier == .normal && gov.trigger == nil, "recovery returns to .normal")
+
+                let gov2 = ResourceGovernor(config: config)
+                _ = gov2.evaluate(nominal(cpu: 300), at: 0)
+                _ = gov2.evaluate(nominal(cpu: 300), at: t1)
+                let mid = (config.cpuReleasePercent + config.cpuTier1Percent) / 2
+                await expect(gov2.evaluate(nominal(cpu: mid), at: t1 + 500) == .tier1Pause,
+                             "middle-band load holds Tier-1")
             }
 
-            // Middle band (release < cpu ≤ engage) holds Tier-1: neither
-            // releases nor escalates.
+            // Spiky-but-high load still counts as sustained.
             do {
                 let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(cpu: 85), at: 0)
-                let t1 = config.cpuSustainSeconds
-                _ = gov.evaluate(nominal(cpu: 85), at: t1)
-                await expect(gov.evaluate(nominal(cpu: 65), at: t1 + config.tier2EscalationSeconds + 10) == .tier1Pause,
-                             "middle-band load holds Tier-1 without escalating to Tier-2")
-                await expect(gov.tier == .tier1, "middle band keeps the governor in .tier1")
-            }
-
-            // Spiky-but-high load: brief dips within the tolerance must not
-            // reset the sustain run — previously a single 750 ms dip restarted
-            // the 20 s clock and the valve never engaged under real spiky load.
-            do {
-                let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(cpu: 85), at: 0)
-                _ = gov.evaluate(nominal(cpu: 85), at: 9)
-                _ = gov.evaluate(nominal(cpu: 60), at: 9.75)   // one 750 ms dip
-                _ = gov.evaluate(nominal(cpu: 85), at: 10.5)
-                await expect(gov.evaluate(nominal(cpu: 85), at: config.cpuSustainSeconds) == .tier1Pause,
+                _ = gov.evaluate(nominal(cpu: 300), at: 0)
+                _ = gov.evaluate(nominal(cpu: 300), at: 19)
+                _ = gov.evaluate(nominal(cpu: 100), at: 19.75)
+                _ = gov.evaluate(nominal(cpu: 300), at: 20.5)
+                await expect(gov.evaluate(nominal(cpu: 300), at: config.cpuSustainSeconds) == .tier1Pause,
                              "sub-tolerance dips don't reset the sustain clock")
             }
 
             // Tier-2 is terminal until reset().
             do {
                 let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(thermal: .serious), at: 0)
-                await expect(gov.evaluate(nominal(), at: 1) == .tier2Stop,
-                             "stays stopped after Tier-2 even on a clean sample")
+                _ = gov.evaluate(nominal(thermal: .critical), at: 0)
+                await expect(gov.evaluate(nominal(), at: 1) == .tier2Stop, "stays stopped after Tier-2")
                 gov.reset()
-                await expect(gov.evaluate(nominal(), at: 2) == .ok,
-                             "reset() clears Tier-2 back to .ok")
+                await expect(gov.evaluate(nominal(), at: 2) == .ok, "reset() clears Tier-2")
+            }
+
+            // Settings: old keys are ignored, new keys persist.
+            do {
+                let defaults = UserDefaults(suiteName: "gov-migration-\(UUID().uuidString)")!
+                defaults.set(70.0, forKey: "performance.safetyValveCPUPercent")
+                defaults.set(1500, forKey: "performance.safetyValveMemoryMB")
+                let store = SettingsStore(defaults: defaults)
+                await expect(store.safetyValveCPUPercent == ResourceGovernorConfig.defaultCPUTier1Percent,
+                             "old persisted 70% CPU is ignored")
+                await expect(store.safetyValveMemoryMB == 3000, "old persisted 1500 MB is ignored")
+                await expect(store.resourceGovernorConfig.cpuTier1Percent == 200, "config uses the new CPU default")
+
+                store.safetyValveMemoryMB = 2000
+                store.safetyValveCPUPercent = 400
+                let reopened = SettingsStore(defaults: defaults)
+                await expect(reopened.safetyValveMemoryMB == 2000, "a deliberate low memory value survives a restart")
+                await expect(reopened.safetyValveCPUPercent == 400, "a chosen CPU value survives a restart")
+                await expect(reopened.resourceGovernorConfig.cpuReleasePercent == 400 * 0.85,
+                             "release level follows the stored CPU setting")
             }
         }
     }

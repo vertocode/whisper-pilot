@@ -11,7 +11,7 @@ Durable decisions that apply across all phases:
 - **`ResourceSampler`**: injectable. Reads own-process CPU (`task_info`), resident memory, and `ProcessInfo.processInfo.thermalState`. Injected so tests feed synthetic samples. Polls ~1–2 Hz, only while listening.
 - **Wiring**: `AppCoordinator` owns sampler→governor; starts in `startListening`, tears down in `stopListening`. Maps decisions to actions.
 - **Alerts**: reuse existing `OverlayState.appendSystemNote` (inline system notes) + `ChatMessageAction` inline-button mechanism. New action case for mic-shed.
-- **Tier defaults** (tunable later): Tier-1 = CPU > ~70% sustained ~20s OR mem > ~1.5GB. Tier-2 = thermal >= `.serious`/`.critical` OR load still high ~15s after Tier-1.
+- **Tier defaults** (tunable later): Tier-1 = own-process CPU > 200% (two cores) sustained ~30s, OR mem > ~3 GB, OR thermal `.serious`. Tier-2 (stop) = thermal `.critical`, OR CPU > 90% of ALL cores for ~3 min, OR mem > 2x the cap for ~2 min, OR thermal `.serious` for ~10 min. (Revised after normal meetings were stopped by the old 70% / 1.5 GB / 15 s rules; on-device transcription alone can use more than one core.)
 - **Invariants**: monitor/valve active only while listening; Tier-1 never stops core transcription; explicit user AI actions always honored; Tier-2 routes through existing `stopListening` teardown.
 
 ---

@@ -45,8 +45,10 @@ final class SettingsStore: ObservableObject {
         static let translationColumnMode = "translation.columnMode"
         static let translationSourceWidthFraction = "translation.sourceWidthFraction"
         static let safetyValveEnabled = "performance.safetyValveEnabled"
-        static let safetyValveCPUPercent = "performance.safetyValveCPUPercent"
-        static let safetyValveMemoryMB = "performance.safetyValveMemoryMB"
+        // Old keys (CPU 70%, memory 1500 MB) are no longer read: those defaults
+        // stopped normal meetings, so everyone restarts from the new defaults.
+        static let safetyValveCPUPercent = "performance.safetyValveCPUPercentV2"
+        static let safetyValveMemoryMB = "performance.safetyValveMemoryMBV2"
         static let alwaysTranscribeMic = "performance.alwaysTranscribeMic"
         static let onboardingCompletedVersion = "onboarding.completedVersion"
         static let setupDeferredBuild = "onboarding.setupDeferredBuild"
@@ -456,6 +458,7 @@ final class SettingsStore: ObservableObject {
     var resourceGovernorConfig: ResourceGovernorConfig {
         var config = ResourceGovernorConfig.default
         config.cpuTier1Percent = safetyValveCPUPercent
+        config.cpuReleasePercent = safetyValveCPUPercent * 0.85
         config.memoryTier1Bytes = UInt64(max(0, safetyValveMemoryMB)) * 1_000_000
         return config
     }
@@ -859,8 +862,10 @@ final class SettingsStore: ObservableObject {
                 ?? Double(TranslationLayout.defaultSourceWidthFraction)
         )
         self.safetyValveEnabled = defaults.object(forKey: Keys.safetyValveEnabled) as? Bool ?? true
-        self.safetyValveCPUPercent = defaults.object(forKey: Keys.safetyValveCPUPercent) as? Double ?? 70
-        self.safetyValveMemoryMB = defaults.object(forKey: Keys.safetyValveMemoryMB) as? Int ?? 1500
+        self.safetyValveCPUPercent = defaults.object(forKey: Keys.safetyValveCPUPercent) as? Double
+            ?? ResourceGovernorConfig.defaultCPUTier1Percent
+        self.safetyValveMemoryMB = defaults.object(forKey: Keys.safetyValveMemoryMB) as? Int
+            ?? ResourceGovernorConfig.defaultMemoryTier1MB
         self.alwaysTranscribeMic = defaults.object(forKey: Keys.alwaysTranscribeMic) as? Bool ?? true
         restoreKeychainAccess()
     }
