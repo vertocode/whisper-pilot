@@ -52,6 +52,7 @@ struct SmokeTestRunner {
         await runParakeetIntegrationSuite()
         await runQuestionEvalSuite()
         await runChatScrollSuite()
+        await runTranscriptHistoryCapSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
@@ -417,6 +418,16 @@ struct SmokeTestRunner {
                          "an answer with no question above scrolls to itself")
             let note = msg(.system)
             await expect(ChatScroll.target(in: [question, answer, note]) == note.id, "a system note scrolls to itself")
+        }
+    }
+
+    static func runTranscriptHistoryCapSuite() async {
+        await suite("TranscriptHistoryCap") {
+            await expect(TranscriptHistoryCap.capped([1, 2, 3], limit: 5) == [1, 2, 3], "under the limit stays whole")
+            await expect(TranscriptHistoryCap.capped([1, 2, 3, 4, 5], limit: 3) == [3, 4, 5], "over the limit keeps the newest")
+            await expect(TranscriptHistoryCap.capped([Int](), limit: 3).isEmpty, "empty stays empty")
+            await expect(TranscriptHistoryCap.capped([1, 2], limit: 0).isEmpty, "zero limit keeps nothing")
+            await expect(TranscriptHistoryCap.capped(Array(1...2_500)).count == TranscriptHistoryCap.limit, "default limit applies")
         }
     }
 

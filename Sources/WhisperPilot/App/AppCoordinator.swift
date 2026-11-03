@@ -1558,7 +1558,7 @@ final class AppCoordinator {
             let messages = await SessionStore.shared.loadChatMessages(session.id)
             // Saved lines go to the history list: the live list is replaced by the
             // buffer on every update, which would wipe them as soon as anyone spoke.
-            overlayState.transcriptHistory = segments
+            overlayState.transcriptHistory = TranscriptHistoryCap.capped(segments)
             overlayState.messages = messages
             // Strip persisted translation lines before the model sees this.
             // `seedFromMarkdown` assigns the raw blob straight into the prompt
@@ -2545,7 +2545,9 @@ final class AppCoordinator {
                 if update.isFinal || now - lastTranscriptUIPublish >= .milliseconds(250) {
                     let snapshot = await buffer.snapshot()
                     let evicted = await buffer.takeEvicted()
-                    if !evicted.isEmpty { self?.overlayState.transcriptHistory.append(contentsOf: evicted) }
+                    if !evicted.isEmpty, let state = self?.overlayState {
+                        state.transcriptHistory = TranscriptHistoryCap.capped(state.transcriptHistory + evicted)
+                    }
                     self?.overlayState.transcript = snapshot
                     lastTranscriptUIPublish = now
                     // Feed the same snapshot to the translation queue. Diffing
