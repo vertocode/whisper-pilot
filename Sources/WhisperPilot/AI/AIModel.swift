@@ -55,9 +55,8 @@ enum AIModelRegistry {
         // Gemini — order is cheap-first so the auto-fallback on 404 lands on
         // the closest-equivalent option (see `AppCoordinator.aiFallbackChain`).
         AIModel(id: "gemini-2.5-flash",       vendor: .gemini,    displayName: "Gemini 2.5 Flash",       tagline: "fast, recommended default"),
-        AIModel(id: "gemini-2.0-flash-lite",  vendor: .gemini,    displayName: "Gemini 2.0 Flash Lite",  tagline: "cheapest, lowest latency"),
+        AIModel(id: "gemini-2.5-flash-lite",  vendor: .gemini,    displayName: "Gemini 2.5 Flash Lite",  tagline: "cheapest, lowest latency"),
         AIModel(id: "gemini-2.5-pro",         vendor: .gemini,    displayName: "Gemini 2.5 Pro",         tagline: "highest quality, slower"),
-        AIModel(id: "gemini-2.0-flash",       vendor: .gemini,    displayName: "Gemini 2.0 Flash",       tagline: "legacy"),
         // Claude — most-capable last so the picker reads cheap → expensive.
         AIModel(id: "claude-haiku-5-5",       vendor: .anthropic, displayName: "Claude Haiku 5.5",       tagline: "fast, cheapest Claude"),
         AIModel(id: "claude-sonnet-5-5",      vendor: .anthropic, displayName: "Claude Sonnet 5.5",      tagline: "balanced, recommended default"),
@@ -67,6 +66,8 @@ enum AIModelRegistry {
 
     /// Older ids that stay valid for a saved selection or a resumed session, but are no longer offered.
     static let retired: [AIModel] = [
+        AIModel(id: "gemini-2.0-flash",       vendor: .gemini,    displayName: "Gemini 2.0 Flash",       tagline: nil),
+        AIModel(id: "gemini-2.0-flash-lite",  vendor: .gemini,    displayName: "Gemini 2.0 Flash Lite",  tagline: nil),
         AIModel(id: "claude-haiku-4-5",       vendor: .anthropic, displayName: "Claude Haiku 4.5",       tagline: nil),
         AIModel(id: "claude-sonnet-4-6",      vendor: .anthropic, displayName: "Claude Sonnet 4.6",      tagline: nil),
         AIModel(id: "claude-opus-4-7",        vendor: .anthropic, displayName: "Claude Opus 4.7",        tagline: nil),

@@ -132,6 +132,9 @@ extension SmokeTestRunner {
             await expect(AIModelRegistry.model(for: "claude-sonnet-5-5", catalog: store) != nil, "built-in ids still resolve")
             await expect(AIModelRegistry.model(for: "claude-sonnet-4-6", catalog: store) != nil, "retired ids still resolve for saved selections")
             await expect(AIModelRegistry.model(for: "nonsense", catalog: store) == nil, "unknown ids do not")
+            let builtInGemini = AIModelRegistry.staticModels(for: .gemini).map(\.id)
+            await expect(!builtInGemini.contains { $0.hasPrefix("gemini-2.0") }, "built-in Gemini list has no retired 2.0 ids")
+            await expect(AIModelRegistry.model(for: "gemini-2.0-flash", catalog: store) != nil, "retired Gemini ids still resolve for saved selections")
 
             await expect(!store.isStale(.anthropic), "fresh right after saving")
             clock.now = clock.now.addingTimeInterval(3_599)

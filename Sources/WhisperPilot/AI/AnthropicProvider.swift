@@ -212,8 +212,16 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         return decoded.firstText ?? ""
     }
 
+    private static let messagesURL: URL = {
+        var c = URLComponents()
+        c.scheme = "https"
+        c.host = "api.anthropic.com"
+        c.path = "/v1/messages"
+        return c.url ?? URL(fileURLWithPath: "/")
+    }()
+
     private func makeRequest(body: Data) -> URLRequest {
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        var request = URLRequest(url: Self.messagesURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")

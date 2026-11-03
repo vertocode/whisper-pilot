@@ -548,8 +548,10 @@ struct OnboardingView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Link("Get a \(selectedVendor.displayName) key", destination: providerKeyURL)
-                        .font(.system(size: 11, weight: .medium))
+                    if let keyURL = providerKeyURL {
+                        Link("Get a \(selectedVendor.displayName) key", destination: keyURL)
+                            .font(.system(size: 11, weight: .medium))
+                    }
                 }
                 if let warning = keyFormatWarning {
                     Label(warning, systemImage: "info.circle.fill")
@@ -580,12 +582,12 @@ struct OnboardingView: View {
     }
 
 
-    private var providerKeyURL: URL {
+    private var providerKeyURL: URL? {
         switch selectedVendor {
         case .gemini:
-            return URL(string: "https://aistudio.google.com/app/apikey")!
+            return URL(string: "https://aistudio.google.com/app/apikey")
         case .anthropic:
-            return URL(string: "https://console.anthropic.com/settings/keys")!
+            return URL(string: "https://console.anthropic.com/settings/keys")
         }
     }
 

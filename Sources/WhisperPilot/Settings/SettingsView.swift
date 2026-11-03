@@ -241,7 +241,7 @@ struct SettingsView: View {
                     },
                     onRemove: { store.geminiAPIKey = nil }
                 )
-                FormHint("`gemini-2.0-flash` was retired for new Google AI Studio keys. If the selected model returns a 404, Whisper Pilot auto-switches to a working one and retries.")
+                FormHint("`gemini-2.0-flash` and `gemini-2.0-flash-lite` were retired for new Google AI Studio keys. If the selected model returns a 404, Whisper Pilot auto-switches to a working one and retries.")
             }
 
             Section("Claude (Anthropic)") {
@@ -415,13 +415,15 @@ struct SettingsView: View {
 
             Spacer()
 
-            Link(destination: URL(string: vendorDocsURL)!) {
-                HStack(spacing: 4) {
-                    Text("Get a key")
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.system(size: 10))
+            if let docsURL = URL(string: vendorDocsURL) {
+                Link(destination: docsURL) {
+                    HStack(spacing: 4) {
+                        Text("Get a key")
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.system(size: 10))
+                    }
+                    .font(.system(size: 12))
                 }
-                .font(.system(size: 12))
             }
         }
     }

@@ -16,10 +16,14 @@ struct SupportLink: View {
 
     let style: Style
 
-    private static let url = URL(string: "https://vertocode.com/coffee")!
+    private static let url = URL(string: "https://vertocode.com/coffee")
 
     var body: some View {
-        Link(destination: Self.url) {
+        if let url = Self.url { link(url) }
+    }
+
+    private func link(_ url: URL) -> some View {
+        Link(destination: url) {
             HStack(spacing: 4) {
                 Text("☕")
                     .font(.system(size: 11))

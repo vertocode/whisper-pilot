@@ -66,7 +66,7 @@ final class AppCoordinator {
     /// Order is cheap-first so the auto-migration lands on the closest-equivalent option.
     private static let aiFallbackChain: [String] = [
         "gemini-2.5-flash",
-        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash-lite",
         "gemini-2.5-pro",
     ]
 
@@ -1876,8 +1876,8 @@ final class AppCoordinator {
             // If the configured monitor was disconnected, fall back to the first
             // available display so capture still produces *something*.
             let targetID = resolvedCaptureDisplayID()
-            let display = content.displays.first(where: { $0.displayID == targetID })
-                ?? content.displays.first!
+            guard let display = content.displays.first(where: { $0.displayID == targetID })
+                ?? content.displays.first else { return .failed }
             if settings.screenCaptureDisplayID != 0, display.displayID != settings.screenCaptureDisplayID {
                 wpWarn("Screen capture: configured monitor (id=\(settings.screenCaptureDisplayID)) not connected — using display id=\(display.displayID) instead")
             }
