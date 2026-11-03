@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var store: SettingsStore
+    @ObservedObject private var catalog = AIModelCatalog.shared
     /// Invoked when the translation enable toggle or target changes, so a live
     /// session can react without a restart. Defaulted so previews and any
     /// non-app construction site stay simple.
@@ -43,8 +44,12 @@ struct SettingsView: View {
             loadKeyDrafts()
             inputDevices = MicrophoneCapture.listInputDevices()
             screens = ScreenEnumerator.connectedScreens()
+            for vendor in AIVendor.allCases { refreshModels(vendor, force: false) }
         }
-        .onChange(of: store.keychainAccess) { _, _ in loadKeyDrafts() }
+        .onChange(of: store.keychainAccess) { _, _ in
+            loadKeyDrafts()
+            for vendor in AIVendor.allCases { refreshModels(vendor, force: false) }
+        }
     }
 
     /// Reads the in-memory copy only. Opening Settings must never make macOS
@@ -209,6 +214,7 @@ struct SettingsView: View {
         Form {
             Section("Active model") {
                 modelPicker
+                modelRefreshRow
                 if let warning = activeModelKeyWarning {
                     HStack(alignment: .top, spacing: WP.Space.xs) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -229,7 +235,10 @@ struct SettingsView: View {
                     saved: $geminiAPIKeySaved,
                     vendorDocsURL: "https://aistudio.google.com/app/apikey",
                     isSaved: { store.hasGeminiAPIKey },
-                    onSave: { store.geminiAPIKey = geminiAPIKeyDraft },
+                    onSave: {
+                        store.geminiAPIKey = geminiAPIKeyDraft
+                        refreshModels(.gemini, force: true)
+                    },
                     onRemove: { store.geminiAPIKey = nil }
                 )
                 FormHint("`gemini-2.0-flash` was retired for new Google AI Studio keys. If the selected model returns a 404, Whisper Pilot auto-switches to a working one and retries.")
@@ -241,7 +250,10 @@ struct SettingsView: View {
                     saved: $anthropicAPIKeySaved,
                     vendorDocsURL: "https://console.anthropic.com/settings/keys",
                     isSaved: { store.hasAnthropicAPIKey },
-                    onSave: { store.anthropicAPIKey = anthropicAPIKeyDraft },
+                    onSave: {
+                        store.anthropicAPIKey = anthropicAPIKeyDraft
+                        refreshModels(.anthropic, force: true)
+                    },
                     onRemove: { store.anthropicAPIKey = nil }
                 )
                 FormHint("Use a Claude API key from console.anthropic.com. The Claude models above only appear in the Active model picker when this key is set.")
@@ -297,10 +309,55 @@ struct SettingsView: View {
         Picker("Model", selection: $store.activeModel) {
             ForEach(AIVendor.allCases, id: \.self) { vendor in
                 let isAvailable = vendors.contains(vendor)
-                ForEach(AIModelRegistry.models(for: vendor)) { model in
+                ForEach(pickerModels(for: vendor)) { model in
                     Text(rowLabel(for: model, vendorAvailable: isAvailable))
                         .tag(model.id)
                 }
+            }
+        }
+    }
+
+    /// The vendor's models, plus the selected one if the fetched list no longer has it, so the
+    /// picker never shows an empty selection.
+    private func pickerModels(for vendor: AIVendor) -> [AIModel] {
+        _ = catalog.revision
+        var models = AIModelRegistry.models(for: vendor)
+        if let active = AIModelRegistry.model(for: store.activeModel),
+           active.vendor == vendor, !models.contains(where: { $0.id == active.id }) {
+            models.append(active)
+        }
+        return models
+    }
+
+    private func refreshModels(_ vendor: AIVendor, force: Bool) {
+        let key = vendor == .gemini ? store.geminiAPIKey : store.anthropicAPIKey
+        Task { await catalog.refresh(vendor, apiKey: key, force: force) }
+    }
+
+    /// Refresh button and the state of the last fetch, shown under the model picker.
+    @ViewBuilder
+    private var modelRefreshRow: some View {
+        let vendors = AIVendor.allCases.filter { store.availableVendors.contains($0) }
+        HStack(spacing: WP.Space.sm) {
+            Button("Refresh models") {
+                for vendor in vendors { refreshModels(vendor, force: true) }
+            }
+            .disabled(vendors.isEmpty || !catalog.refreshing.isEmpty)
+            if !catalog.refreshing.isEmpty {
+                ProgressView().controlSize(.small)
+            }
+            Spacer()
+        }
+        ForEach(vendors, id: \.self) { vendor in
+            if let reason = catalog.lastError[vendor] {
+                Text("Couldn’t load the \(vendor.displayName) model list (\(reason)). Showing the saved or built-in list.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let updated = catalog.lastUpdated(vendor) {
+                Text("\(vendor.displayName) models updated \(updated.formatted(.relative(presentation: .named)))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
         }
     }

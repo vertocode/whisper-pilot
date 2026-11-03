@@ -1377,6 +1377,7 @@ private struct EmptyStatePill: View {
 /// "per-session" — switching mid-conversation should be a one-click action
 /// from the place they're already looking at.
 private struct ModelSelector: View {
+    @ObservedObject private var catalog = AIModelCatalog.shared
     let activeModel: String
     let availableVendors: Set<AIVendor>
     let onSelect: (String) -> Void
@@ -1385,6 +1386,7 @@ private struct ModelSelector: View {
         Menu {
             ForEach(AIVendor.allCases, id: \.self) { vendor in
                 let models = AIModelRegistry.models(for: vendor)
+                let _ = catalog.revision
                 if !models.isEmpty {
                     Section(vendor.displayName) {
                         ForEach(models) { model in

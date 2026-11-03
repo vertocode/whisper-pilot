@@ -148,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &settingsCancellables)
 
         coordinator.startHardCeilingMonitor()
+        Task { @MainActor [coordinator] in await coordinator.refreshModelListsIfStale() }
 
         let vm = SessionsViewModel(projects: coordinator.projects)
         vm.onStartNew = { [weak self] meta in self?.openSession(meta, resumed: false) }

@@ -389,6 +389,15 @@ final class AppCoordinator {
 
     private var hardCeilingMonitor: HardCeilingMonitor?
 
+    /// Refreshes the provider model lists once their saved copy is a day old. Needs the API keys
+    /// in memory, so a vendor whose key is still locked in the Keychain is skipped until Settings opens.
+    func refreshModelListsIfStale() async {
+        await AIModelCatalog.shared.refreshIfStale(keys: [
+            .gemini: settings.geminiAPIKey,
+            .anthropic: settings.anthropicAPIKey
+        ])
+    }
+
     /// Starts the last-resort watchdog. It runs for the whole life of the app, whether or not
     /// anything is listening, and does not depend on the Settings switch for the soft valve.
     func startHardCeilingMonitor() {
