@@ -456,8 +456,11 @@ actor SessionStore {
         guard (try? handle.seek(toOffset: start)) != nil,
               let data = try? handle.readToEnd() else { return "" }
         var text = String(decoding: data, as: UTF8.self)
-        if start > 0, let newline = text.firstIndex(of: "\n") {
-            text = String(text[text.index(after: newline)...])
+        if start > 0 {
+            // The cut usually lands mid-line. Resume at the next speaker line, so the text
+            // never opens with half a sentence, a blank line, or a translation line.
+            guard let line = text.range(of: "\n**") else { return "" }
+            text = String(text[text.index(after: line.lowerBound)...])
         }
         return text
     }
