@@ -183,7 +183,9 @@ final class PermissionsManager: ObservableObject {
         case .speechRecognition: pane = "Privacy_SpeechRecognition"
         case .systemAudio: pane = "Privacy_AudioCapture"
         }
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") {
+            NSWorkspace.shared.open(url)
+        }
         // These two lists only show apps that already asked, so offer a way to add ours.
         if kind == .screenRecording || kind == .systemAudio {
             SettingsDragHelper.shared.show(

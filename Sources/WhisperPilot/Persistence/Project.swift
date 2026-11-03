@@ -111,7 +111,11 @@ actor ProjectStorage {
         // Unreadable file: keep a copy before a later save replaces it.
         let stamp = Int(Date().timeIntervalSince1970)
         let copy = directory.appendingPathComponent("projects.unreadable-\(stamp).json")
-        try? data.write(to: copy, options: .atomic)
+        do {
+            try data.write(to: copy, options: .atomic)
+        } catch {
+            log.error("Could not save a copy of the unreadable projects.json: \(error.localizedDescription, privacy: .public)")
+        }
         log.error("projects.json could not be read; saved a copy as \(copy.lastPathComponent, privacy: .public)")
         return []
     }

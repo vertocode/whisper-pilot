@@ -2196,7 +2196,7 @@ final class AppCoordinator {
         let recognitionErrors = newEntries
             .filter { $0.level == .error && $0.message.contains("recognition error") }
             .map { $0.message }
-        let errorTail = recognitionErrors.isEmpty ? "no recognizer errors logged" : "last error: \(recognitionErrors.last!)"
+        let errorTail = recognitionErrors.isEmpty ? "no recognizer errors logged" : "last error: \(recognitionErrors.last ?? "")"
 
         overlayState.appendSystemNote("""
         ❌ Self-test failed: recognizer received \(buffersFed) synthesized buffers (avg RMS=\(String(format: "%.4f", avgRMS))) but produced no transcripts. \

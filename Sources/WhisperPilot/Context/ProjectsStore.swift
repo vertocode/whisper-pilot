@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 
 /// In-memory list of projects for the UI and the prompt builder, saved to disk through
 /// `ProjectStorage`. Edits to instructions and files save on a short debounce, like
@@ -111,7 +112,12 @@ final class ProjectsStore: ObservableObject {
         let previous = saveChain
         saveChain = Task {
             await previous?.value
-            try? await storage.save(snapshot)
+            do {
+                try await storage.save(snapshot)
+            } catch {
+                Logger(subsystem: "com.whisperpilot.app", category: "ProjectsStore")
+                    .error("Saving projects.json failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
