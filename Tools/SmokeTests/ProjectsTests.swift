@@ -388,3 +388,56 @@ extension SmokeTestRunner {
         }
     }
 }
+
+extension SmokeTestRunner {
+    static func runProjectDeletionSuite() async {
+        await suite("Projects: deleting a project, with and without its sessions") {
+            for deleteSessions in [false, true] {
+                let root = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+                defer { try? FileManager.default.removeItem(at: root) }
+                let sessionsDir = root.appendingPathComponent("sessions", isDirectory: true)
+                let store = SessionStore(baseURL: sessionsDir)
+                let storage = ProjectStorage(directory: root, sessionsDirectory: sessionsDir)
+                let label = deleteSessions ? "checked" : "unchecked"
+                do {
+                    let projects = await ProjectsStore(storage: storage)
+                    let doomed = await projects.create(name: "Doomed")
+                    let other = await projects.create(name: "Other")
+                    guard let doomedID = doomed?.id, let otherID = other?.id else {
+                        await expect(false, "projects were created (\(label))")
+                        continue
+                    }
+                    let inside1 = try await store.createSession(name: "Inside one", projectID: doomedID)
+                    let inside2 = try await store.createSession(name: "Inside two", projectID: doomedID)
+                    let elsewhere = try await store.createSession(name: "Elsewhere", projectID: otherID)
+                    let loose = try await store.createSession(name: "Loose")
+
+                    let vm = await SessionsViewModel(projects: projects, store: store)
+                    await vm.refresh()
+                    await vm.deleteProject(doomedID, deleteSessions: deleteSessions)
+
+                    let remaining = Dictionary(uniqueKeysWithValues: await store.listSessions().map { ($0.folderName, $0) })
+                    await expect(await projects.project(id: doomedID) == nil, "project is gone (\(label))")
+                    await expect(await projects.project(id: otherID) != nil, "other project untouched (\(label))")
+                    await expect(remaining[elsewhere.folderName]?.projectID == otherID, "other project's session untouched (\(label))")
+                    await expect(remaining[loose.folderName] != nil, "ungrouped session untouched (\(label))")
+                    if deleteSessions {
+                        await expect(remaining[inside1.folderName] == nil && remaining[inside2.folderName] == nil,
+                                     "checked: the project's sessions are deleted")
+                    } else {
+                        await expect(remaining[inside1.folderName] != nil && remaining[inside2.folderName] != nil,
+                                     "unchecked: the project's sessions are kept")
+                        await expect(remaining[inside1.folderName]?.projectID == nil && remaining[inside2.folderName]?.projectID == nil,
+                                     "unchecked: kept sessions become unfiled")
+                    }
+                    await expect(await vm.errorMessage == nil, "no error shown (\(label))")
+                } catch {
+                    await expect(false, "deletion fixture threw (\(label)): \(error)")
+                }
+            }
+            await expect(await ProjectDeletionPrompt.checkboxTitle == "Also delete all sessions in this project",
+                         "the checkbox says what the task asked for")
+        }
+    }
+}

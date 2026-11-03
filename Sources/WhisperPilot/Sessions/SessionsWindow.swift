@@ -24,11 +24,13 @@ final class SessionsViewModel: ObservableObject {
     @Published private(set) var contentMatches: Set<String> = []
 
     let projects: ProjectsStore
+    private let store: SessionStore
     private var searchTask: Task<Void, Never>?
     private var projectsObserver: AnyCancellable?
 
-    init(projects: ProjectsStore) {
+    init(projects: ProjectsStore, store: SessionStore = .shared) {
         self.projects = projects
+        self.store = store
         // The window reads project names through this model, so a project change
         // must redraw it too.
         projectsObserver = projects.objectWillChange.sink { [weak self] _ in
@@ -52,7 +54,7 @@ final class SessionsViewModel: ObservableObject {
     func refresh() async {
         isLoading = true
         defer { isLoading = false }
-        sessions = await SessionStore.shared.listSessions()
+        sessions = await store.listSessions()
     }
 
     // MARK: - Grouping and search
@@ -102,7 +104,7 @@ final class SessionsViewModel: ObservableObject {
         searchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
-            let hits = await SessionStore.shared.sessionsMatchingContent(query)
+            let hits = await store.sessionsMatchingContent(query)
             guard !Task.isCancelled else { return }
             self?.contentMatches = hits
         }
@@ -114,7 +116,7 @@ final class SessionsViewModel: ObservableObject {
         do {
             let raw = name ?? newSessionName
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            let meta = try await SessionStore.shared.createSession(
+            let meta = try await store.createSession(
                 name: trimmed.isEmpty ? nil : trimmed,
                 projectID: projectID
             )
@@ -132,7 +134,7 @@ final class SessionsViewModel: ObservableObject {
 
     func delete(_ meta: SessionMeta) async {
         do {
-            try await SessionStore.shared.deleteSession(meta.id)
+            try await store.deleteSession(meta.id)
             if selection == .session(meta.id) { selection = .home }
             await refresh()
         } catch {
@@ -144,7 +146,7 @@ final class SessionsViewModel: ObservableObject {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != meta.displayName else { return }
         do {
-            if let updated = try await SessionStore.shared.renameSession(meta.id, to: trimmed) {
+            if let updated = try await store.renameSession(meta.id, to: trimmed) {
                 onSessionChanged?(updated)
             }
             await refresh()
@@ -154,7 +156,7 @@ final class SessionsViewModel: ObservableObject {
     }
 
     func openInFinder(_ meta: SessionMeta) async {
-        let url = await SessionStore.shared.sessionFolder(for: meta.id)
+        let url = await store.sessionFolder(for: meta.id)
         NSWorkspace.shared.open(url)
     }
 
@@ -162,7 +164,7 @@ final class SessionsViewModel: ObservableObject {
     func move(_ session: SessionMeta, to projectID: UUID?) async {
         guard session.projectID != projectID else { return }
         do {
-            if let updated = try await SessionStore.shared.setProject(projectID, for: session.id) {
+            if let updated = try await store.setProject(projectID, for: session.id) {
                 onSessionChanged?(updated)
             }
             if let projectID { expandedProjects.insert(projectID) }
@@ -194,16 +196,17 @@ final class SessionsViewModel: ObservableObject {
     /// is true (the caller has asked the user to confirm), in which case they go to the Trash.
     func deleteProject(_ id: UUID, deleteSessions: Bool) async {
         if deleteSessions {
+            await refresh()
             for member in sessions(in: id) {
                 do {
-                    try await SessionStore.shared.deleteSession(member.id)
+                    try await store.deleteSession(member.id)
                 } catch {
                     errorMessage = "Couldn’t move \(member.displayName) to Trash: \(error.localizedDescription)"
                 }
             }
         }
         // Whatever is left (all of them when keeping sessions) becomes ungrouped.
-        await SessionStore.shared.clearProject(id)
+        await store.clearProject(id)
         projects.delete(id)
         expandedProjects.remove(id)
         if selection == .project(id) { selection = .home }
@@ -250,8 +253,6 @@ struct SessionsView: View {
     @State private var newProjectDraft: String = ""
     @State private var projectPendingRename: Project?
     @State private var projectRenameDraft: String = ""
-    @State private var projectPendingDeletion: Project?
-    @State private var projectPendingSessionDeletion: Project?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -326,46 +327,6 @@ struct SessionsView: View {
         } message: { _ in
             Text("Only the project name changes. Its sessions stay in it.")
         }
-        .alert(
-            "Delete project?",
-            isPresented: Binding(
-                get: { projectPendingDeletion != nil },
-                set: { if !$0 { projectPendingDeletion = nil } }
-            ),
-            presenting: projectPendingDeletion
-        ) { project in
-            let count = vm.sessions(in: project.id).count
-            Button("Delete project, keep sessions") {
-                Task { await vm.deleteProject(project.id, deleteSessions: false) }
-                projectPendingDeletion = nil
-            }
-            if count > 0 {
-                Button("Also delete \(count) session\(count == 1 ? "" : "s")…", role: .destructive) {
-                    projectPendingSessionDeletion = project
-                    projectPendingDeletion = nil
-                }
-            }
-            Button("Cancel", role: .cancel) { projectPendingDeletion = nil }
-        } message: { project in
-            Text("“\(project.name)” and its instructions and files will be removed. Its sessions are not deleted — they move back to your ungrouped sessions.")
-        }
-        .alert(
-            "Move sessions to Trash?",
-            isPresented: Binding(
-                get: { projectPendingSessionDeletion != nil },
-                set: { if !$0 { projectPendingSessionDeletion = nil } }
-            ),
-            presenting: projectPendingSessionDeletion
-        ) { project in
-            let count = vm.sessions(in: project.id).count
-            Button("Move \(count) session\(count == 1 ? "" : "s") to Trash", role: .destructive) {
-                Task { await vm.deleteProject(project.id, deleteSessions: true) }
-                projectPendingSessionDeletion = nil
-            }
-            Button("Cancel", role: .cancel) { projectPendingSessionDeletion = nil }
-        } message: { project in
-            Text("This deletes the project “\(project.name)” and moves all of its transcripts and chats to the Trash. You can restore them from there.")
-        }
         .alert("Something went wrong", isPresented: errorPresentationBinding) {
             Button("OK", role: .cancel) { vm.errorMessage = nil }
         } message: {
@@ -416,7 +377,11 @@ struct SessionsView: View {
                 projectRenameDraft = project.name
                 projectPendingRename = project
             },
-            requestDeleteProject: { projectPendingDeletion = $0 }
+            requestDeleteProject: { project in
+                ProjectDeletionPrompt.present(project: project, sessionCount: vm.sessions(in: project.id).count) { deleteSessions in
+                    Task { await vm.deleteProject(project.id, deleteSessions: deleteSessions) }
+                }
+            }
         )
     }
 
@@ -811,4 +776,38 @@ struct SessionRow: View {
         f.unitsStyle = .full
         return f
     }()
+}
+
+
+/// The "Delete project?" dialog. SwiftUI alerts can't hold a checkbox, so this is an `NSAlert`.
+@MainActor
+enum ProjectDeletionPrompt {
+    static let checkboxTitle = "Also delete all sessions in this project"
+
+    /// Asks the user. `onConfirm` gets the checkbox state; Cancel does nothing.
+    static func present(project: Project, sessionCount: Int, onConfirm: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete project?"
+        alert.informativeText = "“\(project.name)” and its instructions and files will be removed. Its sessions are kept and move back to your ungrouped sessions, unless you tick the box below."
+        alert.addButton(withTitle: "Delete project")
+        alert.addButton(withTitle: "Cancel")
+        var checkbox: NSButton?
+        if sessionCount > 0 {
+            let box = NSButton(checkboxWithTitle: checkboxTitle, target: nil, action: nil)
+            box.state = .off
+            box.sizeToFit()
+            alert.accessoryView = box
+            checkbox = box
+        }
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn else { return }
+            onConfirm(checkbox?.state == .on)
+        }
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            finish(alert.runModal())
+        }
+    }
 }
