@@ -457,9 +457,12 @@ final class SettingsStore: ObservableObject {
     /// the next listen.
     var resourceGovernorConfig: ResourceGovernorConfig {
         var config = ResourceGovernorConfig.default
-        config.cpuTier1Percent = safetyValveCPUPercent
-        config.cpuReleasePercent = safetyValveCPUPercent * 0.85
-        config.memoryTier1Bytes = UInt64(max(0, safetyValveMemoryMB)) * 1_000_000
+        let cpu = min(safetyValveCPUPercent, Double(ResourceGovernorConfig.maxCPUTier1Percent))
+        config.cpuTier1Percent = cpu
+        config.cpuReleasePercent = cpu * 0.85
+        // A value saved by an older build can sit above the hard ceiling; keep the soft limit below it.
+        let memoryMB = min(max(0, safetyValveMemoryMB), ResourceGovernorConfig.maxMemoryTier1MB)
+        config.memoryTier1Bytes = UInt64(memoryMB) * 1_000_000
         return config
     }
 

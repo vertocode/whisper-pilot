@@ -147,6 +147,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] new in self?.registerAnswerScreenHotKey(new) }
             .store(in: &settingsCancellables)
 
+        coordinator.startHardCeilingMonitor()
+
         let vm = SessionsViewModel(projects: coordinator.projects)
         vm.onStartNew = { [weak self] meta in self?.openSession(meta, resumed: false) }
         vm.onResume = { [weak self] meta in self?.openSession(meta, resumed: true) }

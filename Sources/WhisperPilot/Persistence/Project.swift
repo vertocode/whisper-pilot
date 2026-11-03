@@ -63,8 +63,8 @@ struct Project: Identifiable, Codable, Sendable, Equatable {
         for file in files {
             sections.append("Project file `\(file.filename)`:\n```\n\(file.content)\n```")
         }
-        guard !sections.isEmpty else { return nil }
-        return "Project \"\(name)\"\n\n" + sections.joined(separator: "\n\n")
+        guard let body = SessionContext.joinBounded(sections) else { return nil }
+        return "Project \"\(name)\"\n\n" + body
     }
 }
 

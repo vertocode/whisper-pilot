@@ -254,3 +254,137 @@ extension SmokeTestRunner {
         }
     }
 }
+
+extension SmokeTestRunner {
+    static func runFreezeSafetySuite() async {
+        await suite("HardCeiling: pure thresholds") {
+            let config = HardCeilingConfig.default
+            func sample(cpu: Double = 20, mem: UInt64 = 500_000_000) -> ResourceSample {
+                ResourceSample(cpuPercent: cpu, memoryBytes: mem, thermalState: .nominal)
+            }
+
+            await expect(config.footprintBytes == 2_250_000_000, "memory ceiling is 2.25 GB")
+            await expect(config.cpuPercent == 300 && config.cpuSustainSeconds == 60, "CPU ceiling is 300% for 60 s")
+
+            do {
+                var ceiling = HardCeiling(config: config)
+                var tripped = false
+                var t = 0.0
+                while t <= 3600 {
+                    if ceiling.evaluate(sample(cpu: 180, mem: 1_700_000_000), at: t) != nil { tripped = true }
+                    t += 1
+                }
+                await expect(!tripped, "an hour of heavy but normal load never trips the ceiling")
+            }
+
+            do {
+                var ceiling = HardCeiling(config: config)
+                let over = config.footprintBytes + 1
+                await expect(ceiling.evaluate(sample(mem: over), at: 0) == nil, "first sample over the memory ceiling waits")
+                await expect(ceiling.evaluate(sample(mem: over), at: 1) == nil, "still inside the memory grace time")
+                await expect(ceiling.evaluate(sample(mem: over), at: config.footprintSustainSeconds) == .memory,
+                             "memory held over the ceiling trips")
+            }
+
+            do {
+                var ceiling = HardCeiling(config: config)
+                let over = config.footprintBytes + 1
+                _ = ceiling.evaluate(sample(mem: over), at: 0)
+                _ = ceiling.evaluate(sample(mem: 800_000_000), at: 1)
+                _ = ceiling.evaluate(sample(mem: over), at: 2)
+                await expect(ceiling.evaluate(sample(mem: over), at: 4) == nil, "a short memory spike restarts the clock")
+            }
+
+            do {
+                var ceiling = HardCeiling(config: config)
+                _ = ceiling.evaluate(sample(cpu: 400), at: 0)
+                await expect(ceiling.evaluate(sample(cpu: 400), at: 59) == nil, "CPU over the ceiling for 59 s does not trip")
+                await expect(ceiling.evaluate(sample(cpu: 400), at: 60) == .cpu, "CPU over the ceiling for 60 s trips")
+            }
+
+            do {
+                var ceiling = HardCeiling(config: config)
+                _ = ceiling.evaluate(sample(cpu: 400), at: 0)
+                _ = ceiling.evaluate(sample(cpu: 400), at: 30)
+                for t in 31...34 { _ = ceiling.evaluate(sample(cpu: 50), at: Double(t)) }
+                _ = ceiling.evaluate(sample(cpu: 400), at: 35)
+                await expect(ceiling.evaluate(sample(cpu: 400), at: 94) == nil, "a dip longer than the tolerance restarts the CPU clock")
+                await expect(ceiling.evaluate(sample(cpu: 400), at: 95) == .cpu, "the restarted clock still trips after 60 s")
+            }
+
+            do {
+                var ceiling = HardCeiling(config: config)
+                _ = ceiling.evaluate(sample(cpu: 400), at: 0)
+                _ = ceiling.evaluate(sample(cpu: 400), at: 30)
+                _ = ceiling.evaluate(sample(cpu: 50), at: 31)
+                await expect(ceiling.evaluate(sample(cpu: 400), at: 60) == .cpu, "a one-second dip does not reset the CPU clock")
+            }
+        }
+
+        await suite("Prior-session context caps") {
+            func entry(_ n: Int, chars: Int) -> ProjectHistory.Entry {
+                ProjectHistory.Entry(title: "S\(n)", date: Date(timeIntervalSince1970: Double(n) * 86_400), text: String(repeating: "x", count: chars))
+            }
+
+            let many = (0..<40).map { entry($0, chars: 100) }
+            let block = ProjectHistory.block(entries: many, budget: 1_000_000) ?? ""
+            await expect(block.components(separatedBy: "### ").count - 1 == ProjectHistory.maxSessions,
+                         "no more than \(ProjectHistory.maxSessions) sessions are included")
+
+            let huge = [entry(1, chars: 50_000)]
+            let single = ProjectHistory.block(entries: huge, budget: 1_000_000) ?? ""
+            await expect(single.count < ProjectHistory.maxEntryCharacters + 100, "one session's text is cut to the per-entry cap")
+
+            let bulky = (0..<40).map { entry($0, chars: 5_000) }
+            let total = ProjectHistory.block(entries: bulky, budget: 1_000_000) ?? ""
+            await expect(total.count <= ProjectHistory.maxTotalCharacters, "the whole block never passes the total cap")
+
+            let tight = ProjectHistory.block(entries: bulky, budget: 3_000) ?? ""
+            await expect(tight.count <= 3_000, "a smaller budget still wins")
+
+            let files = (0..<20).map {
+                ContextFile(id: UUID(), filename: "f\($0).md", sourcePath: "/f\($0).md",
+                            content: String(repeating: "y", count: 150_000), byteCount: 150_000, attachedAt: Date())
+            }
+            let project = Project(name: "Big", instructions: "be brief", files: files)
+            let promptBlock = project.promptBlock ?? ""
+            await expect(promptBlock.count <= SessionContext.maxPromptCharacters + 100,
+                         "a project with 20 large files still builds a bounded prompt block")
+            let session = SessionContext(customText: "", files: files).promptBlock ?? ""
+            await expect(session.count <= SessionContext.maxPromptCharacters, "a session context is bounded too")
+            await expect(SessionContext.joinBounded([]) == nil, "no sections give no block")
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+            do {
+                let project = UUID()
+                let target = try await store.createSession(name: "Target", projectID: project)
+                var ids: [SessionID] = []
+                for i in 0..<12 {
+                    let meta = try await store.createSession(name: "Earlier \(i)", projectID: project)
+                    for line in 0..<5 {
+                        await store.appendTranscriptLine(channel: .microphone, text: "line \(line) of session \(i)", at: Date(), to: meta.id)
+                    }
+                    ids.append(meta.id)
+                }
+                let entries = await store.projectHistoryEntries(projectID: project, excluding: target.id, limit: 100)
+                await expect(entries.count == ProjectHistory.maxSessions, "history loads at most \(ProjectHistory.maxSessions) sessions, even if asked for more")
+
+                let long = ids[0]
+                for line in 0..<3_000 {
+                    await store.appendTranscriptLine(channel: .microphone, text: "filler sentence number \(line) for a long meeting", at: Date(), to: long)
+                }
+                let tail = await store.loadTranscriptTail(long, bytes: 2_000)
+                await expect(tail.utf8.count <= 2_000, "tail read returns no more than asked")
+                await expect(tail.contains("number 2999"), "tail read keeps the end of the transcript")
+                await expect(tail.hasPrefix("**"), "tail read starts on a whole line")
+                let short = await store.loadTranscriptTail(ids[1], bytes: 100_000)
+                await expect(short.contains("line 0 of session 1"), "tail read of a short file returns everything")
+            } catch {
+                await expect(false, "history cap fixture threw: \(error)")
+            }
+        }
+    }
+}

@@ -54,12 +54,14 @@ final class SystemAudioCapture: NSObject {
         // produce empty audio buffers (RMS = 0) on some macOS Sonoma/Sequoia configurations.
         config.sampleRate = 48000
         config.channelCount = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        // We never read the video, but ScreenCaptureKit still produces it. Asking for 60 frames
+        // a second made the system render and drop 60 frames a second for the whole meeting.
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         // Tiny dummy video size — we don't consume video, but ScreenCaptureKit requires a
         // sane non-zero rect. 100x100 is empirically more reliable than 2x2 on Sonoma+.
         config.width = 100
         config.height = 100
-        config.queueDepth = 5
+        config.queueDepth = 3
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)

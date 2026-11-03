@@ -32,6 +32,7 @@ struct SmokeTestRunner {
         await runSaveHealthSuite()
         await runSessionCountCacheSuite()
         await runProjectsSuite()
+        await runFreezeSafetySuite()
         await runLogRotationSuite()
         await runAIProviderSuite()
         await runSingleInstanceSuite()
@@ -1490,9 +1491,7 @@ struct SmokeTestRunner {
     @MainActor
     static func runResourceGovernorSuite() async {
         await suite("ResourceGovernor") {
-            var cfg = ResourceGovernorConfig.default
-            cfg.coreCount = 8   // Mac mini class: Tier-2 CPU = 720%
-            let config = cfg
+            let config = ResourceGovernorConfig.default
 
             func nominal(cpu: Double = 10, mem: UInt64 = 200_000_000,
                          thermal: ProcessInfo.ThermalState = .nominal) -> ResourceSample {
@@ -1500,6 +1499,8 @@ struct SmokeTestRunner {
             }
 
             // Normal meeting: ~1.5 cores of transcription for an hour, 1.2 GB memory.
+            await expect(config.cpuTier1Percent == 180 && config.memoryTier1Bytes == 1_600_000_000,
+                         "soft limits are 180% CPU and 1.6 GB")
             do {
                 let gov = ResourceGovernor(config: config)
                 var stopped = false
@@ -1564,44 +1565,41 @@ struct SmokeTestRunner {
                              "transient .serious recovers to .ok")
             }
 
-            // Tier-2 CPU: needs load beyond 90% of all cores for the long window.
+            // Tier-2 CPU: needs load beyond the Tier-2 level for the sustain window.
             do {
                 let gov = ResourceGovernor(config: config)
-                _ = gov.evaluate(nominal(cpu: 300), at: 0)
-                _ = gov.evaluate(nominal(cpu: 300), at: config.cpuSustainSeconds)
+                _ = gov.evaluate(nominal(cpu: 250), at: 0)
+                _ = gov.evaluate(nominal(cpu: 250), at: config.cpuSustainSeconds)
                 let t0 = config.cpuSustainSeconds
-                await expect(gov.evaluate(nominal(cpu: 600), at: t0 + 120) == .tier1Pause,
-                             "heavy but below the all-cores level never escalates")
+                await expect(gov.evaluate(nominal(cpu: 250), at: t0 + 120) == .tier1Pause,
+                             "heavy but below the Tier-2 level never escalates")
                 let runaway = config.cpuTier2Percent + 10
                 let start = t0 + 200
                 _ = gov.evaluate(nominal(cpu: runaway), at: start)
-                await expect(gov.evaluate(nominal(cpu: runaway), at: start + 60) == .tier1Pause,
-                             "runaway CPU for one minute does not stop")
+                await expect(gov.evaluate(nominal(cpu: runaway), at: start + 30) == .tier1Pause,
+                             "runaway CPU for half the window does not stop")
                 await expect(gov.evaluate(nominal(cpu: runaway), at: start + config.cpuTier2SustainSeconds) == .tier2Stop,
-                             "runaway CPU held for minutes stops")
+                             "runaway CPU held for the window stops")
                 await expect(gov.trigger == .cpu, "CPU Tier-2 reports the CPU trigger")
             }
 
-            // Tier-2 CPU scales with core count.
+            // Tier-2 CPU level.
             do {
-                var small = config
-                small.coreCount = 4
-                await expect(small.cpuTier2Percent < config.cpuTier2Percent, "fewer cores → lower Tier-2 CPU level")
-                await expect(config.cpuTier2Percent == 720, "8 cores at 90% → 720%")
-                var two = config
-                two.coreCount = 2
-                await expect(two.cpuTier2Percent >= two.cpuTier1Percent * 1.5, "2 cores: Tier-2 CPU stays well above Tier-1")
+                await expect(config.cpuTier2Percent == 300, "default Tier-2 CPU is 300%")
+                var low = config
+                low.cpuTier1Percent = 100
+                await expect(low.cpuTier2Percent == 300, "a low Tier-1 setting keeps the Tier-2 floor")
                 var high = config
-                high.cpuTier1Percent = 800
-                await expect(high.cpuTier2Percent == 1200, "a high Tier-1 setting pulls Tier-2 up with it")
+                high.cpuTier1Percent = 250
+                await expect(high.cpuTier2Percent == 375, "a high Tier-1 setting pulls Tier-2 up with it")
             }
 
-            // Tier-2 memory: double the cap, held for the window.
+            // Tier-2 memory: 1.4x the cap, held for the window.
             do {
                 let gov = ResourceGovernor(config: config)
                 _ = gov.evaluate(nominal(mem: config.memoryTier1Bytes + 1), at: 0)
                 await expect(gov.evaluate(nominal(mem: config.memoryTier1Bytes + 1), at: 600) == .tier1Pause,
-                             "memory over the cap but under 2x never stops")
+                             "memory over the cap but under the Tier-2 level never stops")
                 let huge = config.memoryTier2Bytes + 1
                 _ = gov.evaluate(nominal(mem: huge), at: 700)
                 await expect(gov.evaluate(nominal(mem: huge), at: 700 + config.memoryTier2SustainSeconds) == .tier2Stop,
@@ -1656,16 +1654,25 @@ struct SmokeTestRunner {
                 let store = SettingsStore(defaults: defaults)
                 await expect(store.safetyValveCPUPercent == ResourceGovernorConfig.defaultCPUTier1Percent,
                              "old persisted 70% CPU is ignored")
-                await expect(store.safetyValveMemoryMB == 3000, "old persisted 1500 MB is ignored")
-                await expect(store.resourceGovernorConfig.cpuTier1Percent == 200, "config uses the new CPU default")
+                await expect(store.safetyValveMemoryMB == ResourceGovernorConfig.defaultMemoryTier1MB,
+                             "old persisted 1500 MB is ignored")
+                await expect(store.resourceGovernorConfig.cpuTier1Percent == 180, "config uses the new CPU default")
 
-                store.safetyValveMemoryMB = 2000
-                store.safetyValveCPUPercent = 400
+                store.safetyValveMemoryMB = 1200
+                store.safetyValveCPUPercent = 200
                 let reopened = SettingsStore(defaults: defaults)
-                await expect(reopened.safetyValveMemoryMB == 2000, "a deliberate low memory value survives a restart")
-                await expect(reopened.safetyValveCPUPercent == 400, "a chosen CPU value survives a restart")
-                await expect(reopened.resourceGovernorConfig.cpuReleasePercent == 400 * 0.85,
+                await expect(reopened.safetyValveMemoryMB == 1200, "a deliberate low memory value survives a restart")
+                await expect(reopened.safetyValveCPUPercent == 200, "a chosen CPU value survives a restart")
+                await expect(reopened.resourceGovernorConfig.cpuReleasePercent == 200 * 0.85,
                              "release level follows the stored CPU setting")
+
+                store.safetyValveMemoryMB = 8000
+                store.safetyValveCPUPercent = 800
+                let clamped = store.resourceGovernorConfig
+                await expect(clamped.memoryTier1Bytes == UInt64(ResourceGovernorConfig.maxMemoryTier1MB) * 1_000_000,
+                             "a memory setting above the limit is clamped below the hard ceiling")
+                await expect(clamped.cpuTier1Percent == Double(ResourceGovernorConfig.maxCPUTier1Percent),
+                             "a CPU setting above the limit is clamped")
             }
         }
     }

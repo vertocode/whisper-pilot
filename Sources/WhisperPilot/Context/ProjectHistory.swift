@@ -10,15 +10,26 @@ enum ProjectHistory {
 
     /// Characters of transcript used for a session that has no summary yet.
     static let fallbackCharacters = 1_500
+    /// Hard caps on what earlier sessions can add to a prompt, however many sessions a project has.
+    static let maxSessions = 8
+    static let maxEntryCharacters = 1_500
+    static let maxTotalCharacters = 12_000
+    /// Bytes read from the end of a transcript file for the fallback. Reading the whole
+    /// file of a long meeting just to keep its last 1,500 characters wastes memory.
+    static let fallbackReadBytes = 32_000
     /// Not worth adding a last entry if less than this much room is left.
     private static let minimumTail = 300
 
     /// Entries must already be newest first. Whole entries are added until the budget runs
     /// out, so the most recent sessions always make it in; the last one that fits may be cut.
     static func block(entries: [Entry], budget: Int) -> String? {
+        let budget = min(budget, maxTotalCharacters)
         var parts: [String] = []
         var used = 0
-        for entry in entries {
+        for entry in entries.prefix(maxSessions) {
+            let entry = entry.text.count > maxEntryCharacters
+                ? Entry(title: entry.title, date: entry.date, text: String(entry.text.prefix(maxEntryCharacters - 1)) + "…")
+                : entry
             let header = "### \(entry.title) (\(dateFormatter.string(from: entry.date)))\n"
             let separator = parts.isEmpty ? 0 : 2
             let room = budget - used - separator - header.count

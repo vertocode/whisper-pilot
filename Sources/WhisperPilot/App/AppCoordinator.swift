@@ -387,6 +387,29 @@ final class AppCoordinator {
         )
     }
 
+    private var hardCeilingMonitor: HardCeilingMonitor?
+
+    /// Starts the last-resort watchdog. It runs for the whole life of the app, whether or not
+    /// anything is listening, and does not depend on the Settings switch for the soft valve.
+    func startHardCeilingMonitor() {
+        guard hardCeilingMonitor == nil else { return }
+        let monitor = HardCeilingMonitor { [weak self] reason, sample in
+            Task { @MainActor in await self?.emergencyShutdown(reason: reason, sample: sample) }
+        }
+        hardCeilingMonitor = monitor
+        monitor.start()
+    }
+
+    /// The app is about to freeze the Mac: write what we have to disk and quit. If this
+    /// hangs, `HardCeilingMonitor` ends the process on its own after a short deadline.
+    private func emergencyShutdown(reason: HardCeilingReason, sample: ResourceSample) async {
+        wpError("[Coordinator] Hard ceiling crossed (\(reason.label)): cpu=\(Int(sample.cpuPercent.rounded()))%, footprint=\(sample.memoryBytes / 1_000_000) MB. Saving the session and quitting.")
+        await flushPendingContextSave()
+        await flushPendingTranscriptLines()
+        await projects.flush()
+        NSApp.terminate(nil)
+    }
+
     func shutdown() async {
         log.info("Shutdown")
         await stopListening()

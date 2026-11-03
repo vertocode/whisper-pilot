@@ -117,7 +117,7 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
-                    Slider(value: $store.safetyValveCPUPercent, in: 100...800, step: 50)
+                    Slider(value: $store.safetyValveCPUPercent, in: 100...Double(ResourceGovernorConfig.maxCPUTier1Percent), step: 10)
                 }
                 .disabled(!store.safetyValveEnabled)
                 VStack(alignment: .leading, spacing: 2) {
@@ -133,12 +133,12 @@ struct SettingsView: View {
                             get: { Double(store.safetyValveMemoryMB) },
                             set: { store.safetyValveMemoryMB = Int($0) }
                         ),
-                        in: 1000...8000,
+                        in: 1000...Double(ResourceGovernorConfig.maxMemoryTier1MB),
                         step: 100
                     )
                 }
                 .disabled(!store.safetyValveEnabled)
-                FormHint("CPU is shown as % of one core, so 200% means two cores. The soft pause (Tier-1) trips when this app's CPU stays above the threshold for ~30s, its memory crosses the cap, or the Mac gets hot. Listening only stops for runaway load held for minutes, or a critical temperature. Changes apply the next time you start listening.")
+                FormHint("CPU is shown as % of one core, so 200% means two cores. The soft pause (Tier-1) trips when this app's CPU stays above the threshold for ~30s, its memory crosses the cap, or the Mac gets hot. Listening only stops for runaway load held for a minute or so, or a critical temperature. As a last resort, the app saves your session and quits if it passes about 2.25 GB of memory or 300% CPU for a minute, so it can never freeze your Mac. Changes apply the next time you start listening.")
             }
         }
         .formStyle(.grouped)

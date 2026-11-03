@@ -41,6 +41,24 @@ struct SessionContext: Codable, Sendable, Equatable {
         for file in files {
             sections.append("Attached file `\(file.filename)`:\n```\n\(file.content)\n```")
         }
-        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
+        return Self.joinBounded(sections)
+    }
+
+    /// The prompt only has room for this much of a context block, so building more is wasted work
+    /// (and memory, when someone attaches dozens of 200 KB files).
+    static let maxPromptCharacters = 60_000
+
+    /// Joins sections until `limit` characters are used. The section that crosses the limit is cut.
+    static func joinBounded(_ sections: [String], limit: Int = maxPromptCharacters) -> String? {
+        var parts: [String] = []
+        var used = 0
+        for section in sections {
+            let room = limit - used
+            if room <= 0 { break }
+            let part = section.count > room ? String(section.prefix(room)) : section
+            parts.append(part)
+            used += part.count + 2
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
     }
 }

@@ -326,11 +326,11 @@ actor SessionStore {
         projectID: UUID,
         excluding current: SessionID?,
         includeOther: Bool = true,
-        limit: Int = 15
+        limit: Int = ProjectHistory.maxSessions
     ) -> [ProjectHistory.Entry] {
         let earlier = listSessions()
             .filter { $0.projectID == projectID && $0.id != current }
-            .prefix(limit)
+            .prefix(min(limit, ProjectHistory.maxSessions))
         var entries: [ProjectHistory.Entry] = []
         for meta in earlier {
             let text: String
@@ -338,7 +338,7 @@ actor SessionStore {
                includeOther || saved.excludesOther == true {
                 text = saved.summary
             } else {
-                var raw = Self.strippingTranslations(loadTranscriptMarkdown(meta.id))
+                var raw = Self.strippingTranslations(loadTranscriptTail(meta.id, bytes: ProjectHistory.fallbackReadBytes))
                 if !includeOther { raw = Self.strippingOtherSpeaker(raw) }
                 text = ProjectHistory.transcriptFallback(raw)
             }
@@ -444,6 +444,22 @@ actor SessionStore {
     func loadTranscriptMarkdown(_ id: SessionID) -> String {
         let url = sessionFolder(for: id).appendingPathComponent("transcript.md")
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    /// The last `bytes` of the transcript, starting at a whole line. Cheap for very long sessions.
+    func loadTranscriptTail(_ id: SessionID, bytes: Int) -> String {
+        let url = sessionFolder(for: id).appendingPathComponent("transcript.md")
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return "" }
+        let start = size > UInt64(bytes) ? size - UInt64(bytes) : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.readToEnd() else { return "" }
+        var text = String(decoding: data, as: UTF8.self)
+        if start > 0, let newline = text.firstIndex(of: "\n") {
+            text = String(text[text.index(after: newline)...])
+        }
+        return text
     }
 
     func loadChatMarkdown(_ id: SessionID) -> String {

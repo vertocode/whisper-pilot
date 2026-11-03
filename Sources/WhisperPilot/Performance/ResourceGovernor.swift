@@ -48,7 +48,8 @@ enum ResourceTrigger: String, Sendable, Equatable {
 /// one core for a whole meeting, so a busy-but-normal session must never stop.
 /// Tier-1 only sheds optional work (AI, translation rate). Tier-2 (stopping
 /// listening) needs thermal `.critical`, or load far beyond normal transcription
-/// cost held for minutes.
+/// cost held for a short while. `HardCeilingMonitor` backs all of this up from
+/// a background thread, because this governor only runs while the main thread is alive.
 struct ResourceGovernorConfig: Sendable, Equatable {
     /// CPU percentage (100 = one core) above which the Tier-1 sustain clock runs.
     var cpuTier1Percent: Double
@@ -64,11 +65,8 @@ struct ResourceGovernorConfig: Sendable, Equatable {
     var recoverySeconds: TimeInterval
     /// Brief sub-threshold dips shorter than this do NOT reset a sustain run.
     var cpuDipToleranceSeconds: TimeInterval
-    /// Logical core count of the machine; Tier-2 CPU scales with it.
-    var coreCount: Int
-    /// Tier-2 CPU level as a fraction of ALL cores (0.9 = this app alone is using
-    /// 90% of the whole machine).
-    var cpuTier2CoreFraction: Double
+    /// Lowest Tier-2 CPU level (100 = one core). Normal transcription stays well under it.
+    var cpuTier2FloorPercent: Double
     /// How long CPU must stay above the Tier-2 level (while in Tier-1) before stopping.
     var cpuTier2SustainSeconds: TimeInterval
     /// Memory level that counts as runaway (Tier-2), as a multiple of the Tier-1 cap.
@@ -80,15 +78,18 @@ struct ResourceGovernorConfig: Sendable, Equatable {
     var thermalSeriousStopSeconds: TimeInterval
 
     var cpuTier2Percent: Double {
-        max(cpuTier1Percent * 1.5, Double(max(1, coreCount)) * 100 * cpuTier2CoreFraction)
+        max(cpuTier1Percent * 1.5, cpuTier2FloorPercent)
     }
 
     var memoryTier2Bytes: UInt64 {
         UInt64(Double(memoryTier1Bytes) * memoryTier2Multiplier)
     }
 
-    static let defaultCPUTier1Percent: Double = 200
-    static let defaultMemoryTier1MB = 3000
+    static let defaultCPUTier1Percent: Double = 180
+    static let defaultMemoryTier1MB = 1600
+    /// The Settings sliders stop here so the soft limits always sit below the hard ceiling.
+    static let maxMemoryTier1MB = 2000
+    static let maxCPUTier1Percent = 250
 
     static let `default` = ResourceGovernorConfig(
         cpuTier1Percent: defaultCPUTier1Percent,
@@ -97,11 +98,10 @@ struct ResourceGovernorConfig: Sendable, Equatable {
         cpuReleasePercent: defaultCPUTier1Percent * 0.85,
         recoverySeconds: 5,
         cpuDipToleranceSeconds: 2,
-        coreCount: ProcessInfo.processInfo.activeProcessorCount,
-        cpuTier2CoreFraction: 0.9,
-        cpuTier2SustainSeconds: 180,
-        memoryTier2Multiplier: 2,
-        memoryTier2SustainSeconds: 120,
+        cpuTier2FloorPercent: 300,
+        cpuTier2SustainSeconds: 60,
+        memoryTier2Multiplier: 1.4,
+        memoryTier2SustainSeconds: 20,
         thermalSeriousStopSeconds: 600
     )
 }
