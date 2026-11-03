@@ -76,7 +76,7 @@ struct SessionsSidebar: View {
                 .padding(.horizontal, WP.Space.md)
                 .padding(.vertical, WP.Space.md)
             ScrollView {
-                VStack(alignment: .leading, spacing: WP.Space.xs) {
+                LazyVStack(alignment: .leading, spacing: WP.Space.xs) {
                     if vm.isSearching {
                         searchResultsList
                     } else {

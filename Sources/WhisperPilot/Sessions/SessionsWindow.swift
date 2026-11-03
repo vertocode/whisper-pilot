@@ -22,6 +22,9 @@ final class SessionsViewModel: ObservableObject {
     }
     /// Folder names of sessions whose transcript or summary matches the search text.
     @Published private(set) var contentMatches: Set<String> = []
+    /// The search text after a short pause in typing. All filtering uses this, so the
+    /// lists do not rebuild on every keystroke.
+    @Published private(set) var activeQuery: String = ""
 
     let projects: ProjectsStore
     private let store: SessionStore
@@ -60,7 +63,7 @@ final class SessionsViewModel: ObservableObject {
     // MARK: - Grouping and search
 
     var isSearching: Bool {
-        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !activeQuery.isEmpty
     }
 
     /// The project a session sits in. Nil when it has none, or when the project no longer exists.
@@ -83,7 +86,7 @@ final class SessionsViewModel: ObservableObject {
     }
 
     func matchesSearch(_ session: SessionMeta) -> Bool {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = activeQuery
         guard !query.isEmpty else { return true }
         if Self.contains(session.displayName, query) { return true }
         if let name = project(of: session)?.name, Self.contains(name, query) { return true }
@@ -97,14 +100,21 @@ final class SessionsViewModel: ObservableObject {
     private func scheduleContentSearch() {
         searchTask?.cancel()
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Old matches belong to the old query, so drop them right away.
-        contentMatches = []
-        guard !query.isEmpty else { return }
+        guard !query.isEmpty else {
+            // Clearing the box should feel instant.
+            if !activeQuery.isEmpty { activeQuery = "" }
+            if !contentMatches.isEmpty { contentMatches = [] }
+            return
+        }
+        guard query != activeQuery else { return }
         // Wait for a pause in typing, then read files off the main thread.
         searchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
-            let hits = await store.sessionsMatchingContent(query)
+            self?.activeQuery = query
+            // Old matches belong to the old query.
+            self?.contentMatches = []
+            let hits = await self?.store.sessionsMatchingContent(query) ?? []
             guard !Task.isCancelled else { return }
             self?.contentMatches = hits
         }
@@ -558,7 +568,7 @@ struct SessionsView: View {
             if vm.sessions.isEmpty {
                 EmptyHistoryState()
             } else if visibleHistory.isEmpty {
-                Text("No sessions match “\(vm.searchText)”.")
+                Text("No sessions match “\(vm.activeQuery)”.")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
