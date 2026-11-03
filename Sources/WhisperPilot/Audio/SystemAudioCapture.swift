@@ -37,6 +37,7 @@ final class SystemAudioCapture: NSObject {
     func start() async throws {
         log.info("Starting system audio capture…")
         print("[WP][SystemAudio] start() begin")
+        if stream != nil { await stop() }
         manuallyStopped = false
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
@@ -65,7 +66,18 @@ final class SystemAudioCapture: NSObject {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        try await stream.startCapture()
+        do {
+            try await stream.startCapture()
+        } catch {
+            try? stream.removeStreamOutput(self, type: .audio)
+            throw error
+        }
+        if manuallyStopped {
+            // stop() ran while we were starting; don't leave a live stream behind.
+            try? await stream.stopCapture()
+            try? stream.removeStreamOutput(self, type: .audio)
+            return
+        }
         self.stream = stream
         log.info("✓ System audio capture started; awaiting frames")
         print("[WP][SystemAudio] startCapture returned; awaiting frames")
@@ -80,6 +92,7 @@ final class SystemAudioCapture: NSObject {
         } catch {
             log.error("Stop error: \(String(describing: error), privacy: .public)")
         }
+        try? stream.removeStreamOutput(self, type: .audio)
         self.stream = nil
         stateLock.withLock {
             self.converter = nil

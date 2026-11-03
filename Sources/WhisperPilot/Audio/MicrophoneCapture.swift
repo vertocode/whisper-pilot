@@ -92,7 +92,12 @@ final class MicrophoneCapture {
             self?.handle(buffer)
         }
 
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            throw error
+        }
         isRunning = true
         // Default input switch, sample-rate change, or sleep/wake stops the
         // engine and would otherwise kill mic capture silently mid-session.
