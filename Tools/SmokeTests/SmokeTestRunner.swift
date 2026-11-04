@@ -1361,13 +1361,15 @@ struct SmokeTestRunner {
             do {
                 let session = try await store.createSession(name: "Export regression")
                 let out = root.appendingPathComponent("export.md")
+                let transcript = root.appendingPathComponent(session.folderName).appendingPathComponent("transcript.md")
 
+                // createSession seeds a header, so remove it to get a truly missing transcript.
+                try FileManager.default.removeItem(at: transcript)
                 let empty = try await store.exportTranscriptMarkdown(session.id, to: out)
                 await expect(empty == 0 && (try? Data(contentsOf: out)) == Data(),
                              "missing transcript exports an empty file")
 
                 let text = "**Me** [00:00:01] héllo\n\n"
-                let transcript = root.appendingPathComponent(session.folderName).appendingPathComponent("transcript.md")
                 try Data(text.utf8).write(to: transcript)
                 let written = try await store.exportTranscriptMarkdown(session.id, to: out)
                 await expect(written == Data(text.utf8).count, "export reports the bytes written")
