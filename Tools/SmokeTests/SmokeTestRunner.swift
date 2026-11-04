@@ -1352,6 +1352,32 @@ struct SmokeTestRunner {
     }
 
     static func runSessionStorePersistenceSuite() async {
+        await suite("SessionStore transcript export") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(baseURL: root)
+
+            do {
+                let session = try await store.createSession(name: "Export regression")
+                let out = root.appendingPathComponent("export.md")
+
+                let empty = try await store.exportTranscriptMarkdown(session.id, to: out)
+                await expect(empty == 0 && (try? Data(contentsOf: out)) == Data(),
+                             "missing transcript exports an empty file")
+
+                let text = "**Me** [00:00:01] héllo\n\n"
+                let transcript = root.appendingPathComponent(session.folderName).appendingPathComponent("transcript.md")
+                try Data(text.utf8).write(to: transcript)
+                let written = try await store.exportTranscriptMarkdown(session.id, to: out)
+                await expect(written == Data(text.utf8).count, "export reports the bytes written")
+                await expect((try? Data(contentsOf: out)) == Data(text.utf8), "export matches the transcript bytes")
+            } catch {
+                await expect(false, "transcript export setup failed: \(error.localizedDescription)")
+            }
+        }
+
+
         await suite("SessionStore chat persistence") {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)

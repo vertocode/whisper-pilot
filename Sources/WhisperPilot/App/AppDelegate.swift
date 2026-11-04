@@ -435,10 +435,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             Task {
-                let markdown = await SessionStore.shared.loadTranscriptMarkdown(session.id)
                 do {
-                    try markdown.write(to: url, atomically: true, encoding: .utf8)
-                    wpInfo("Exported transcript (\(markdown.count) bytes) to \(url.path)")
+                    let bytes = try await SessionStore.shared.exportTranscriptMarkdown(session.id, to: url)
+                    wpInfo("Exported transcript (\(bytes) bytes) to \(url.path)")
                 } catch {
                     wpError("Export transcript failed: \(error.localizedDescription)")
                 }

@@ -446,6 +446,16 @@ actor SessionStore {
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
+    /// Copies `transcript.md` to `destination` inside the actor, so a large export never
+    /// touches the main thread. Bytes are copied as-is. A missing transcript writes an
+    /// empty file. Returns the number of bytes written.
+    func exportTranscriptMarkdown(_ id: SessionID, to destination: URL) throws -> Int {
+        let url = sessionFolder(for: id).appendingPathComponent("transcript.md")
+        let data = (try? Data(contentsOf: url, options: .mappedIfSafe)) ?? Data()
+        try data.write(to: destination, options: .atomic)
+        return data.count
+    }
+
     /// The last `bytes` of the transcript, starting at a whole line. Cheap for very long sessions.
     func loadTranscriptTail(_ id: SessionID, bytes: Int) -> String {
         let url = sessionFolder(for: id).appendingPathComponent("transcript.md")
