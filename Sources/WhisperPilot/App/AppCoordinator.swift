@@ -140,6 +140,12 @@ final class AppCoordinator {
     /// Set while the valve itself is flipping `isAIPaused`, so the paused observer can
     /// distinguish valve-initiated changes from explicit user toggles.
     private var valveTogglingAI = false
+    /// True when the valve (not the user) paused microphone transcription. Mic is
+    /// the first thing shed under load — system audio ("Other") keeps transcribing —
+    /// and it is resumed on recovery unless the user touched the mic toggle meanwhile.
+    private var tier1MutedMic = false
+    /// Set while the valve itself flips `isMicrophoneMuted`.
+    private var valveTogglingMic = false
 
     /// IDs of currently-displayed watchdog warnings, so we can dismiss them when the
     /// underlying problem resolves itself (e.g. audio frames start flowing).
@@ -278,7 +284,10 @@ final class AppCoordinator {
         micMuteObserver = overlayState.$isMicrophoneMuted
             .removeDuplicates()
             .sink { [weak self] muted in
-                self?.muteFlags.withLock { $0.micMuted = muted }
+                guard let self else { return }
+                self.muteFlags.withLock { $0.micMuted = muted }
+                // A change the valve didn't make is the user's call; never undo it.
+                if !self.valveTogglingMic { self.tier1MutedMic = false }
             }
         systemMuteObserver = overlayState.$isSystemAudioMuted
             .removeDuplicates()
@@ -939,6 +948,7 @@ final class AppCoordinator {
         tier1Engaged = false
         tier2Engaged = false
         tier1PausedAI = false
+        tier1MutedMic = false
         resourceMonitorTask = Task { @MainActor [weak self] in
             let start = ContinuousClock.now
             while !Task.isCancelled {
@@ -982,6 +992,8 @@ final class AppCoordinator {
             valveTogglingAI = false
         }
         tier1PausedAI = false
+        // Same for a valve-paused mic: the next session must honour the user's setting.
+        resumeValveMutedMic(note: nil)
     }
 
     private func handleResourceDecision(_ decision: ResourceDecision) {
@@ -1011,6 +1023,7 @@ final class AppCoordinator {
                     )
                 }
                 tier1PausedAI = false
+                resumeValveMutedMic(note: "✅ System load back to normal — mic transcription resumed.")
             }
         case .tier1Pause:
             engageTier1()
@@ -1040,6 +1053,16 @@ final class AppCoordinator {
             valveTogglingAI = false
             tier1PausedAI = true
         }
+        // Shed the second recognizer first: pause mic transcription (system audio
+        // keeps transcribing). Skipped when the user already muted the mic.
+        let shedMic = !overlayState.isMicrophoneMuted && settings.captureMicrophone
+        if shedMic {
+            valveTogglingMic = true
+            overlayState.isMicrophoneMuted = true
+            valveTogglingMic = false
+            tier1MutedMic = true
+            wpWarn("[Coordinator] Mic transcription paused to save resources (\(reason))")
+        }
         // Cancel streaming AI replies to free their CPU immediately. Transcription
         // (a separate consumer task) keeps running.
         for task in inFlightCompletions.values { task.cancel() }
@@ -1052,11 +1075,24 @@ final class AppCoordinator {
             Task { await queue.setMode(.finalsOnly) }
         }
         tier1NoteID = overlayState.appendSystemNote(
-            "⚠️ \(tier1Headline(reason)) — AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
+            "⚠️ \(tier1Headline(reason)) — \(shedMic ? "Mic transcription paused to save resources (system audio still transcribes; it resumes when load drops) and " : "")AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
             category: .ai,
-            actionLabel: "Disable my mic for this session",
-            actionKind: .shedMicrophoneForSession
+            actionLabel: shedMic ? nil : "Disable my mic for this session",
+            actionKind: shedMic ? nil : .shedMicrophoneForSession
         )
+    }
+
+    /// Unmutes the mic if (and only if) the valve muted it and the user hasn't
+    /// touched the toggle since.
+    private func resumeValveMutedMic(note: String?) {
+        guard tier1MutedMic else { return }
+        tier1MutedMic = false
+        guard overlayState.isMicrophoneMuted else { return }
+        valveTogglingMic = true
+        overlayState.isMicrophoneMuted = false
+        valveTogglingMic = false
+        wpInfo("[Coordinator] Mic transcription resumed (load recovered or session ended)")
+        if let note { overlayState.appendSystemNote(note, category: .ai) }
     }
 
     private func tier1Headline(_ trigger: String) -> String {
@@ -1480,7 +1516,8 @@ final class AppCoordinator {
     /// capture-path switch). Unlike a user-initiated stop/start, this preserves
     /// in-session state the user set — currently the mic mute toggle.
     func restartListening() async {
-        pendingMicMuteRestore = overlayState.isMicrophoneMuted
+        // A valve-paused mic isn't the user's choice; don't carry it into the restart.
+        pendingMicMuteRestore = overlayState.isMicrophoneMuted && !tier1MutedMic
         await stopListening(endsSession: false)
         await startListening()
     }
@@ -1533,6 +1570,7 @@ final class AppCoordinator {
         tier1Engaged = false
         tier2Engaged = false
         tier1PausedAI = false
+        tier1MutedMic = false
         overlayState.transcriptCount = 0
         overlayState.audioFrameCount = 0
         overlayState.systemAudioFrameCount = 0
