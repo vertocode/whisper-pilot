@@ -442,7 +442,7 @@ struct SettingsView: View {
                 Toggle("Always transcribe my mic", isOn: $store.alwaysTranscribeMic)
                     .disabled(!store.captureMicrophone)
                 FormHint("When off, a new session starts with your mic muted — system audio (\"Other\") still transcribes, but your own voice is skipped until you unmute with the in-session mic toggle. Useful if you rarely need your own speech transcribed and want to avoid the mic recognizer's cost. Has no effect when microphone capture above is off.")
-                FormHint("Transcribing your mic runs a second speech recognizer alongside system audio, so it roughly increases transcription CPU use. Under high load the safety valve pauses mic transcription first and resumes it when load drops.")
+                FormHint("Transcribing your mic runs a second speech recognizer alongside system audio, which adds noticeable CPU use. With the safety valve on, high load pauses mic transcription first and resumes it once load has stayed low for a while.")
             }
             Section("System audio capture path") {
                 Toggle("Use ScreenCaptureKit for system audio", isOn: $store.forceScreenCaptureKitForSystemAudio)

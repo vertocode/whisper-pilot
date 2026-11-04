@@ -146,6 +146,12 @@ final class AppCoordinator {
     private var tier1MutedMic = false
     /// Set while the valve itself flips `isMicrophoneMuted`.
     private var valveTogglingMic = false
+    /// When Tier-1 released while the mic was still valve-paused. The mic only
+    /// comes back after load has stayed calm for `micResumeCalmSeconds` — the calm
+    /// reading was taken without the mic recognizer, so resuming right away would
+    /// flap it on and off every ~35 s.
+    private var micCalmSince: ContinuousClock.Instant?
+    private static let micResumeCalmSeconds: Double = 90
 
     /// IDs of currently-displayed watchdog warnings, so we can dismiss them when the
     /// underlying problem resolves itself (e.g. audio frames start flowing).
@@ -962,7 +968,11 @@ final class AppCoordinator {
                 self.overlayState.publishResourceSample(sample)
                 // Valve disabled in Settings: sample for the readout only, never trip
                 // the governor (reverts to the old no-limit behavior).
-                guard self.settings.safetyValveEnabled else { continue }
+                guard self.settings.safetyValveEnabled else {
+                    // Valve switched off mid-episode: give the mic back right away.
+                    self.resumeValveMutedMic(note: nil)
+                    continue
+                }
                 let elapsed = start.duration(to: .now)
                 let seconds = Double(elapsed.components.seconds)
                     + Double(elapsed.components.attoseconds) * 1e-18
@@ -1023,6 +1033,10 @@ final class AppCoordinator {
                     )
                 }
                 tier1PausedAI = false
+                if tier1MutedMic { micCalmSince = .now }
+            }
+            if tier1MutedMic, let calm = micCalmSince,
+               calm.duration(to: .now) >= .seconds(Self.micResumeCalmSeconds) {
                 resumeValveMutedMic(note: "✅ System load back to normal — mic transcription resumed.")
             }
         case .tier1Pause:
@@ -1038,6 +1052,7 @@ final class AppCoordinator {
     /// off. Explicit user AI actions (composer, Help AI, Summary, Action Items)
     /// keep working because they don't consult `isAIPaused`.
     private func engageTier1() {
+        micCalmSince = nil
         guard !tier1Engaged else { return }
         tier1Engaged = true
         let reason = resourceGovernor.trigger?.label ?? "load"
@@ -1075,7 +1090,7 @@ final class AppCoordinator {
             Task { await queue.setMode(.finalsOnly) }
         }
         tier1NoteID = overlayState.appendSystemNote(
-            "⚠️ \(tier1Headline(reason)) — \(shedMic ? "Mic transcription paused to save resources (system audio still transcribes; it resumes when load drops) and " : "")AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
+            "⚠️ \(tier1Headline(reason)) — \(shedMic ? "Mic transcription paused to save resources (system audio still transcribes; it resumes once load stays low) and " : "")AI auto-suggestions paused to keep transcription smooth.\(translationQueue != nil ? " Live translation switched to completed lines only." : "") Manual prompts (composer, Help AI, Summary, Action items) still work. Resume auto-suggestions any time with the AI toggle.",
             category: .ai,
             actionLabel: shedMic ? nil : "Disable my mic for this session",
             actionKind: shedMic ? nil : .shedMicrophoneForSession
@@ -1085,6 +1100,7 @@ final class AppCoordinator {
     /// Unmutes the mic if (and only if) the valve muted it and the user hasn't
     /// touched the toggle since.
     private func resumeValveMutedMic(note: String?) {
+        micCalmSince = nil
         guard tier1MutedMic else { return }
         tier1MutedMic = false
         guard overlayState.isMicrophoneMuted else { return }
@@ -1570,7 +1586,8 @@ final class AppCoordinator {
         tier1Engaged = false
         tier2Engaged = false
         tier1PausedAI = false
-        tier1MutedMic = false
+        // Unmute a valve-paused mic before forgetting we paused it.
+        resumeValveMutedMic(note: nil)
         overlayState.transcriptCount = 0
         overlayState.audioFrameCount = 0
         overlayState.systemAudioFrameCount = 0
