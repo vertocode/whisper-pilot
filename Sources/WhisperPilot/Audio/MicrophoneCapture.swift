@@ -35,7 +35,7 @@ final class MicrophoneCapture {
 
     init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
-        self.frames = AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
+        self.frames = AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             capturedContinuation = continuation
         }
         self.continuation = capturedContinuation
@@ -183,7 +183,7 @@ final class MicrophoneCapture {
             let outRMS = Self.computeRMSAny(output)
             wpInfo("Microphone frame#\(framesEmitted) inFrames=\(buffer.frameLength) outFrames=\(output.frameLength) inRMS=\(String(format: "%.5f", inRMS)) outRMS=\(String(format: "%.5f", outRMS))")
         }
-        continuation.yield(AudioFrame(buffer: output, channel: .microphone, timestamp: Date()))
+        continuation.yieldTracked(AudioFrame(buffer: output, channel: .microphone, timestamp: Date()), stage: "capture")
     }
 
     /// Reads `kAudioHardwarePropertyDefaultInputDevice` and that device's display name.

@@ -27,7 +27,7 @@ final class SystemAudioCapture: NSObject {
 
     override init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
-        self.frames = AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
+        self.frames = AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             capturedContinuation = continuation
         }
         self.continuation = capturedContinuation
@@ -133,7 +133,7 @@ extension SystemAudioCapture: SCStreamOutput {
         } else if framesEmitted % 200 == 0 {
             print("[WP][SystemAudio] frames emitted: \(framesEmitted)")
         }
-        continuation.yield(frame)
+        continuation.yieldTracked(frame, stage: "capture")
     }
 
     private func makePCMBuffer(from sample: CMSampleBuffer) -> AVAudioPCMBuffer? {

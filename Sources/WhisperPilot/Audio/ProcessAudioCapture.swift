@@ -48,7 +48,7 @@ final class ProcessAudioCapture {
 
     init() {
         var captured: AsyncStream<AudioFrame>.Continuation!
-        self.frames = AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
+        self.frames = AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             captured = continuation
         }
         self.continuation = captured
@@ -330,7 +330,7 @@ final class ProcessAudioCapture {
         }
 
         let frame = AudioFrame(buffer: outputBuffer, channel: .system, timestamp: Date())
-        continuation.yield(frame)
+        continuation.yieldTracked(frame, stage: "processTap")
     }
 
     /// RMS computed directly off the AudioBufferList memory, treating it as Float32. This

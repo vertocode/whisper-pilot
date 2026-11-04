@@ -9,7 +9,7 @@ final class AudioMixer: @unchecked Sendable {
 
     init() {
         var capturedContinuation: AsyncStream<AudioFrame>.Continuation!
-        self.output = AsyncStream(bufferingPolicy: .bufferingNewest(128)) { continuation in
+        self.output = AsyncStream(bufferingPolicy: .bufferingNewest(1024)) { continuation in
             capturedContinuation = continuation
         }
         self.continuation = capturedContinuation
@@ -19,10 +19,10 @@ final class AudioMixer: @unchecked Sendable {
         await withTaskGroup(of: Void.self) { group in
             let continuation = self.continuation
             group.addTask {
-                for await frame in systemFrames { continuation.yield(frame) }
+                for await frame in systemFrames { continuation.yieldTracked(frame, stage: "mixer") }
             }
             group.addTask {
-                for await frame in micFrames { continuation.yield(frame) }
+                for await frame in micFrames { continuation.yieldTracked(frame, stage: "mixer") }
             }
         }
     }

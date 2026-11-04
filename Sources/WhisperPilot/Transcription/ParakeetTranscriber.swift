@@ -154,7 +154,7 @@ private final class Pipe: @unchecked Sendable {
         wpInfo("Parakeet.\(channel): models loaded (\(await manager.displayName))")
 
         let (inputStream, inputContinuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
-            bufferingPolicy: .bufferingNewest(256)
+            bufferingPolicy: .bufferingNewest(2048)
         )
         let engineConfig = await manager.config
         let pipe = Pipe(
@@ -189,7 +189,9 @@ private final class Pipe: @unchecked Sendable {
         mutex.lock()
         if isFinished { mutex.unlock(); return }
         mutex.unlock()
-        inputContinuation.yield(buffer)
+        if case .dropped(let evicted) = inputContinuation.yield(buffer) {
+            AudioDropMonitor.shared.recordDrop(stage: "Parakeet.\(channel).input", buffer: evicted)
+        }
     }
 
     func finish() {
@@ -231,8 +233,13 @@ private final class Pipe: @unchecked Sendable {
                     wpInfo("Parakeet.\(channel) FIRST buffer (frames=\(buffer.frameLength))")
                 }
                 do {
+                    let started = ContinuousClock.now
                     try await self.manager.appendAudio(buffer)
                     try await self.manager.processBufferedAudio()
+                    let took = ContinuousClock.now - started
+                    if took >= .seconds(1) {
+                        wpWarn("Parakeet.\(channel) slow decode: \(took) for \(buffer.frameLength) frames — transcript will lag (CPU contention?)")
+                    }
                     self.mutex.withLock {
                         self.appendedSeconds += buffer.format.sampleRate > 0
                             ? Double(buffer.frameLength) / buffer.format.sampleRate

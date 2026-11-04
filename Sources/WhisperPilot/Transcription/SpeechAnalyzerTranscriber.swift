@@ -251,7 +251,7 @@ private final class Pipe: @unchecked Sendable {
         }
 
         let (inputStream, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream(
-            bufferingPolicy: .bufferingNewest(256)
+            bufferingPolicy: .bufferingNewest(2048)
         )
 
         try await analyzer.start(inputSequence: inputStream)
@@ -314,7 +314,9 @@ private final class Pipe: @unchecked Sendable {
             wpInfo("SpeechAnalyzer.\(channel) buffer#\(count) frames=\(converted.frameLength)")
         }
 
-        inputContinuation.yield(AnalyzerInput(buffer: converted))
+        if case .dropped(let evicted) = inputContinuation.yield(AnalyzerInput(buffer: converted)) {
+            AudioDropMonitor.shared.recordDrop(stage: "SpeechAnalyzer.\(channel).input", buffer: evicted.buffer)
+        }
     }
 
     func finish() {

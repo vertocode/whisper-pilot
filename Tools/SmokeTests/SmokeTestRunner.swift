@@ -53,6 +53,7 @@ struct SmokeTestRunner {
         await runQuestionEvalSuite()
         await runChatScrollSuite()
         await runTranscriptHistoryCapSuite()
+        await runAudioDropTrackingSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
@@ -418,6 +419,24 @@ struct SmokeTestRunner {
                          "an answer with no question above scrolls to itself")
             let note = msg(.system)
             await expect(ChatScroll.target(in: [question, answer, note]) == note.id, "a system note scrolls to itself")
+        }
+    }
+
+    static func runAudioDropTrackingSuite() async {
+        await suite("AudioDropTracking") {
+            let (stream, sink) = AsyncStream<AudioFrame>.makeStream(bufferingPolicy: .bufferingNewest(2))
+            let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+            func frame() -> AudioFrame {
+                let b = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 320)!
+                b.frameLength = 320
+                return AudioFrame(buffer: b, channel: .system, timestamp: Date())
+            }
+            for _ in 0..<5 { sink.yieldTracked(frame(), stage: "smoke") }
+            sink.finish()
+            var count = 0
+            for await _ in stream { count += 1 }
+            await expect(count == 2, "bounded stream keeps newest; evictions are reported, not fatal")
+            AudioDropMonitor.shared.flushSummary()
         }
     }
 

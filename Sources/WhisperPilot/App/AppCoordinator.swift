@@ -2406,7 +2406,25 @@ final class AppCoordinator {
         // Snapshot the mute-flag cache once; the lock is Sendable so the detached
         // consumer can read it per frame without hopping to the main actor.
         let muteFlags = self.muteFlags
+        // VAD events go to the main actor through an unbounded, ordered stream
+        // instead of being awaited inline. Awaiting `handleVADEvent` (main actor)
+        // from the audio loop stalled audio consumption whenever the main thread
+        // was busy; the bounded mixer stream then silently evicted audio and the
+        // transcript skipped ahead. Events are rare (speech start/end), so the
+        // stream stays tiny.
+        let (vadEvents, vadEventSink) = AsyncStream<VoiceActivityEvent>.makeStream()
+        consumerTasks.append(Task { [weak self] in
+            for await event in vadEvents {
+                await self?.handleVADEvent(event)
+            }
+        })
         consumerTasks.append(Task.detached { [weak self] in
+            defer {
+                vadEventSink.finish()
+                AudioDropMonitor.shared.flushSummary()
+            }
+            // Per-channel arrival time of the last frame, to log capture stalls.
+            var lastFrameAt: [AudioChannel: ContinuousClock.Instant] = [:]
             // Counters accumulate locally and flush to `OverlayState` on a ~2 Hz
             // throttle. Previously each frame spawned a `Task { @MainActor }` to
             // bump per-channel counts and a `MainActor.run` to read mute state —
@@ -2419,6 +2437,11 @@ final class AppCoordinator {
             var lastCounterPublish: ContinuousClock.Instant = .now
             for await frame in mixer.output {
                 framesProcessed += 1
+                let arrivedAt = ContinuousClock.now
+                if let previous = lastFrameAt[frame.channel], arrivedAt - previous >= .milliseconds(1500) {
+                    wpWarn("Pipeline: no \(frame.channel) audio for \(arrivedAt - previous) — capture stalled (transcript gap)")
+                }
+                lastFrameAt[frame.channel] = arrivedAt
                 switch frame.channel {
                 case .system: systemFrames += 1
                 case .microphone: micFrames += 1
@@ -2448,7 +2471,7 @@ final class AppCoordinator {
                 } else {
                     // Flush the absolute counters at ~2 Hz so the watchdog still sees
                     // which side is silent and the Diagnostics frame counts still move.
-                    let now = ContinuousClock.now
+                    let now = arrivedAt
                     if now - lastCounterPublish >= .milliseconds(500) {
                         lastCounterPublish = now
                         let total = framesProcessed
@@ -2476,7 +2499,7 @@ final class AppCoordinator {
                 transcriber.feed(frame.buffer, channel: frame.channel)
                 if let event {
                     wpInfo("VAD: \(event)")
-                    await self?.handleVADEvent(event)
+                    vadEventSink.yield(event)
                 }
             }
             wpInfo("Pipeline: mixer stream ended after \(framesProcessed) frames")
