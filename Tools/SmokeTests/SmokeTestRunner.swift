@@ -18,6 +18,8 @@ struct SmokeTestRunner {
         await runUpdateCheckerSuite()
         await runStreamingAudioConverterSuite()
         await runSystemAudioGainSuite()
+        await runAudioFrameCoalescerSuite()
+        await runMinIntervalGateSuite()
         await runTranscriptBufferSuite()
         await runReplayOverlapTrimmerSuite()
         await runTranscriptStreamSegmenterSuite()
@@ -1900,6 +1902,79 @@ struct SmokeTestRunner {
     /// old per-buffer `reset()` + `.endOfStream` pattern was working around (a
     /// latched converter returns 0 frames from call 2 onward) — the `.noDataNow`
     /// idiom must not reintroduce it, and must not leak samples to re-priming.
+    static func runAudioFrameCoalescerSuite() async {
+        await suite("AudioFrameCoalescer") {
+            let format = CanonicalAudioFormat.make()
+            func makeBuffer(frames: Int, startingAt start: Float) -> AVAudioPCMBuffer? {
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)),
+                      let data = buffer.floatChannelData else { return nil }
+                buffer.frameLength = AVAudioFrameCount(frames)
+                for i in 0..<frames { data[0][i] = start + Float(i) }
+                return buffer
+            }
+
+            var coalescer = AudioFrameCoalescer(targetFrames: 1_000)
+            var emitted: [AVAudioPCMBuffer] = []
+            var next: Float = 0
+            for _ in 0..<7 {
+                guard let input = makeBuffer(frames: 341, startingAt: next) else { continue }
+                next += 341
+                if let out = coalescer.append(input) { emitted.append(out) }
+            }
+            await expect(emitted.count == 2, "7 x 341 frames at target 1000 emits twice (got \(emitted.count))")
+            let emittedFrames = emitted.reduce(0) { $0 + Int($1.frameLength) }
+            await expect(emittedFrames == 6 * 341, "emitted frames are whole inputs, none lost or duplicated (got \(emittedFrames))")
+            var contiguous = true
+            var expected: Float = 0
+            for buffer in emitted {
+                guard let data = buffer.floatChannelData else { contiguous = false; continue }
+                for i in 0..<Int(buffer.frameLength) {
+                    if data[0][i] != expected { contiguous = false }
+                    expected += 1
+                }
+            }
+            await expect(contiguous, "samples come out unchanged and in order")
+
+            var passThrough = AudioFrameCoalescer(targetFrames: 1_000)
+            if let big = makeBuffer(frames: 1_500, startingAt: 0) {
+                let out = passThrough.append(big)
+                await expect(out === big, "a buffer already at the target passes straight through")
+            }
+
+            var overflow = AudioFrameCoalescer(targetFrames: 1_000)
+            if let small = makeBuffer(frames: 100, startingAt: 0), let huge = makeBuffer(frames: 5_000, startingAt: 100) {
+                _ = overflow.append(small)
+                let out = overflow.append(huge)
+                await expect(out?.frameLength == 5_100, "a large buffer after a small one is joined, not truncated (got \(out?.frameLength ?? 0))")
+                if let data = out?.floatChannelData {
+                    await expect(data[0][99] == 99 && data[0][100] == 100 && data[0][5_099] == 5_099,
+                                 "joined overflow buffer keeps sample order")
+                }
+            }
+
+            var resettable = AudioFrameCoalescer(targetFrames: 1_000)
+            if let a = makeBuffer(frames: 600, startingAt: 0), let b = makeBuffer(frames: 600, startingAt: 0) {
+                _ = resettable.append(a)
+                resettable.reset()
+                await expect(resettable.append(b) == nil, "reset drops buffered audio")
+            }
+        }
+    }
+
+    static func runMinIntervalGateSuite() async {
+        await suite("MinIntervalGate") {
+            var gate = MinIntervalGate(interval: .seconds(3))
+            let t0 = ContinuousClock.now
+            await expect(gate.allow(at: t0), "first call passes")
+            await expect(!gate.allow(at: t0 + .seconds(1)), "call inside the interval is held back")
+            await expect(!gate.allow(at: t0 + .milliseconds(2_999)), "just inside the interval is held back")
+            await expect(gate.allow(at: t0 + .seconds(3)), "call at the interval passes")
+            await expect(!gate.allow(at: t0 + .seconds(4)), "interval restarts from the last pass")
+            gate.reset()
+            await expect(gate.allow(at: t0 + .seconds(4)), "reset lets the next call pass")
+        }
+    }
+
     static func runStreamingAudioConverterSuite() async {
         await suite("StreamingAudioConverter") {
             guard let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false),

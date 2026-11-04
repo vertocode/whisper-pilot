@@ -19,6 +19,7 @@ final class SystemAudioCapture: NSObject {
     private let stateLock = NSLock()
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
+    private var sourceDescription: AudioStreamBasicDescription?
     private var framesEmitted: Int = 0
     /// True between `stop()` and the next `start()`. Lets the delegate's
     /// crash-restart loop tell a deliberate teardown apart from a mid-session
@@ -63,6 +64,7 @@ final class SystemAudioCapture: NSObject {
         config.width = 100
         config.height = 100
         config.queueDepth = 3
+        config.showsCursor = false
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
@@ -97,6 +99,7 @@ final class SystemAudioCapture: NSObject {
         stateLock.withLock {
             self.converter = nil
             self.sourceFormat = nil
+            self.sourceDescription = nil
         }
         self.framesEmitted = 0
     }
@@ -136,16 +139,38 @@ extension SystemAudioCapture: SCStreamOutput {
         continuation.yieldTracked(frame, stage: "capture")
     }
 
+    private static func sameDescription(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription) -> Bool {
+        a.mSampleRate == b.mSampleRate
+            && a.mFormatID == b.mFormatID
+            && a.mFormatFlags == b.mFormatFlags
+            && a.mBytesPerPacket == b.mBytesPerPacket
+            && a.mFramesPerPacket == b.mFramesPerPacket
+            && a.mBytesPerFrame == b.mBytesPerFrame
+            && a.mChannelsPerFrame == b.mChannelsPerFrame
+            && a.mBitsPerChannel == b.mBitsPerChannel
+    }
+
     private func makePCMBuffer(from sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let formatDescription = sample.formatDescription,
               let asbd = formatDescription.audioStreamBasicDescription else { return nil }
-        var streamDescription = asbd
-        guard let inputFormat = AVAudioFormat(streamDescription: &streamDescription) else { return nil }
-
         stateLock.lock()
+        let inputFormat: AVAudioFormat
+        if let cached = sourceFormat, let known = sourceDescription, Self.sameDescription(known, asbd) {
+            // Same stream layout as the last buffer (the normal case): reuse the
+            // format instead of building a new one on every callback.
+            inputFormat = cached
+        } else {
+            var streamDescription = asbd
+            guard let built = AVAudioFormat(streamDescription: &streamDescription) else {
+                stateLock.unlock()
+                return nil
+            }
+            inputFormat = built
+        }
         if sourceFormat?.isEqual(inputFormat) != true {
             if let newConverter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make()) {
                 sourceFormat = inputFormat
+                sourceDescription = asbd
                 converter = newConverter
                 wpInfo("System audio source format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, interleaved=\(inputFormat.isInterleaved), commonFormat=\(inputFormat.commonFormat.rawValue)")
             } else {
@@ -153,6 +178,7 @@ extension SystemAudioCapture: SCStreamOutput {
                 // the next buffer compare equal, skip this branch forever, and
                 // leave the channel permanently dead on a stale nil converter.
                 sourceFormat = nil
+                sourceDescription = nil
                 converter = nil
                 wpError("System audio: no converter for source format \(inputFormat.sampleRate) Hz / \(inputFormat.channelCount) ch — will retry on next buffer")
             }

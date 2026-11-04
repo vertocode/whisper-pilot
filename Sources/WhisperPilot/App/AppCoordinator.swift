@@ -949,7 +949,7 @@ final class AppCoordinator {
                 let sample = self.resourceSampler.sample()
                 // Publish for the live Diagnostics readout on every tick — independent
                 // of the valve, so the numbers update even when the valve is disabled.
-                self.overlayState.resourceSample = sample
+                self.overlayState.publishResourceSample(sample)
                 // Valve disabled in Settings: sample for the readout only, never trip
                 // the governor (reverts to the old no-limit behavior).
                 guard self.settings.safetyValveEnabled else { continue }
@@ -969,7 +969,7 @@ final class AppCoordinator {
         resourceGovernor.reset()
         // Clear the live readout — the monitor only samples while listening, so an
         // idle session shows "—" rather than a stale last reading.
-        overlayState.resourceSample = nil
+        overlayState.publishResourceSample(nil)
         if tier1Engaged {
             dismissTier1Note()
             tier1Engaged = false
@@ -1065,7 +1065,7 @@ final class AppCoordinator {
 
     private func tier2Cause(_ trigger: String) -> String {
         if resourceGovernor.trigger == .thermal {
-            return overlayState.resourceSample?.thermalState == .critical
+            return overlayState.latestResourceSample?.thermalState == .critical
                 ? "thermal state is critical"
                 : "your Mac stayed too hot for too long"
         }
@@ -1074,7 +1074,7 @@ final class AppCoordinator {
 
     private func resourceSampleSummary() -> String {
         let cores = ProcessInfo.processInfo.activeProcessorCount
-        guard let sample = overlayState.resourceSample else { return "no sample, cores=\(cores)" }
+        guard let sample = overlayState.latestResourceSample else { return "no sample, cores=\(cores)" }
         return "cpu=\(Int(sample.cpuPercent.rounded()))% (100=1 core), memory=\(sample.memoryBytes / 1_000_000) MB, thermal=\(sample.thermalState.rawValue), cores=\(cores)"
     }
 
@@ -2435,6 +2435,9 @@ final class AppCoordinator {
             var systemFrames = 0
             var micFrames = 0
             var lastCounterPublish: ContinuousClock.Instant = .now
+            // The transcriber gets ~100 ms buffers instead of every 10–40 ms capture
+            // buffer. VAD below still sees the original small frames.
+            var coalescers: [AudioChannel: AudioFrameCoalescer] = [:]
             for await frame in mixer.output {
                 framesProcessed += 1
                 let arrivedAt = ContinuousClock.now
@@ -2469,10 +2472,10 @@ final class AppCoordinator {
                     }
                     lastCounterPublish = .now
                 } else {
-                    // Flush the absolute counters at ~2 Hz so the watchdog still sees
+                    // Flush the absolute counters every 2 s so the watchdog still sees
                     // which side is silent and the Diagnostics frame counts still move.
                     let now = arrivedAt
-                    if now - lastCounterPublish >= .milliseconds(500) {
+                    if now - lastCounterPublish >= .seconds(2) {
                         lastCounterPublish = now
                         let total = framesProcessed
                         let sys = systemFrames
@@ -2494,9 +2497,14 @@ final class AppCoordinator {
                     case .system: return flags.systemMuted
                     }
                 }
-                if isMuted { continue }
+                if isMuted {
+                    coalescers[frame.channel]?.reset()
+                    continue
+                }
                 let event = await vad.feed(frame)
-                transcriber.feed(frame.buffer, channel: frame.channel)
+                if let merged = coalescers[frame.channel, default: AudioFrameCoalescer()].append(frame.buffer) {
+                    transcriber.feed(merged, channel: frame.channel)
+                }
                 if let event {
                     wpInfo("VAD: \(event)")
                     vadEventSink.yield(event)
@@ -2571,7 +2579,12 @@ final class AppCoordinator {
                     if !evicted.isEmpty, let state = self?.overlayState {
                         state.transcriptHistory = TranscriptHistoryCap.capped(state.transcriptHistory + evicted)
                     }
-                    self?.overlayState.transcript = snapshot
+                    if let state = self?.overlayState {
+                        // Assigning an @Published value always redraws the overlay, even
+                        // when nothing changed (a partial that repeats the last text).
+                        if state.transcript != snapshot { state.transcript = snapshot }
+                        state.transcriptCount = transcriptsSeen + 1
+                    }
                     lastTranscriptUIPublish = now
                     // Feed the same snapshot to the translation queue. Diffing
                     // it against what was last translated is what makes
@@ -2584,8 +2597,8 @@ final class AppCoordinator {
                     }
                 }
                 transcriptsSeen += 1
-                self?.overlayState.transcriptCount = transcriptsSeen
                 if transcriptsSeen == 1 {
+                    self?.overlayState.transcriptCount = 1
                     wpInfo("First transcript update received")
                     self?.dismissNoTranscriptsWarning()
                 }

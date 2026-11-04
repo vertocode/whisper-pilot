@@ -19,7 +19,10 @@ struct LogEntry: Identifiable, Sendable {
 final class LogBuffer: ObservableObject {
     static let shared = LogBuffer()
 
-    @Published private(set) var entries: [LogEntry] = []
+    /// Not `@Published`: every append would redraw the whole overlay. Views refresh
+    /// at most twice a second through `schedulePublish`.
+    private(set) var entries: [LogEntry] = []
+    private var publishScheduled = false
     /// Increments whenever a `.warn` or `.error` is appended; the overlay watches this so
     /// it can surface a numeric badge without re-rendering the full list.
     @Published private(set) var unseenAlertCount: Int = 0
@@ -36,11 +39,23 @@ final class LogBuffer: ObservableObject {
         if level == .warn || level == .error {
             unseenAlertCount += 1
         }
+        schedulePublish()
         // Mirror every entry into the on-disk crash log. The in-memory buffer
         // above is gone the instant the process dies; the file persists. On
         // next launch, `CrashLogger.logTail()` is what the user can paste into
         // a bug report when the app vanished without leaving a Cocoa dialog.
         CrashLogger.shared.writeLine("[\(level.rawValue.uppercased())] \(message)")
+    }
+
+    private func schedulePublish() {
+        guard !publishScheduled else { return }
+        publishScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self else { return }
+            self.publishScheduled = false
+            self.objectWillChange.send()
+        }
     }
 
     func clearAlertBadge() {
@@ -49,6 +64,7 @@ final class LogBuffer: ObservableObject {
 
     func clearAll() {
         entries.removeAll()
+        objectWillChange.send()
         unseenAlertCount = 0
     }
 }
@@ -219,14 +235,17 @@ final class OverlayState: ObservableObject {
     /// usual signature of an output-device routing problem (Bluetooth /
     /// aggregate / virtual driver) where capture starts cleanly but the
     /// macOS audio mixdown we tap doesn't include the playing audio.
-    @Published var systemAudioFrameCount: Int = 0
-    @Published var microphoneFrameCount: Int = 0
+    ///
+    /// The per-channel counters below are deliberately not `@Published`: only the
+    /// watchdog reads them, and publishing would redraw the whole overlay.
+    var systemAudioFrameCount: Int = 0
+    var microphoneFrameCount: Int = 0
     /// Per-channel finalized-transcript counters. Lets the no-transcripts
     /// watchdog tell the difference between "system audio is producing
     /// silent buffers" (frames > 0, sys transcripts == 0) and "user just
     /// hasn't said anything yet" (both transcript counts == 0).
-    @Published var systemTranscriptCount: Int = 0
-    @Published var microphoneTranscriptCount: Int = 0
+    var systemTranscriptCount: Int = 0
+    var microphoneTranscriptCount: Int = 0
 
     /// Per-channel mute. When true, captured frames for that channel are dropped before
     /// reaching VAD/transcription. Capture itself keeps running so the resume is instant.
@@ -247,7 +266,21 @@ final class OverlayState: ObservableObject {
     /// Latest resource reading published by the safety-valve monitor (~1.3 Hz) for the
     /// live Diagnostics readout. `nil` while not listening — the monitor only samples
     /// during a session, so the readout shows "—" when idle.
-    @Published var resourceSample: ResourceSample? = nil
+    @Published private(set) var resourceSample: ResourceSample? = nil
+    /// Newest reading, always current. `resourceSample` above only follows it every
+    /// few seconds, because each publish redraws the whole overlay.
+    private(set) var latestResourceSample: ResourceSample? = nil
+    private var resourcePublishGate = MinIntervalGate(interval: .seconds(3))
+
+    func publishResourceSample(_ sample: ResourceSample?) {
+        latestResourceSample = sample
+        let changedKind = (sample == nil) != (resourceSample == nil)
+            || sample?.thermalState != resourceSample?.thermalState
+        if changedKind || resourcePublishGate.allow(at: .now) {
+            resourceSample = sample
+            if sample == nil { resourcePublishGate.reset() }
+        }
+    }
 
     /// User-supplied context for this session — free-form notes plus attached files.
     /// Edited via the Context dropdown in the AI lane and persisted to disk by the

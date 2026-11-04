@@ -88,7 +88,7 @@ final class MicrophoneCapture {
             converter = AVAudioConverter(from: inputFormat, to: CanonicalAudioFormat.make())
         }
 
-        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.handle(buffer)
         }
 

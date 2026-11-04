@@ -704,14 +704,14 @@ struct OverlayView: View {
                     // also follows a growing in-progress hypothesis: a long
                     // sentence wraps to more lines under the same id, and
                     // id-only tracking would leave its tail below the fold.
-                    .onChange(of: state.transcript.last) { _, _ in
-                        followTranscript(proxy)
+                    .onChange(of: state.transcript.last) { old, new in
+                        followTranscript(proxy, animated: old?.id != new?.id)
                     }
                     .overlay(alignment: .bottomTrailing) {
                         AutoScrollToggle(isPaused: transcriptAutoScrollPaused, hasUnseen: transcriptHasUnseen) {
                             transcriptAutoScrollPaused.toggle()
                             transcriptHasUnseen = false
-                            if !transcriptAutoScrollPaused { followTranscript(proxy) }
+                            if !transcriptAutoScrollPaused { followTranscript(proxy, animated: true) }
                         }
                         .padding(WP.Space.sm)
                     }
@@ -736,13 +736,17 @@ struct OverlayView: View {
         }
     }
 
-    private func followTranscript(_ proxy: ScrollViewProxy) {
+    private func followTranscript(_ proxy: ScrollViewProxy, animated: Bool) {
         guard !transcriptAutoScrollPaused else {
             transcriptHasUnseen = true
             return
         }
         guard let last = (state.transcript.last ?? state.transcriptHistory.last)?.id else { return }
-        withAnimation(.easeOut(duration: 0.15)) {
+        if animated {
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo(last, anchor: .bottom)
+            }
+        } else {
             proxy.scrollTo(last, anchor: .bottom)
         }
     }
@@ -1204,7 +1208,9 @@ private struct StatusDot: View {
 
     private var shouldPulse: Bool {
         switch status {
-        case .starting, .listening, .thinking, .streaming: return true
+        // Not while listening: that state lasts the whole meeting, and a forever
+        // animation keeps the app redrawing 60 times a second.
+        case .starting, .thinking, .streaming: return true
         default: return false
         }
     }
