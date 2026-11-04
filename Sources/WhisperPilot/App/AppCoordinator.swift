@@ -2425,12 +2425,12 @@ final class AppCoordinator {
             }
             // Per-channel arrival time of the last frame, to log capture stalls.
             var lastFrameAt: [AudioChannel: ContinuousClock.Instant] = [:]
-            // Counters accumulate locally and flush to `OverlayState` on a ~2 Hz
-            // throttle. Previously each frame spawned a `Task { @MainActor }` to
+            // Counters accumulate locally and flush to `OverlayState` every 2 s.
+            // Previously each frame spawned a `Task { @MainActor }` to
             // bump per-channel counts and a `MainActor.run` to read mute state —
             // a main-actor hop per audio frame, the dominant standing CPU cost of
-            // the live pipeline. Now we touch the main actor at most ~twice a
-            // second regardless of frame rate.
+            // the live pipeline. Now we touch the main actor at most once
+            // every 2 s regardless of frame rate.
             var framesProcessed = 0
             var systemFrames = 0
             var micFrames = 0
@@ -2498,16 +2498,28 @@ final class AppCoordinator {
                     }
                 }
                 if isMuted {
-                    coalescers[frame.channel]?.reset()
+                    for held in coalescers[frame.channel]?.flush() ?? [] {
+                        transcriber.feed(held, channel: frame.channel)
+                    }
                     continue
                 }
                 let event = await vad.feed(frame)
-                if let merged = coalescers[frame.channel, default: AudioFrameCoalescer()].append(frame.buffer) {
+                for merged in coalescers[frame.channel, default: AudioFrameCoalescer()].append(frame.buffer) {
                     transcriber.feed(merged, channel: frame.channel)
                 }
                 if let event {
+                    if case .speechEnded(let endedChannel, _, _, _) = event {
+                        for held in coalescers[endedChannel]?.flush() ?? [] {
+                            transcriber.feed(held, channel: endedChannel)
+                        }
+                    }
                     wpInfo("VAD: \(event)")
                     vadEventSink.yield(event)
+                }
+            }
+            for (channel, var coalescer) in coalescers {
+                for held in coalescer.flush() {
+                    transcriber.feed(held, channel: channel)
                 }
             }
             wpInfo("Pipeline: mixer stream ended after \(framesProcessed) frames")

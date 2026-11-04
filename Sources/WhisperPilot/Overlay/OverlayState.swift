@@ -277,6 +277,7 @@ final class OverlayState: ObservableObject {
         let changedKind = (sample == nil) != (resourceSample == nil)
             || sample?.thermalState != resourceSample?.thermalState
         if changedKind || resourcePublishGate.allow(at: .now) {
+            if changedKind { _ = resourcePublishGate.allow(at: .now) }
             resourceSample = sample
             if sample == nil { resourcePublishGate.reset() }
         }

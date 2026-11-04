@@ -1896,12 +1896,6 @@ struct SmokeTestRunner {
         }
     }
 
-    /// Guards the streaming conversion contract: one converter instance fed many
-    /// sequential Process-Tap-sized buffers (10 ms, 48 kHz stereo → 16 kHz mono)
-    /// must keep producing output for every buffer. This is the regression the
-    /// old per-buffer `reset()` + `.endOfStream` pattern was working around (a
-    /// latched converter returns 0 frames from call 2 onward) — the `.noDataNow`
-    /// idiom must not reintroduce it, and must not leak samples to re-priming.
     static func runAudioFrameCoalescerSuite() async {
         await suite("AudioFrameCoalescer") {
             let format = CanonicalAudioFormat.make()
@@ -1919,7 +1913,7 @@ struct SmokeTestRunner {
             for _ in 0..<7 {
                 guard let input = makeBuffer(frames: 341, startingAt: next) else { continue }
                 next += 341
-                if let out = coalescer.append(input) { emitted.append(out) }
+                emitted.append(contentsOf: coalescer.append(input))
             }
             await expect(emitted.count == 2, "7 x 341 frames at target 1000 emits twice (got \(emitted.count))")
             let emittedFrames = emitted.reduce(0) { $0 + Int($1.frameLength) }
@@ -1938,25 +1932,46 @@ struct SmokeTestRunner {
             var passThrough = AudioFrameCoalescer(targetFrames: 1_000)
             if let big = makeBuffer(frames: 1_500, startingAt: 0) {
                 let out = passThrough.append(big)
-                await expect(out === big, "a buffer already at the target passes straight through")
+                await expect(out.count == 1 && out[0] === big, "a buffer already at the target passes straight through")
             }
 
             var overflow = AudioFrameCoalescer(targetFrames: 1_000)
             if let small = makeBuffer(frames: 100, startingAt: 0), let huge = makeBuffer(frames: 5_000, startingAt: 100) {
                 _ = overflow.append(small)
                 let out = overflow.append(huge)
-                await expect(out?.frameLength == 5_100, "a large buffer after a small one is joined, not truncated (got \(out?.frameLength ?? 0))")
-                if let data = out?.floatChannelData {
+                await expect(out.count == 1 && out[0].frameLength == 5_100, "a large buffer after a small one is joined, not truncated (got \(out.first?.frameLength ?? 0))")
+                if let data = out.first?.floatChannelData {
                     await expect(data[0][99] == 99 && data[0][100] == 100 && data[0][5_099] == 5_099,
                                  "joined overflow buffer keeps sample order")
                 }
             }
 
-            var resettable = AudioFrameCoalescer(targetFrames: 1_000)
-            if let a = makeBuffer(frames: 600, startingAt: 0), let b = makeBuffer(frames: 600, startingAt: 0) {
-                _ = resettable.append(a)
-                resettable.reset()
-                await expect(resettable.append(b) == nil, "reset drops buffered audio")
+            var flushable = AudioFrameCoalescer(targetFrames: 1_000)
+            if let a = makeBuffer(frames: 600, startingAt: 0) {
+                let held = flushable.append(a)
+                await expect(held.isEmpty, "a short buffer is held back")
+                let flushed = flushable.flush()
+                await expect(flushed.count == 1 && flushed[0].frameLength == 600, "flush returns the held audio (got \(flushed.first?.frameLength ?? 0))")
+                if let data = flushed.first?.floatChannelData {
+                    await expect(data[0][0] == 0 && data[0][599] == 599, "flushed samples are unchanged")
+                }
+                await expect(flushable.flush().isEmpty, "a second flush has nothing left")
+            }
+
+            var formatChange = AudioFrameCoalescer(targetFrames: 1_000)
+            if let a = makeBuffer(frames: 600, startingAt: 0),
+               let otherFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 1, interleaved: false),
+               let b = AVAudioPCMBuffer(pcmFormat: otherFormat, frameCapacity: 300),
+               let bData = b.floatChannelData {
+                b.frameLength = 300
+                for i in 0..<300 { bData[0][i] = 1_000 + Float(i) }
+                _ = formatChange.append(a)
+                let out = formatChange.append(b)
+                await expect(out.count == 1 && out[0].frameLength == 600 && out[0].format == format,
+                             "format change emits the held audio first (got \(out.count) buffers)")
+                let rest = formatChange.flush()
+                await expect(rest.count == 1 && rest[0].frameLength == 300 && rest[0].format == otherFormat,
+                             "the new-format buffer is held, not lost")
             }
         }
     }
@@ -1975,6 +1990,12 @@ struct SmokeTestRunner {
         }
     }
 
+    /// Guards the streaming conversion contract: one converter instance fed many
+    /// sequential Process-Tap-sized buffers (10 ms, 48 kHz stereo → 16 kHz mono)
+    /// must keep producing output for every buffer. This is the regression the
+    /// old per-buffer `reset()` + `.endOfStream` pattern was working around (a
+    /// latched converter returns 0 frames from call 2 onward) — the `.noDataNow`
+    /// idiom must not reintroduce it, and must not leak samples to re-priming.
     static func runStreamingAudioConverterSuite() async {
         await suite("StreamingAudioConverter") {
             guard let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false),

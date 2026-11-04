@@ -12,56 +12,62 @@ struct AudioFrameCoalescer {
         self.targetFrames = targetFrames
     }
 
-    /// Returns a buffer to forward now, or nil while more audio is needed.
-    mutating func append(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    /// Returns the buffers to forward now, oldest first. Empty while more audio is needed.
+    /// Held audio is never dropped: if the format changes or a buffer can't be joined,
+    /// the held audio comes out first, then the new buffer.
+    mutating func append(_ buffer: AVAudioPCMBuffer) -> [AVAudioPCMBuffer] {
         let format = buffer.format
         guard format.commonFormat == .pcmFormatFloat32,
               !format.isInterleaved || format.channelCount == 1,
               buffer.floatChannelData != nil else {
-            pending = nil
-            return buffer
+            return flush() + [buffer]
         }
         guard let current = pending else {
-            if buffer.frameLength >= targetFrames { return buffer }
+            if buffer.frameLength >= targetFrames { return [buffer] }
             return start(with: buffer)
         }
         guard current.format == format else {
             pending = nil
-            return buffer.frameLength >= targetFrames ? buffer : start(with: buffer)
+            if buffer.frameLength >= targetFrames { return [current, buffer] }
+            return [current] + start(with: buffer)
         }
 
         let total = current.frameLength + buffer.frameLength
         if total > current.frameCapacity {
             guard let merged = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: total) else {
                 pending = nil
-                return buffer
+                return [current, buffer]
             }
             Self.copy(current, into: merged, at: 0)
             Self.copy(buffer, into: merged, at: current.frameLength)
             merged.frameLength = total
             pending = nil
-            return merged
+            return [merged]
         }
         Self.copy(buffer, into: current, at: current.frameLength)
         current.frameLength = total
-        guard total >= targetFrames else { return nil }
+        guard total >= targetFrames else { return [] }
         pending = nil
-        return current
+        return [current]
     }
 
-    /// Drops buffered audio, e.g. when the channel is muted.
-    mutating func reset() {
+    /// Hands back whatever is still held, e.g. when the stream ends, speech ends or the
+    /// channel is muted.
+    mutating func flush() -> [AVAudioPCMBuffer] {
+        guard let current = pending else { return [] }
         pending = nil
+        return [current]
     }
 
-    private mutating func start(with buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    /// Holds `buffer` for joining. Returns it straight away if a holding copy can't be made.
+    private mutating func start(with buffer: AVAudioPCMBuffer) -> [AVAudioPCMBuffer] {
         guard let merged = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: targetFrames * 2) else {
-            return buffer
+            return [buffer]
         }
         Self.copy(buffer, into: merged, at: 0)
         merged.frameLength = buffer.frameLength
         pending = merged
-        return nil
+        return []
     }
 
     private static func copy(_ source: AVAudioPCMBuffer, into destination: AVAudioPCMBuffer, at offset: AVAudioFrameCount) {
