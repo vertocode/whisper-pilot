@@ -208,6 +208,9 @@ extension SmokeTestRunner {
             ))])
             let ok = await collect(claude())
             await expect(ok.deltas == ["Hi"] && ok.finish == .stop, "text delta and end_turn parse")
+            let sentBody = StubURLProtocol.lastRequestBody
+            await expect(!sentBody.isEmpty && !sentBody.contains("temperature") && !sentBody.contains("top_p") && !sentBody.contains("top_k"),
+                         "Anthropic request omits sampling params (Sonnet 5.5 rejects temperature with HTTP 400)")
 
             StubURLProtocol.install([.init(status: 200, body: sse(
                 "event: content_block_delta",

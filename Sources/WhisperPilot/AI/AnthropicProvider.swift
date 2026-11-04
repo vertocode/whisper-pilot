@@ -259,7 +259,6 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
             max_tokens: maxTokens,
             system: prompt.systemInstruction,
             messages: [.init(role: "user", content: content)],
-            temperature: 0.4,
             stream: stream
         )
     }
@@ -331,7 +330,10 @@ private struct AnthropicRequest: Encodable {
     let max_tokens: Int
     let system: String?
     let messages: [Message]
-    let temperature: Double
+    // No `temperature` (or top_p/top_k): newer Claude models (e.g. Sonnet 5.5)
+    // reject sampling parameters with HTTP 400 ("temperature is deprecated for
+    // this model"). Every model accepts a request without them and uses its own
+    // default, so we never send them.
     let stream: Bool
 
     static func singleUserTurn(model: String, prompt: String, maxTokens: Int) -> AnthropicRequest {
@@ -340,7 +342,6 @@ private struct AnthropicRequest: Encodable {
             max_tokens: maxTokens,
             system: nil,
             messages: [.init(role: "user", content: [.text(prompt)])],
-            temperature: 0.2,
             stream: false
         )
     }
