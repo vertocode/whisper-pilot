@@ -2825,6 +2825,11 @@ final class AppCoordinator {
                     }
                 }
                 self.log.info("Stream complete (\(deltaCount) deltas, reason=\(String(describing: finishReason), privacy: .public))")
+                let emptyReply = deltaCount == 0
+                if emptyReply {
+                    wpWarn("AI stream ended with no text (origin=\(origin))")
+                    self.fillEmptyAssistant(messageId, with: "⚠️ The AI returned an empty reply.")
+                }
                 self.overlayState.finishAssistant(id: messageId)
                 if let diagnostic = finishReason.diagnosticMessage {
                     // Non-clean finishes are loud failures the user needs to know
@@ -2833,15 +2838,18 @@ final class AppCoordinator {
                     self.overlayState.appendSystemNote("⚠️ AI reply was incomplete — \(diagnostic).", category: .ai)
                     wpWarn("AI stream finished with non-stop reason: \(diagnostic)")
                 }
-                await self.persistAssistantReply(
-                    messageId: messageId,
-                    incomplete: finishReason.diagnosticMessage != nil,
-                    origin: origin,
-                    sessionID: sessionID
-                )
+                if !emptyReply {
+                    await self.persistAssistantReply(
+                        messageId: messageId,
+                        incomplete: finishReason.diagnosticMessage != nil,
+                        origin: origin,
+                        sessionID: sessionID
+                    )
+                }
             } catch is CancellationError {
+                let cancelledEmpty = self.fillEmptyAssistant(messageId, with: "Reply cancelled before it started.")
                 self.overlayState.finishAssistant(id: messageId)
-                await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID)
+                if !cancelledEmpty { await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID) }
             } catch {
                 // 404 means the selected model isn't reachable on this key — almost always
                 // because Google retired it for new users (e.g. `gemini-2.0-flash`). Try
@@ -2869,7 +2877,11 @@ final class AppCoordinator {
                     return
                 }
                 let message = error.localizedDescription
-                wpError("AI stream failed: \(message)")
+                wpError("AI stream failed (origin=\(origin)): \(message)")
+                // Show the failure in the bubble itself: the separate note below is
+                // de-duplicated for auto-detected questions, which left repeat
+                // failures as a bare "…" bubble forever.
+                let failedEmpty = self.fillEmptyAssistant(messageId, with: "⚠️ \(message)")
                 self.overlayState.finishAssistant(id: messageId)
                 let note = "⚠️ \(message)"
                 // Auto-triggered questions can fail back to back for the same reason;
@@ -2879,7 +2891,9 @@ final class AppCoordinator {
                 } else {
                     self.overlayState.appendSystemNote(note, category: .ai)
                 }
-                await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID)
+                if !failedEmpty {
+                    await self.persistAssistantReply(messageId: messageId, incomplete: true, origin: origin, sessionID: sessionID)
+                }
             }
             self.completionFinished(messageId: messageId)
         }
@@ -2893,6 +2907,18 @@ final class AppCoordinator {
     /// the meantime). With concurrent completions, we can't just unconditionally
     /// flip after each one — that would prematurely declare "done" while another
     /// stream is still arriving.
+    /// Puts `text` in an assistant bubble that never received any content, so a
+    /// failed or cancelled reply doesn't render as a permanent "…".
+    /// Returns true when it filled the bubble — callers then skip saving that
+    /// placeholder to chat.md as if the model had said it.
+    @discardableResult
+    private func fillEmptyAssistant(_ id: UUID, with text: String) -> Bool {
+        guard let message = overlayState.messages.first(where: { $0.id == id }),
+              message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        overlayState.replaceText(of: id, with: text)
+        return true
+    }
+
     private func completionFinished(messageId: UUID) {
         inFlightCompletions[messageId] = nil
         guard inFlightCompletions.isEmpty else { return }
