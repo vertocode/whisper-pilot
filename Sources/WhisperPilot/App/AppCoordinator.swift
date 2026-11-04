@@ -2901,12 +2901,6 @@ final class AppCoordinator {
         await task.value
     }
 
-    /// Called by every non-fallback exit path of `runCompletion`. Removes the task
-    /// from the in-flight map and, only when nothing else is still streaming, flips
-    /// the status pill back to `.listening` (or `.idle` if we've been stopped in
-    /// the meantime). With concurrent completions, we can't just unconditionally
-    /// flip after each one — that would prematurely declare "done" while another
-    /// stream is still arriving.
     /// Puts `text` in an assistant bubble that never received any content, so a
     /// failed or cancelled reply doesn't render as a permanent "…".
     /// Returns true when it filled the bubble — callers then skip saving that
@@ -2919,6 +2913,12 @@ final class AppCoordinator {
         return true
     }
 
+    /// Called by every non-fallback exit path of `runCompletion`. Removes the task
+    /// from the in-flight map and, only when nothing else is still streaming, flips
+    /// the status pill back to `.listening` (or `.idle` if we've been stopped in
+    /// the meantime). With concurrent completions, we can't just unconditionally
+    /// flip after each one — that would prematurely declare "done" while another
+    /// stream is still arriving.
     private func completionFinished(messageId: UUID) {
         inFlightCompletions[messageId] = nil
         guard inFlightCompletions.isEmpty else { return }
