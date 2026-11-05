@@ -2081,6 +2081,61 @@ struct SmokeTestRunner {
         }
     }
 
+    /// Holds fake engine calls until the test opens it; stays open afterwards.
+    actor TranslationGate {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        func wait() async {
+            if isOpen { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        func open() {
+            isOpen = true
+            for waiter in waiters { waiter.resume() }
+            waiters.removeAll()
+        }
+    }
+
+    /// Records calls, then waits on the gate. Optionally throws a bare
+    /// `CancellationError` on the first call, as an engine whose host task
+    /// ended would.
+    final class GatedTranslator: TranslationProviding, @unchecked Sendable {
+        private let lock = NSLock()
+        private let gate: TranslationGate
+        private let cancelFirstCall: Bool
+        private var recorded: [String] = []
+        private var cancelled = false
+        private var finishedCount = 0
+        init(gate: TranslationGate, cancelFirstCall: Bool = false) {
+            self.gate = gate
+            self.cancelFirstCall = cancelFirstCall
+        }
+        func translate(_ text: String) async throws -> String {
+            let isFirst = lock.withLock { recorded.append(text); return recorded.count == 1 }
+            await gate.wait()
+            lock.withLock { finishedCount += 1 }
+            if Task.isCancelled { lock.withLock { cancelled = true }; throw CancellationError() }
+            if cancelFirstCall && isFirst { throw CancellationError() }
+            return "<\(text)>"
+        }
+        func prewarm() async {}
+        var calls: [String] { lock.withLock { recorded } }
+        var wasCancelled: Bool { lock.withLock { cancelled } }
+        var finished: Int { lock.withLock { finishedCount } }
+    }
+
+    final class FailureFlag: @unchecked Sendable { var fired = false }
+
+    /// Polls `condition` until it is true or the timeout passes. Test-only.
+    static func pollUntil(timeout: Duration = .seconds(3), _ condition: () async -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return await condition()
+    }
+
     static func volatileSystemSegment(id: UUID = UUID(), _ text: String) -> TranscriptSegment {
         TranscriptSegment(id: id, text: text, isFinal: false, channel: .system,
                           startedAt: Date(), updatedAt: Date())
@@ -2726,24 +2781,8 @@ struct SmokeTestRunner {
         }
 
         await suite("TranslationQueue in-flight translations are not cancelled") {
-            // Slow engine that records whether it was ever cancelled.
-            final class SlowTranslator: TranslationProviding, @unchecked Sendable {
-                private let lock = NSLock()
-                private var recorded: [String] = []
-                private var cancelled = false
-                func translate(_ text: String) async throws -> String {
-                    lock.withLock { recorded.append(text) }
-                    try? await Task.sleep(for: .milliseconds(120))
-                    if Task.isCancelled { lock.withLock { cancelled = true }; throw CancellationError() }
-                    return "<\(text)>"
-                }
-                func prewarm() async {}
-                var calls: [String] { lock.withLock { recorded } }
-                var wasCancelled: Bool { lock.withLock { cancelled } }
-            }
-            final class FailureFlag: @unchecked Sendable { var fired = false }
-
-            let slow = SlowTranslator()
+            let gate = TranslationGate()
+            let slow = GatedTranslator(gate: gate)
             let sink = TranslationSink()
             let flag = FailureFlag()
             let queue = TranslationQueue(provider: slow) { id, text in await sink.record(id, text) }
@@ -2751,22 +2790,99 @@ struct SmokeTestRunner {
             let id = UUID()
 
             await queue.ingest([finalSystemSegment(id: id, "Part one.")])
-            try? await Task.sleep(for: .milliseconds(30))
-            // The row keeps growing while the first call is still running.
+            await expect(await pollUntil { slow.calls.count == 1 }, "first call starts")
+            // The row keeps growing while the first call is held open.
             for text in ["Part one. Two.", "Part one. Two. Three.", "Part one. Two. Three. Four."] {
                 await queue.ingest([finalSystemSegment(id: id, text)])
-                try? await Task.sleep(for: .milliseconds(10))
             }
-            try? await Task.sleep(for: .milliseconds(400))
+            await gate.open()
+            await expect(await pollUntil { await sink.writeCount == 2 }, "interim and follow-up are both written")
 
             await expect(!slow.wasCancelled, "a translation in flight is never cancelled")
             await expect(slow.calls == ["Part one.", "Part one. Two. Three. Four."],
                          "updates during flight coalesce into one follow-up on the latest text")
             await expect(await sink.results[id] == "<Part one. Two. Three. Four.>",
                          "the row ends up with a translation of the latest text")
-            await expect(await sink.writeCount == 2, "the older result shows as an interim, then is replaced")
             await expect(!flag.fired, "no failure is counted")
             await queue.stop()
+        }
+
+        await suite("TranslationQueue stop during flight") {
+            let gate = TranslationGate()
+            let slow = GatedTranslator(gate: gate)
+            let sink = TranslationSink()
+            let flag = FailureFlag()
+            let queue = TranslationQueue(provider: slow) { id, text in await sink.record(id, text) }
+            await queue.setPersistentFailureHandler { _ in flag.fired = true }
+
+            await queue.ingest([finalSystemSegment("Stopping soon.")])
+            await expect(await pollUntil { slow.calls.count == 1 }, "call starts")
+            await queue.stop()
+            await gate.open()
+            await expect(await pollUntil { slow.finished == 1 }, "engine call returns")
+            try? await Task.sleep(for: .milliseconds(50))
+            await expect(await sink.writeCount == 0, "nothing is written back after stop")
+            await expect(!flag.fired, "stop is not counted as a failure")
+        }
+
+        await suite("TranslationQueue finals-only drops a pending volatile follow-up") {
+            let gate = TranslationGate()
+            let slow = GatedTranslator(gate: gate)
+            let sink = TranslationSink()
+            let queue = TranslationQueue(provider: slow) { id, text in await sink.record(id, text) }
+            let id = UUID()
+
+            await queue.ingest([volatileSystemSegment(id: id, "Hello there")])
+            await expect(await pollUntil { slow.calls.count == 1 }, "volatile call starts after the debounce")
+            await queue.ingest([volatileSystemSegment(id: id, "Hello there my friend")])
+            await queue.setMode(.finalsOnly)
+            await gate.open()
+            await expect(await pollUntil { await sink.writeCount == 1 }, "the in-flight call still lands")
+            // Long enough that a follow-up would have fired after its debounce.
+            try? await Task.sleep(for: TranslationQueue.partialDebounce + .milliseconds(150))
+            await expect(slow.calls == ["Hello there"], "no volatile follow-up call is issued")
+            await queue.stop()
+        }
+
+        await suite("TranslationQueue recovers from a non-stop CancellationError") {
+            // Same text again after the engine cancels itself.
+            do {
+                let gate = TranslationGate()
+                await gate.open()
+                let flaky = GatedTranslator(gate: gate, cancelFirstCall: true)
+                let sink = TranslationSink()
+                let flag = FailureFlag()
+                let queue = TranslationQueue(provider: flaky) { id, text in await sink.record(id, text) }
+                await queue.setPersistentFailureHandler { _ in flag.fired = true }
+                let id = UUID()
+                let segment = finalSystemSegment(id: id, "Try again.")
+
+                // Re-ingesting is a no-op until the row is released, so it is safe to poll with.
+                let retried = await pollUntil {
+                    await queue.ingest([segment])
+                    return flaky.calls.count == 2
+                }
+                await expect(retried, "the next ingest retries the row")
+                await expect(await pollUntil { await sink.results[id] == "<Try again.>" }, "the retry is written back")
+                await expect(!flag.fired, "a cancellation is not counted as a failure")
+                await queue.stop()
+            }
+            // Newer text arrived while the cancelled call was in flight.
+            do {
+                let gate = TranslationGate()
+                let flaky = GatedTranslator(gate: gate, cancelFirstCall: true)
+                let sink = TranslationSink()
+                let queue = TranslationQueue(provider: flaky) { id, text in await sink.record(id, text) }
+                let id = UUID()
+
+                await queue.ingest([finalSystemSegment(id: id, "Old text.")])
+                await expect(await pollUntil { flaky.calls.count == 1 }, "first call starts")
+                await queue.ingest([finalSystemSegment(id: id, "Newer text.")])
+                await gate.open()
+                await expect(await pollUntil { await sink.results[id] == "<Newer text.>" },
+                             "the newer text is translated without another ingest")
+                await queue.stop()
+            }
         }
 
         await suite("TranslationQueue channel and baseline gating") {

@@ -111,6 +111,8 @@ actor TranslationQueue {
         // Dropping to finals-only must also abandon debounces already in
         // flight for volatile rows, or the degradation is delayed by up to one
         // debounce window per row.
+        // A row already in flight is left alone; its volatile follow-up is
+        // dropped in `scheduleFollowUp` when the call returns.
         if newMode == .finalsOnly {
             for (id, var state) in rows where state.debounceTask != nil && !state.inFlight {
                 state.debounceTask?.cancel()
@@ -213,12 +215,18 @@ actor TranslationQueue {
         do {
             translated = try await provider.translate(text)
         } catch {
-            // Our own stop()/prune cancelling the call is not an engine failure.
-            if Task.isCancelled || isStopped || error is CancellationError {
+            if isStopped || Task.isCancelled {
+                // Our own stop()/prune cancelling the call is not an engine failure.
                 if var state = rows[id] {
                     state.inFlight = false
                     rows[id] = state
                 }
+                return
+            }
+            if error is CancellationError {
+                // The engine gave up on its own (e.g. its host task ended). Not a
+                // failure, but the row must not stay marked as scheduled.
+                finishFlight(id: id, generation: generation)
                 return
             }
             // A failure is not worth a user-visible error: the row simply stays
@@ -226,17 +234,7 @@ actor TranslationQueue {
             // debug volume rather than per line, which on a bad pair would be
             // several messages a second.
             wpWarn("[Translation] failed for a \(text.count)-char line: \(error)")
-            if var state = rows[id] {
-                state.inFlight = false
-                if state.generation == generation {
-                    state.scheduledSource = nil
-                    state.debounceTask = nil
-                    rows[id] = state
-                } else {
-                    rows[id] = state
-                    scheduleFollowUp(id: id)
-                }
-            }
+            finishFlight(id: id, generation: generation)
             consecutiveFailures += 1
             if consecutiveFailures == Self.persistentFailureThreshold, !isStopped {
                 await onPersistentFailure?(error.localizedDescription)
@@ -248,21 +246,30 @@ actor TranslationQueue {
         // Re-check after the await: the session may have been torn down, or the
         // row pruned, while the engine was working.
         guard !isStopped, var state = rows[id] else { return }
-        state.inFlight = false
         state.translatedSource = text
-        let isCurrent = state.generation == generation
-        if isCurrent {
+        rows[id] = state
+        // `inFlight` stays true through the write-back, so an ingest during it
+        // cannot start a second call. The follow-up (if the row moved on) starts
+        // only after the write-back returns, which guarantees an interim result
+        // is written before any newer one.
+        await onTranslated(id, translated)
+        finishFlight(id: id, generation: generation)
+    }
+
+    /// Ends a flight. If the row has not changed since, it is idle again (and a
+    /// later ingest of the same text retries). If it moved on meanwhile, only
+    /// the latest text gets one follow-up call.
+    private func finishFlight(id: UUID, generation: Int) {
+        guard !isStopped, var state = rows[id] else { return }
+        state.inFlight = false
+        if state.generation == generation {
             state.scheduledSource = nil
             state.debounceTask = nil
+            rows[id] = state
+        } else {
+            rows[id] = state
+            scheduleFollowUp(id: id)
         }
-        rows[id] = state
-        // If the row moved on meanwhile this is an interim translation of the
-        // older text: better than an empty column, and replaced by the
-        // follow-up. No newer result can exist yet, since only one call per row
-        // runs at a time. The follow-up is scheduled before the write-back
-        // suspends, so a concurrent ingest sees it.
-        if !isCurrent { scheduleFollowUp(id: id) }
-        await onTranslated(id, translated)
     }
 
     /// Starts the single follow-up call for the latest text of a row whose
@@ -290,6 +297,8 @@ actor TranslationQueue {
     private func pruneRows(keeping live: Set<UUID>) {
         guard rows.count > Self.maxTrackedRows else { return }
         for (id, state) in rows where !live.contains(id) {
+            // Cancelling an in-flight call here is intended: the row is gone,
+            // so nobody needs its result.
             state.debounceTask?.cancel()
             rows.removeValue(forKey: id)
         }
