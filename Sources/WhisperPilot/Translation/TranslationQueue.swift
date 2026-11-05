@@ -51,7 +51,15 @@ actor TranslationQueue {
         var translatedSource: String?
         var scheduledSource: String?
         var generation: Int = 0
+        /// Runs the debounce sleep and then the translation. Only cancelled
+        /// while `inFlight` is false, so a started translation is never aborted.
         var debounceTask: Task<Void, Never>?
+        /// True from the moment the engine call starts until it returns. At most
+        /// one call per row is ever in flight.
+        var inFlight = false
+        /// Whether the latest scheduled text came from a committed row, which
+        /// decides if its follow-up call skips the debounce.
+        var scheduledIsFinal = false
     }
 
     private let provider: any TranslationProviding
@@ -104,7 +112,7 @@ actor TranslationQueue {
         // flight for volatile rows, or the degradation is delayed by up to one
         // debounce window per row.
         if newMode == .finalsOnly {
-            for (id, var state) in rows where state.debounceTask != nil {
+            for (id, var state) in rows where state.debounceTask != nil && !state.inFlight {
                 state.debounceTask?.cancel()
                 state.debounceTask = nil
                 state.scheduledSource = nil
@@ -148,23 +156,23 @@ actor TranslationQueue {
                 continue
             }
 
-            state.debounceTask?.cancel()
             state.scheduledSource = text
+            state.scheduledIsFinal = segment.isFinal
             state.generation += 1
-            let generation = state.generation
-            let id = segment.id
 
-            // Finals skip the debounce: their text is settled the moment it
-            // commits, and waiting only adds lag. When a roll-up later appends
-            // to that same row the text changes, which re-enters this path and
-            // re-translates — exactly the intended behavior.
-            let delay: Duration? = segment.isFinal ? nil : Self.partialDebounce
-            state.debounceTask = Task { [weak self] in
-                if let delay {
-                    try? await Task.sleep(for: delay)
-                    if Task.isCancelled { return }
-                }
-                await self?.performTranslation(id: id, text: text, generation: generation)
+            // A translation already running is left alone: cancelling it would
+            // abort the engine call, and a long row that keeps growing would
+            // never finish. The latest text is picked up when it returns.
+            if !state.inFlight {
+                state.debounceTask?.cancel()
+                // Finals skip the debounce: their text is settled the moment it
+                // commits, and waiting only adds lag. When a roll-up later appends
+                // to that same row the text changes, which re-enters this path and
+                // re-translates — exactly the intended behavior.
+                state.debounceTask = makeTask(
+                    id: segment.id, text: text, generation: state.generation,
+                    delay: segment.isFinal ? nil : Self.partialDebounce
+                )
             }
             rows[segment.id] = state
         }
@@ -183,24 +191,51 @@ actor TranslationQueue {
 
     // MARK: - Internals
 
+    private func makeTask(id: UUID, text: String, generation: Int, delay: Duration?) -> Task<Void, Never> {
+        Task { [weak self] in
+            if let delay {
+                try? await Task.sleep(for: delay)
+                if Task.isCancelled { return }
+            }
+            await self?.performTranslation(id: id, text: text, generation: generation)
+        }
+    }
+
     private func performTranslation(id: UUID, text: String, generation: Int) async {
         guard !isStopped else { return }
         // Bail if a newer revision of this row was scheduled while we waited
         // out the debounce.
-        guard rows[id]?.generation == generation else { return }
+        guard var started = rows[id], started.generation == generation else { return }
+        started.inFlight = true
+        rows[id] = started
 
         let translated: String
         do {
             translated = try await provider.translate(text)
         } catch {
+            // Our own stop()/prune cancelling the call is not an engine failure.
+            if Task.isCancelled || isStopped || error is CancellationError {
+                if var state = rows[id] {
+                    state.inFlight = false
+                    rows[id] = state
+                }
+                return
+            }
             // A failure is not worth a user-visible error: the row simply stays
             // untranslated and the next revision tries again. Logged once at
             // debug volume rather than per line, which on a bad pair would be
             // several messages a second.
             wpWarn("[Translation] failed for a \(text.count)-char line: \(error)")
-            if var state = rows[id], state.generation == generation {
-                state.scheduledSource = nil
-                rows[id] = state
+            if var state = rows[id] {
+                state.inFlight = false
+                if state.generation == generation {
+                    state.scheduledSource = nil
+                    state.debounceTask = nil
+                    rows[id] = state
+                } else {
+                    rows[id] = state
+                    scheduleFollowUp(id: id)
+                }
             }
             consecutiveFailures += 1
             if consecutiveFailures == Self.persistentFailureThreshold, !isStopped {
@@ -210,14 +245,43 @@ actor TranslationQueue {
         }
         consecutiveFailures = 0
 
-        // Re-check after the await: the row may have moved on, or the session
-        // may have been torn down entirely, while the engine was working.
-        guard !isStopped, var state = rows[id], state.generation == generation else { return }
+        // Re-check after the await: the session may have been torn down, or the
+        // row pruned, while the engine was working.
+        guard !isStopped, var state = rows[id] else { return }
+        state.inFlight = false
         state.translatedSource = text
-        state.scheduledSource = nil
-        state.debounceTask = nil
+        let isCurrent = state.generation == generation
+        if isCurrent {
+            state.scheduledSource = nil
+            state.debounceTask = nil
+        }
         rows[id] = state
+        // If the row moved on meanwhile this is an interim translation of the
+        // older text: better than an empty column, and replaced by the
+        // follow-up. No newer result can exist yet, since only one call per row
+        // runs at a time. The follow-up is scheduled before the write-back
+        // suspends, so a concurrent ingest sees it.
+        if !isCurrent { scheduleFollowUp(id: id) }
         await onTranslated(id, translated)
+    }
+
+    /// Starts the single follow-up call for the latest text of a row whose
+    /// previous call finished while newer text was already waiting. However many
+    /// updates arrived during the flight, only the latest is translated.
+    private func scheduleFollowUp(id: UUID) {
+        guard !isStopped, var state = rows[id], !state.inFlight,
+              let latest = state.scheduledSource else { return }
+        if latest == state.translatedSource || (mode == .finalsOnly && !state.scheduledIsFinal) {
+            state.scheduledSource = nil
+            state.debounceTask = nil
+            rows[id] = state
+            return
+        }
+        state.debounceTask = makeTask(
+            id: id, text: latest, generation: state.generation,
+            delay: state.scheduledIsFinal ? nil : Self.partialDebounce
+        )
+        rows[id] = state
     }
 
     /// Drops state for rows that have fallen out of the buffer, and enforces the

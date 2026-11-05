@@ -2725,6 +2725,50 @@ struct SmokeTestRunner {
             await queue.stop()
         }
 
+        await suite("TranslationQueue in-flight translations are not cancelled") {
+            // Slow engine that records whether it was ever cancelled.
+            final class SlowTranslator: TranslationProviding, @unchecked Sendable {
+                private let lock = NSLock()
+                private var recorded: [String] = []
+                private var cancelled = false
+                func translate(_ text: String) async throws -> String {
+                    lock.withLock { recorded.append(text) }
+                    try? await Task.sleep(for: .milliseconds(120))
+                    if Task.isCancelled { lock.withLock { cancelled = true }; throw CancellationError() }
+                    return "<\(text)>"
+                }
+                func prewarm() async {}
+                var calls: [String] { lock.withLock { recorded } }
+                var wasCancelled: Bool { lock.withLock { cancelled } }
+            }
+            final class FailureFlag: @unchecked Sendable { var fired = false }
+
+            let slow = SlowTranslator()
+            let sink = TranslationSink()
+            let flag = FailureFlag()
+            let queue = TranslationQueue(provider: slow) { id, text in await sink.record(id, text) }
+            await queue.setPersistentFailureHandler { _ in flag.fired = true }
+            let id = UUID()
+
+            await queue.ingest([finalSystemSegment(id: id, "Part one.")])
+            try? await Task.sleep(for: .milliseconds(30))
+            // The row keeps growing while the first call is still running.
+            for text in ["Part one. Two.", "Part one. Two. Three.", "Part one. Two. Three. Four."] {
+                await queue.ingest([finalSystemSegment(id: id, text)])
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            try? await Task.sleep(for: .milliseconds(400))
+
+            await expect(!slow.wasCancelled, "a translation in flight is never cancelled")
+            await expect(slow.calls == ["Part one.", "Part one. Two. Three. Four."],
+                         "updates during flight coalesce into one follow-up on the latest text")
+            await expect(await sink.results[id] == "<Part one. Two. Three. Four.>",
+                         "the row ends up with a translation of the latest text")
+            await expect(await sink.writeCount == 2, "the older result shows as an interim, then is replaced")
+            await expect(!flag.fired, "no failure is counted")
+            await queue.stop()
+        }
+
         await suite("TranslationQueue channel and baseline gating") {
             let fake = FakeTranslator()
             let queue = TranslationQueue(provider: fake) { _, _ in }
