@@ -2736,8 +2736,11 @@ final class AppCoordinator {
     /// The question and answer bubbles shown for each auto-detected question, by
     /// question text, so a longer version of the same question can replace them.
     private var detectedBubbles: [String: (question: UUID, answer: UUID?, at: Date)] = [:]
-    /// Questions replaced while their own AI check was still running.
-    private var supersededQuestions: Set<String> = []
+    /// Questions replaced while their own AI check was still running, oldest first.
+    private var supersededQuestions: [String] = []
+    /// Hard limits so these never grow over a long meeting. Far above real use.
+    private static let maxDetectedBubbles = 32
+    private static let maxSupersededQuestions = 32
 
     private func answerDetectedQuestion(_ trigger: TriggerEvent, ai: AIProvider) async {
         if trigger.needsCheck {
@@ -2752,7 +2755,10 @@ final class AppCoordinator {
                 wpWarn("Question check failed, answering anyway: \(error.localizedDescription)")
             }
         }
-        if supersededQuestions.remove(trigger.text) != nil { return }
+        if let index = supersededQuestions.firstIndex(of: trigger.text) {
+            supersededQuestions.remove(at: index)
+            return
+        }
         let earlierBubbles = trigger.supersedes.flatMap(takeDetectedBubbles(for:))
         self.log.info("→ Trigger fired, building prompt")
         // Surface the detected question as a user-style bubble in the AI pane so
@@ -2769,6 +2775,10 @@ final class AppCoordinator {
             questionID = overlayState.appendAutoTriggerPreamble(origin: .detectedQuestion, text: trigger.text)
         }
         detectedBubbles = detectedBubbles.filter { Date().timeIntervalSince($0.value.at) < 60 }
+        if detectedBubbles.count >= Self.maxDetectedBubbles,
+           let oldest = detectedBubbles.min(by: { $0.value.at < $1.value.at })?.key {
+            detectedBubbles.removeValue(forKey: oldest)
+        }
         detectedBubbles[trigger.text] = (questionID, nil, Date())
         await persistChatTurn(role: "You", text: trigger.text, origin: .detectedQuestion, to: sessionID)
         overlayState.status = .thinking
@@ -2800,7 +2810,12 @@ final class AppCoordinator {
     /// remembers to drop that question once the check ends.
     private func takeDetectedBubbles(for questionText: String) -> (question: UUID, answer: UUID?)? {
         guard let bubbles = detectedBubbles.removeValue(forKey: questionText) else {
-            supersededQuestions.insert(questionText)
+            if !supersededQuestions.contains(questionText) {
+                supersededQuestions.append(questionText)
+                if supersededQuestions.count > Self.maxSupersededQuestions {
+                    supersededQuestions.removeFirst()
+                }
+            }
             return nil
         }
         wpInfo("[Coordinator] replacing the answer to a question that was cut short")
