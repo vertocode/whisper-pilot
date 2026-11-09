@@ -123,6 +123,7 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         // carries the terminal `stop_reason` we need for `AIFinishReason`.
         var currentEvent: String?
         var stopReason: String?
+        var sawMessageStop = false
         var decodeFailures = 0
 
         for try await line in bytes.lines {
@@ -136,7 +137,15 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
             if payload.isEmpty { continue }
             guard let data = payload.data(using: .utf8) else { continue }
 
-            switch currentEvent {
+            // Prefer the `event:` name; fall back to the JSON `type` so a missing
+            // event line can't drop the stop reason. Reset it so a stale name
+            // never labels a later data line.
+            let kind = currentEvent ?? (try? JSONDecoder().decode(AnthropicEventType.self, from: data))?.type
+            currentEvent = nil
+
+            switch kind {
+            case "message_stop":
+                sawMessageStop = true
             case "content_block_delta":
                 do {
                     let chunk = try JSONDecoder().decode(AnthropicContentBlockDelta.self, from: data)
@@ -174,6 +183,9 @@ final class AnthropicProvider: AIProvider, @unchecked Sendable {
         if attempt.deltaCount == 0, decodeFailures > 0 {
             throw AnthropicError.unexpectedFormat
         }
+        // `message_stop` is only sent after a whole reply, so it counts as clean
+        // even if the stop reason itself was missing or unreadable.
+        if stopReason == nil, sawMessageStop { return .stop }
         return Self.parseFinishReason(stopReason)
     }
 
@@ -365,6 +377,10 @@ private struct AnthropicContentBlockDelta: Decodable {
         let text: String?
     }
     let delta: Delta?
+}
+
+private struct AnthropicEventType: Decodable {
+    let type: String?
 }
 
 private struct AnthropicMessageDelta: Decodable {

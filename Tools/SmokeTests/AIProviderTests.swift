@@ -241,6 +241,35 @@ extension SmokeTestRunner {
             ))])
             let empty = await collect(claude())
             await expect(empty.error == nil && empty.finish == .maxTokens, "empty reply with a valid stop reason is not an error")
+
+            StubURLProtocol.install([.init(status: 200, body: sse(
+                "event: message_start", #"data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":3}}}"#, "",
+                "event: content_block_delta", #"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#, "",
+                "event: message_delta", #"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#, "",
+                "event: message_stop", #"data: {"type":"message_stop"}"#, ""
+            ))])
+            let full = await collect(claude())
+            await expect(full.deltas == ["Hi"] && full.finish == .stop, "full Anthropic stream ending in message_stop is clean")
+
+            StubURLProtocol.install([.init(status: 200, body: sse(
+                #"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#, "",
+                #"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#, ""
+            ))])
+            let noEventLines = await collect(claude())
+            await expect(noEventLines.deltas == ["Hi"] && noEventLines.finish == .stop, "stop reason is found from the JSON type when event lines are missing")
+
+            StubURLProtocol.install([.init(status: 200, body: sse(
+                "event: content_block_delta", #"data: {"delta":{"text":"Hi"}}"#, "",
+                "event: message_stop", #"data: {"type":"message_stop"}"#, ""
+            ))])
+            let stopOnly = await collect(claude())
+            await expect(stopOnly.finish == .stop, "message_stop without a message_delta still counts as complete")
+
+            StubURLProtocol.install([.init(status: 200, body: sse(
+                "event: content_block_delta", #"data: {"delta":{"text":"Hi"}}"#, ""
+            ))])
+            let cut = await collect(claude())
+            await expect(cut.finish == .other(nil), "stream cut before any stop signal is still flagged")
         }
 
         await suite("AI retry") {

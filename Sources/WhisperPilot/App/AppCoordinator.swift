@@ -2905,8 +2905,8 @@ final class AppCoordinator {
                 // / dropped-connection finish so the user gets a diagnostic note
                 // instead of a silently-truncated bubble.
                 var finishReason: AIFinishReason = .other(nil)
+                var receivedFinish = false
                 for try await event in ai.streamCompletion(prompt: prompt) {
-                    if Task.isCancelled { break }
                     switch event {
                     case .delta(let text):
                         deltaCount += 1
@@ -2917,8 +2917,12 @@ final class AppCoordinator {
                         }
                     case .finish(let reason):
                         finishReason = reason
+                        receivedFinish = true
                     }
                 }
+                // A cancelled stream ends quietly with no finish event. That is a
+                // cancel, not a cut-off reply, so it must not raise the warning.
+                if Task.isCancelled, !receivedFinish { throw CancellationError() }
                 self.log.info("Stream complete (\(deltaCount) deltas, reason=\(String(describing: finishReason), privacy: .public))")
                 let emptyReply = deltaCount == 0
                 if emptyReply {
