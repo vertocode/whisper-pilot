@@ -104,6 +104,8 @@ actor ConversationContext {
         lines.removeAll()
         topics.clear()
         entities.clear()
+        priorTranscriptMarkdown = nil
+        priorChatMarkdown = nil
     }
 
     /// Markdown loaded on session resume. Surfaced in the prompt context but kept separate

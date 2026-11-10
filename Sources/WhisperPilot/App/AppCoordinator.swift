@@ -1557,6 +1557,8 @@ final class AppCoordinator {
         await flushPendingTranscriptLines()
         // The just-persisted dedup memory belongs to the old session's file.
         transcriptPersistence.forgetPersistedLines()
+        detectedBubbles.removeAll()
+        supersededQuestions.removeAll()
 
         currentSession = session
         overlayState.transcript = []
@@ -2681,6 +2683,7 @@ final class AppCoordinator {
             }
         })
 
+        let pipelineGeneration = sessionGeneration
         consumerTasks.append(Task { [weak self] in
             for await trigger in engine.events {
                 guard let self else { return }
@@ -2702,8 +2705,9 @@ final class AppCoordinator {
                 }
                 // Each question runs on its own, so a new question (or a longer
                 // version of one) doesn't wait for the previous answer to finish.
+                let origin = DetectedQuestionOrigin(generation: pipelineGeneration, sessionID: self.currentSession?.id)
                 Task { [weak self] in
-                    await self?.answerDetectedQuestion(trigger, ai: liveAI)
+                    await self?.answerDetectedQuestion(trigger, ai: liveAI, origin: origin)
                 }
             }
         })
@@ -2718,11 +2722,20 @@ final class AppCoordinator {
     private static let maxDetectedBubbles = 32
     private static let maxSupersededQuestions = 32
 
-    private func answerDetectedQuestion(_ trigger: TriggerEvent, ai: AIProvider) async {
+    private func canStillAnswer(_ origin: DetectedQuestionOrigin) -> Bool {
+        origin.canAnswer(
+            generation: sessionGeneration,
+            sessionID: currentSession?.id,
+            isAIPaused: overlayState.isAIPaused
+        )
+    }
+
+    private func answerDetectedQuestion(_ trigger: TriggerEvent, ai: AIProvider, origin: DetectedQuestionOrigin) async {
         if trigger.needsCheck {
             do {
                 guard try await ai.isQuestionToAnswer(trigger.text) else {
                     wpInfo("[Coordinator] possible question rejected by the AI check — skipping")
+                    supersededQuestions.removeAll { $0 == trigger.text }
                     return
                 }
             } catch {
@@ -2733,6 +2746,10 @@ final class AppCoordinator {
         }
         if let index = supersededQuestions.firstIndex(of: trigger.text) {
             supersededQuestions.remove(at: index)
+            return
+        }
+        guard canStillAnswer(origin) else {
+            wpInfo("[Coordinator] detected question dropped — session ended or AI paused during its check")
             return
         }
         let earlierBubbles = trigger.supersedes.flatMap(takeDetectedBubbles(for:))
@@ -2756,10 +2773,17 @@ final class AppCoordinator {
             detectedBubbles.removeValue(forKey: oldest)
         }
         detectedBubbles[trigger.text] = (questionID, nil, Date())
-        await persistChatTurn(role: "You", text: trigger.text, origin: .detectedQuestion, to: sessionID)
         overlayState.status = .thinking
+        await persistChatTurn(role: "You", text: trigger.text, origin: .detectedQuestion, to: sessionID)
         await absorbPendingTranscripts()
         let snapshot = await context.snapshotWithPrior()
+        guard canStillAnswer(origin) else {
+            wpInfo("[Coordinator] detected question dropped before its answer started")
+            if inFlightCompletions.isEmpty, case .thinking = overlayState.status {
+                overlayState.status = isRunning ? .listening : .idle
+            }
+            return
+        }
         let history = chatHistorySnapshot(excludingLast: false)
         let prompt = PromptBuilder.build(
             context: filteredSnapshot(snapshot),

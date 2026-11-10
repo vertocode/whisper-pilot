@@ -444,6 +444,18 @@ struct SmokeTestRunner {
     }
 
     static func runTranscriptHistoryCapSuite() async {
+        await suite("DetectedQuestionOrigin") {
+            let sessionA = SessionID(folderName: "session-a")
+            let sessionB = SessionID(folderName: "session-b")
+            let origin = DetectedQuestionOrigin(generation: 3, sessionID: sessionA)
+            await expect(origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: false), "same run and session can answer")
+            await expect(!origin.canAnswer(generation: 4, sessionID: sessionA, isAIPaused: false), "a different generation blocks the answer")
+            await expect(!origin.canAnswer(generation: 5, sessionID: sessionB, isAIPaused: false), "a different generation and session together block the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: sessionB, isAIPaused: false), "a different session id alone blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: nil, isAIPaused: false), "a nil session id blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: true), "isAIPaused blocks the answer")
+        }
+
         await suite("TranscriptHistoryCap") {
             await expect(TranscriptHistoryCap.capped([1, 2, 3], limit: 5) == [1, 2, 3], "under the limit stays whole")
             await expect(TranscriptHistoryCap.capped([1, 2, 3, 4, 5], limit: 3) == [3, 4, 5], "over the limit keeps the newest")
@@ -499,6 +511,20 @@ struct SmokeTestRunner {
             await context4.reset()
             let snap4 = await context4.snapshot()
             await expect(snap4.recentLines.isEmpty && snap4.topics.isEmpty, "reset clears state")
+
+            let resumedThenNew = ConversationContext()
+            await resumedThenNew.seedFromMarkdown(transcript: "Old meeting transcript", chat: "Old meeting chat")
+            await resumedThenNew.reset()
+            let newSessionSnapshot = await resumedThenNew.snapshotWithPrior()
+            await expect(newSessionSnapshot.priorTranscriptMarkdown == nil, "new session gets no prior transcript")
+            await expect(newSessionSnapshot.priorChatMarkdown == nil, "new session gets no prior chat")
+
+            // A resume runs reset first and seeds afterwards.
+            await resumedThenNew.reset()
+            await resumedThenNew.seedFromMarkdown(transcript: "Resumed transcript", chat: "Resumed chat")
+            let resumedSnapshot = await resumedThenNew.snapshotWithPrior()
+            await expect(resumedSnapshot.priorTranscriptMarkdown == "Resumed transcript", "resumed session keeps its prior transcript")
+            await expect(resumedSnapshot.priorChatMarkdown == "Resumed chat", "resumed session keeps its prior chat")
 
             // Containment-duplicate finals under different ids (synthetic
             // pre-flush + the recognizer's own final) merge into one line —
