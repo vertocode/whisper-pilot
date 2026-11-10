@@ -1,20 +1,27 @@
 import CoreGraphics
 import CoreText
 import Foundation
+import PDFKit
 @testable import WhisperPilot
 
 extension SmokeTestRunner {
     private static func makePDF(at url: URL, text: String?) {
+        makePDF(at: url, pages: [text])
+    }
+
+    private static func makePDF(at url: URL, pages: [String?]) {
         var box = CGRect(x: 0, y: 0, width: 400, height: 200)
         guard let pdf = CGContext(url as CFURL, mediaBox: &box, nil) else { return }
-        pdf.beginPDFPage(nil)
-        if let text {
-            let font = CTFontCreateWithName("Helvetica" as CFString, 18, nil)
-            let attributed = NSAttributedString(string: text, attributes: [kCTFontAttributeName as NSAttributedString.Key: font])
-            pdf.textPosition = CGPoint(x: 20, y: 100)
-            CTLineDraw(CTLineCreateWithAttributedString(attributed), pdf)
+        for text in pages {
+            pdf.beginPDFPage(nil)
+            if let text {
+                let font = CTFontCreateWithName("Helvetica" as CFString, 18, nil)
+                let attributed = NSAttributedString(string: text, attributes: [kCTFontAttributeName as NSAttributedString.Key: font])
+                pdf.textPosition = CGPoint(x: 20, y: 100)
+                CTLineDraw(CTLineCreateWithAttributedString(attributed), pdf)
+            }
+            pdf.endPDFPage()
         }
-        pdf.endPDFPage()
         pdf.closePDF()
     }
 
@@ -107,6 +114,44 @@ extension SmokeTestRunner {
             await expect(sameOutcome(brokenResult, .failure(.unreadable("broken.pdf"))), "broken PDF is unreadable")
         }
 
+        await suite("ContextFileReader: multi-page PDFs") {
+            let pdf = dir.appendingPathComponent("long.pdf")
+            makePDF(at: pdf, pages: ["First page", nil, "Third page"])
+            let result = ContextFileReader.read(pdf)
+            if case .success(let file) = result {
+                let whole = PDFDocument(url: pdf)?.string?.trimmingCharacters(in: .whitespacesAndNewlines)
+                await expect(file.content == whole, "matches the whole-document text, got: \(file.content) vs \(String(describing: whole))")
+            } else {
+                await expect(false, "multi-page PDF should succeed, got \(result)")
+            }
+        }
+
+        await suite("ContextFileReader: stops pulling PDF text past the size limit") {
+            let limit = SessionContext.maxFileBytes
+            let marker = "…[truncated, file is larger than 200 KB]"
+            func extract(_ page: String, pages: Int = 5) -> (text: String, asked: [Int]) {
+                var asked: [Int] = []
+                let text = ContextFileReader.joinedPageText(pageCount: pages) { asked.append($0); return page }
+                return (text.trimmingCharacters(in: .whitespacesAndNewlines), asked)
+            }
+
+            let big = extract(String(repeating: "a", count: limit / 2 + 1))
+            await expect(big.asked == [0, 1], "stops after the page that crosses the limit, asked \(big.asked)")
+            await expect(ContextFileReader.truncated(big.text).hasSuffix(marker), "cut text is marked as truncated")
+
+            // Two bytes each, so the byte count passes the limit a whole page before the character count.
+            let wide = extract(String(repeating: "é", count: limit / 2 + 1))
+            await expect(wide.asked == [0, 1], "the limit counts characters, asked \(wide.asked)")
+
+            // The page separator alone passes the limit, but trimming removes it again.
+            let exact = extract(String(repeating: "a", count: limit))
+            await expect(exact.asked == [0, 1], "keeps going until the trimmed text is over the limit, asked \(exact.asked)")
+            await expect(ContextFileReader.truncated(exact.text).hasSuffix(marker), "dropped pages are still marked as truncated")
+
+            let small = extract("short", pages: 3)
+            await expect(small.asked == [0, 1, 2], "reads every page of a small PDF, asked \(small.asked)")
+        }
+
         await suite("ContextFileReader: drops the result when the target changed") {
             let text = dir.appendingPathComponent("late.txt")
             try? "late".write(to: text, atomically: true, encoding: .utf8)
@@ -119,7 +164,7 @@ extension SmokeTestRunner {
 
             var loading: [SessionID?] = [before, nil]
             let midSwitch = await ContextFileReader.readInBackground(text, ifTargetStays: { loading.removeFirst() })
-            await expect(midSwitch == nil, "read ends while a switch is still loading: result is dropped")
+            await expect(midSwitch == nil, "wrapper only: owner turns nil during the read, result is dropped")
 
             var same: [SessionID] = [before, before]
             let kept = await ContextFileReader.readInBackground(text, ifTargetStays: { same.removeFirst() })
