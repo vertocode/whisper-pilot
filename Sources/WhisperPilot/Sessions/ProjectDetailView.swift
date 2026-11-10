@@ -138,7 +138,8 @@ struct ProjectDetailView: View {
                             isHovered: hoveredSessionID == session.id,
                             vm: vm,
                             onRequestDelete: { sessionActions.delete(session) },
-                            onRequestRename: { sessionActions.rename(session) }
+                            onRequestRename: { sessionActions.rename(session) },
+                            checkState: vm.checkState(for: session)
                         )
                         .onHover { hovering in
                             hoveredSessionID = hovering ? session.id : (hoveredSessionID == session.id ? nil : hoveredSessionID)

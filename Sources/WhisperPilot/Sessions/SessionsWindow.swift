@@ -9,6 +9,31 @@ enum SessionsSelection: Hashable {
     case session(SessionID)
 }
 
+struct DeletionNotice: Equatable {
+    let title: String
+    let message: String
+
+    /// Nil when nothing was kept.
+    init?(keptOpen sessions: [SessionMeta]) {
+        guard let only = sessions.first else { return nil }
+        if sessions.count == 1 {
+            title = "A session was kept"
+            message = "“\(only.displayName)” was kept because it’s open right now."
+        } else {
+            title = "Some sessions were kept"
+            message = "\(SessionCleanup.countLabel(sessions.count)) were kept because they were open."
+        }
+    }
+}
+
+/// How a session's checkbox looks while the user is picking sessions to delete.
+enum SessionCheckState: Equatable {
+    case unchecked
+    case checked
+    /// The session open in the overlay. It can't be picked.
+    case open
+}
+
 @MainActor
 final class SessionsViewModel: ObservableObject {
     @Published var sessions: [SessionMeta] = []
@@ -25,6 +50,12 @@ final class SessionsViewModel: ObservableObject {
     /// The search text after a short pause in typing. All filtering uses this, so the
     /// lists do not rebuild on every keystroke.
     @Published private(set) var activeQuery: String = ""
+    @Published private(set) var isSelectingSessions = false
+    @Published private(set) var checkedSessionIDs: Set<SessionID> = []
+    /// How far a bulk delete has got. Nil when none is running.
+    @Published private(set) var deletionProgress: (done: Int, total: Int)?
+    /// Shown after a delete that had to leave a session behind.
+    @Published var deletionNotice: DeletionNotice?
 
     let projects: ProjectsStore
     private let store: SessionStore
@@ -53,11 +84,17 @@ final class SessionsViewModel: ObservableObject {
     /// bar — discoverability fix for first-time users who haven't found the
     /// menu bar icon yet.
     var onOpenSettings: (() -> Void)?
+    /// Set by the AppDelegate. The sessions open or still opening, which delete must keep.
+    var openSessionIDs: (() -> Set<SessionID>)?
 
     func refresh() async {
         isLoading = true
         defer { isLoading = false }
         sessions = await store.listSessions()
+        if !checkedSessionIDs.isEmpty {
+            checkedSessionIDs.formIntersection(sessions.map(\.id))
+            checkedSessionIDs.subtract(openSessionIDs?() ?? [])
+        }
     }
 
     // MARK: - Grouping and search
@@ -131,6 +168,7 @@ final class SessionsViewModel: ObservableObject {
                 projectID: projectID
             )
             if name == nil { newSessionName = "" }
+            endSelectingSessions()
             onStartNew?(meta)
             await refresh()
         } catch {
@@ -139,10 +177,15 @@ final class SessionsViewModel: ObservableObject {
     }
 
     func resume(_ meta: SessionMeta) {
+        endSelectingSessions()
         onResume?(meta)
     }
 
     func delete(_ meta: SessionMeta) async {
+        guard !isOpen(meta) else {
+            deletionNotice = DeletionNotice(keptOpen: [meta])
+            return
+        }
         do {
             try await store.deleteSession(meta.id)
             if selection == .session(meta.id) { selection = .home }
@@ -190,6 +233,121 @@ final class SessionsViewModel: ObservableObject {
         await move(session, to: projectID)
     }
 
+    // MARK: - Bulk delete
+
+    func beginSelectingSessions() {
+        isSelectingSessions = true
+        // A single session's page has no list to pick from.
+        if case .session = selection { selection = .home }
+    }
+
+    func endSelectingSessions() {
+        isSelectingSessions = false
+        checkedSessionIDs = []
+    }
+
+    var isDeletingSessions: Bool { deletionProgress != nil }
+
+    func isOpen(_ session: SessionMeta) -> Bool {
+        openSessionIDs?().contains(session.id) ?? false
+    }
+
+    /// Nil when the user is not picking sessions.
+    func checkState(for session: SessionMeta) -> SessionCheckState? {
+        guard isSelectingSessions else { return nil }
+        if isOpen(session) { return .open }
+        return checkedSessionIDs.contains(session.id) ? .checked : .unchecked
+    }
+
+    func toggleChecked(_ session: SessionMeta) {
+        guard checkState(for: session) != .open else { return }
+        if checkedSessionIDs.remove(session.id) == nil {
+            checkedSessionIDs.insert(session.id)
+        }
+    }
+
+    /// The rows on the current page: the open project's sessions or every session,
+    /// narrowed by the search.
+    var sessionsOnPage: [SessionMeta] {
+        var visible = sessions
+        if case .project(let id) = selection { visible = sessions(in: id) }
+        if isSearching { visible = visible.filter { matchesSearch($0) } }
+        return visible
+    }
+
+    /// What "Select all" adds. Never more than the user is looking at.
+    var selectableSessions: [SessionMeta] {
+        sessionsOnPage.filter { !isOpen($0) }
+    }
+
+    func checkAllSelectable() {
+        checkedSessionIDs.formUnion(selectableSessions.map(\.id))
+    }
+
+    func clearChecked() {
+        checkedSessionIDs = []
+    }
+
+    var checkedSessions: [SessionMeta] {
+        sessions.filter { checkedSessionIDs.contains($0.id) && !isOpen($0) }
+    }
+
+    /// The body of the "Delete N sessions?" dialog. Ticks survive a search or a page
+    /// change, so it says when some of what will go is off screen.
+    var checkedDeletionMessage: String {
+        let checked = checkedSessions
+        var message = "\(checked.count == 1 ? "It moves" : "They move") to the Trash with \(checked.count == 1 ? "its transcript, chat, and recap" : "their transcripts, chats, and recaps")."
+        let onPage = Set(sessionsOnPage.map(\.id))
+        let hidden = checked.filter { !onPage.contains($0.id) }.count
+        if hidden > 0 { message += " Includes \(hidden) not shown here." }
+        return message
+    }
+
+    func oldSessions(_ limit: SessionAgeLimit, now: Date) -> SessionCleanup.AgeMatch {
+        SessionCleanup.match(limit, in: sessions, openSessions: openSessionIDs?() ?? [], now: now)
+    }
+
+    /// Moves the sessions to the Trash. The list reloads once, after the whole batch.
+    func deleteSessions(_ targets: [SessionMeta]) async {
+        guard !isDeletingSessions, !targets.isEmpty else { return }
+        defer { deletionProgress = nil }
+        let outcome = await moveToTrash(targets)
+        if case .session(let id) = selection, outcome.deleted.contains(id) { selection = .home }
+        await refresh()
+        report(outcome)
+    }
+
+    private func moveToTrash(_ targets: [SessionMeta]) async -> SessionCleanup.Outcome {
+        deletionProgress = (0, targets.count)
+        return await SessionCleanup.delete(
+            targets,
+            from: store,
+            openSessions: { openSessionIDs?() ?? [] },
+            onProgress: { deletionProgress = ($0, targets.count) }
+        )
+    }
+
+    private func report(_ outcome: SessionCleanup.Outcome) {
+        checkedSessionIDs.subtract(outcome.skippedOpen.map(\.id))
+        // Failed sessions stay checked so the user can try again.
+        if outcome.failed.isEmpty { endSelectingSessions() }
+        announce(outcome)
+    }
+
+    private func announce(_ outcome: SessionCleanup.Outcome) {
+        let kept = DeletionNotice(keptOpen: outcome.skippedOpen)
+        if let failed = failureMessage(outcome) {
+            errorMessage = [failed, kept?.message].compactMap { $0 }.joined(separator: " ")
+        } else {
+            deletionNotice = kept
+        }
+    }
+
+    private func failureMessage(_ outcome: SessionCleanup.Outcome) -> String? {
+        guard let failure = outcome.failed.first else { return nil }
+        return "Couldn’t move \(SessionCleanup.countLabel(outcome.failed.count)) to Trash: \(failure.error.localizedDescription)"
+    }
+
     // MARK: - Projects
 
     func createProject(named name: String) {
@@ -205,16 +363,22 @@ final class SessionsViewModel: ObservableObject {
     /// Deletes the project. Its sessions stay and move to ungrouped, unless `deleteSessions`
     /// is true (the caller has asked the user to confirm), in which case they go to the Trash.
     func deleteProject(_ id: UUID, deleteSessions: Bool) async {
-        if deleteSessions {
-            await refresh()
-            for member in sessions(in: id) {
-                do {
-                    try await store.deleteSession(member.id)
-                } catch {
-                    errorMessage = "Couldn’t move \(member.displayName) to Trash: \(error.localizedDescription)"
-                }
-            }
+        guard deleteSessions else {
+            await removeProject(id)
+            return
         }
+        guard !isDeletingSessions else { return }
+        // Held until the last reload, because rows already in the Trash still show Resume.
+        deletionProgress = (0, sessions(in: id).count)
+        defer { deletionProgress = nil }
+        await refresh()
+        let outcome = await moveToTrash(sessions(in: id))
+        if case .session(let shown) = selection, outcome.deleted.contains(shown) { selection = .home }
+        announce(outcome)
+        await removeProject(id)
+    }
+
+    private func removeProject(_ id: UUID) async {
         // Whatever is left (all of them when keeping sessions) becomes ungrouped.
         await store.clearProject(id)
         projects.delete(id)
@@ -225,8 +389,11 @@ final class SessionsViewModel: ObservableObject {
 }
 
 @MainActor
-final class SessionsWindowController: NSWindowController {
+final class SessionsWindowController: NSWindowController, NSWindowDelegate {
+    private let viewModel: SessionsViewModel
+
     init(viewModel: SessionsViewModel, globalContext: GlobalContextStore) {
+        self.viewModel = viewModel
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1020, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -247,9 +414,14 @@ final class SessionsWindowController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: SessionsView(vm: viewModel, globalContext: globalContext))
         super.init(window: window)
+        window.delegate = self
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unsupported") }
+
+    func windowWillClose(_ notification: Notification) {
+        viewModel.endSelectingSessions()
+    }
 }
 
 struct SessionsView: View {
@@ -263,6 +435,8 @@ struct SessionsView: View {
     @State private var newProjectDraft: String = ""
     @State private var projectPendingRename: Project?
     @State private var projectRenameDraft: String = ""
+    @State private var showingDeleteChecked = false
+    @State private var showingDeleteOld = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -274,6 +448,7 @@ struct SessionsView: View {
                 Divider().opacity(0.4)
                 detail
             }
+            .disabled(vm.isDeletingSessions)
         }
         .frame(minWidth: 900, minHeight: 520)
         // Solid system colour rather than the `.windowBackground` material — the
@@ -295,7 +470,33 @@ struct SessionsView: View {
                 sessionPendingDeletion = nil
             }
         } message: { session in
-            Text("This permanently removes the transcript, chat, and metadata folder for “\(session.displayName)” from disk. This action cannot be undone.")
+            Text("“\(session.displayName)” moves to the Trash with its transcript, chat, and recap.")
+        }
+        .alert(
+            "Delete \(SessionCleanup.countLabel(vm.checkedSessions.count))?",
+            isPresented: $showingDeleteChecked
+        ) {
+            Button("Delete", role: .destructive) {
+                let targets = vm.checkedSessions
+                Task { await vm.deleteSessions(targets) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(vm.checkedDeletionMessage)
+        }
+        .sheet(isPresented: $showingDeleteOld) {
+            DeleteOldSessionsSheet(vm: vm)
+        }
+        .alert(
+            vm.deletionNotice?.title ?? "",
+            isPresented: Binding(
+                get: { vm.deletionNotice != nil },
+                set: { if !$0 { vm.deletionNotice = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { vm.deletionNotice = nil }
+        } message: {
+            Text(vm.deletionNotice?.message ?? "")
         }
         .alert(
             "Rename session",
@@ -392,7 +593,9 @@ struct SessionsView: View {
                 ProjectDeletionPrompt.present(project: project, sessionCount: vm.sessions(in: project.id).count) { deleteSessions in
                     Task { await vm.deleteProject(project.id, deleteSessions: deleteSessions) }
                 }
-            }
+            },
+            requestDeleteCheckedSessions: { showingDeleteChecked = true },
+            requestDeleteOldSessions: { showingDeleteOld = true }
         )
     }
 
@@ -583,7 +786,8 @@ struct SessionsView: View {
                             onRequestRename: {
                                 renameDraft = session.displayName
                                 sessionPendingRename = session
-                            }
+                            },
+                            checkState: vm.checkState(for: session)
                         )
                         .onHover { hovering in
                             hoveredSessionID = hovering ? session.id : (hoveredSessionID == session.id ? nil : hoveredSessionID)
@@ -665,9 +869,15 @@ struct SessionRow: View {
     let vm: SessionsViewModel
     let onRequestDelete: () -> Void
     let onRequestRename: () -> Void
+    /// Set while the user is picking sessions to delete. Clicking the row then ticks it.
+    var checkState: SessionCheckState? = nil
 
     var body: some View {
         HStack(spacing: WP.Space.md) {
+            if let checkState {
+                SessionCheckbox(state: checkState)
+            }
+
             ZStack {
                 RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
                     .fill(Color.accentColor.opacity(0.12))
@@ -712,41 +922,48 @@ struct SessionRow: View {
                     .help(modelBadge.tooltip)
             }
 
-            Button {
-                vm.resume(session)
-            } label: {
-                Text("Resume")
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-
-            Menu {
-                Button(action: onRequestRename) {
-                    Label("Rename…", systemImage: "pencil")
-                }
-                MoveToProjectMenu(session: session, projects: vm.projects) { target in
-                    Task { await vm.move(session, to: target) }
-                }
+            if checkState == .open {
+                Text("Open now")
+                    .font(.system(size: 10, weight: .medium))
+                    .chip(.neutral)
+            } else if checkState == nil {
                 Button {
-                    Task { await vm.openInFinder(session) }
+                    vm.resume(session)
                 } label: {
-                    Label("Open in Finder", systemImage: "folder")
+                    Text("Resume")
+                        .font(.system(size: 11, weight: .medium))
                 }
-                Divider()
-                Button(role: .destructive, action: onRequestDelete) {
-                    Label("Delete session", systemImage: "trash")
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Menu {
+                    Button(action: onRequestRename) {
+                        Label("Rename…", systemImage: "pencil")
+                    }
+                    MoveToProjectMenu(session: session, projects: vm.projects) { target in
+                        Task { await vm.move(session, to: target) }
+                    }
+                    Button {
+                        Task { await vm.openInFinder(session) }
+                    } label: {
+                        Label("Open in Finder", systemImage: "folder")
+                    }
+                    Divider()
+                    Button(role: .destructive, action: onRequestDelete) {
+                        Label("Delete session", systemImage: "trash")
+                    }
+                    .disabled(vm.isOpen(session))
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 24, height: 24)
-                    .contentShape(Rectangle())
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
         }
         .padding(.horizontal, WP.Space.md)
         .padding(.vertical, WP.Space.sm + 2)
@@ -759,6 +976,8 @@ struct SessionRow: View {
                 .strokeBorder(.separator.opacity(isHovered ? 0.5 : 0.25), lineWidth: 0.5)
         )
         .animation(.easeOut(duration: 0.12), value: isHovered)
+        .gesture(checkState == nil ? nil : TapGesture().onEnded { vm.toggleChecked(session) })
+        .modifier(CheckableRowAccessibility(state: checkState) { vm.toggleChecked(session) })
     }
 
     /// Vendor-colored badge content for the model this session uses. Nil when
@@ -789,6 +1008,32 @@ struct SessionRow: View {
     }()
 }
 
+
+/// Lets VoiceOver tick a row while the user picks sessions. Normal rows are left alone,
+/// so their Resume button and menu stay separately reachable.
+private struct CheckableRowAccessibility: ViewModifier {
+    let state: SessionCheckState?
+    let toggle: () -> Void
+
+    func body(content: Content) -> some View {
+        if let state {
+            content
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(traits(for: state))
+                .accessibilityAction(.default, toggle)
+        } else {
+            content
+        }
+    }
+
+    private func traits(for state: SessionCheckState) -> AccessibilityTraits {
+        switch state {
+        case .unchecked: return .isButton
+        case .checked: return [.isButton, .isSelected]
+        case .open: return []
+        }
+    }
+}
 
 /// The "Delete project?" dialog. SwiftUI alerts can't hold a checkbox, so this is an `NSAlert`.
 @MainActor

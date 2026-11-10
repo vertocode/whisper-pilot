@@ -33,6 +33,9 @@ struct SessionMeta: Identifiable, Sendable, Codable, Equatable {
     /// Filled in on every list refresh — not persisted.
     var transcriptLineCount: Int = 0
     var chatTurnCount: Int = 0
+    /// False when `metadata.json` is missing or damaged, so the dates are only guessed from
+    /// the folder. Not persisted.
+    var hasReadableDates: Bool = true
 
     var id: SessionID { SessionID(folderName: folderName) }
 
@@ -89,8 +92,14 @@ actor SessionStore {
     private var chatCounts: [String: CountEntry] = [:]
     /// How many times a session file was actually read for counting. Tests use it.
     private(set) var countFileReads = 0
+    private let removeItem: @Sendable (URL) throws -> Void
 
-    init(baseURL overrideBaseURL: URL? = nil) {
+    /// `removeItem` is how a session folder leaves the disk. The app always uses the Trash.
+    init(
+        baseURL overrideBaseURL: URL? = nil,
+        removeItem: @escaping @Sendable (URL) throws -> Void = SessionStore.moveToTrash
+    ) {
+        self.removeItem = removeItem
         if let overrideBaseURL {
             self.baseURL = overrideBaseURL
             try? FileManager.default.createDirectory(at: overrideBaseURL, withIntermediateDirectories: true)
@@ -349,11 +358,13 @@ actor SessionStore {
     }
 
     func deleteSession(_ id: SessionID) throws {
+        try removeItem(sessionFolder(for: id))
+    }
+
+    @Sendable
+    static func moveToTrash(_ url: URL) throws {
         var resultingURL: NSURL?
-        try FileManager.default.trashItem(
-            at: sessionFolder(for: id),
-            resultingItemURL: &resultingURL
-        )
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
     }
 
     /// Minimum interval between `touch()` rewrites of metadata.json per session.
@@ -724,7 +735,8 @@ actor SessionStore {
             folderName: folderName,
             displayName: folderName,
             createdAt: createdAt,
-            lastUsedAt: lastUsedAt
+            lastUsedAt: lastUsedAt,
+            hasReadableDates: false
         )
     }
 
