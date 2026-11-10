@@ -39,6 +39,13 @@ extension SmokeTestRunner {
     /// Keeps fake test sessions out of the real Trash.
     static let removeWithoutTrash: @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
 
+    /// Waits out the pause the search box leaves after typing.
+    @MainActor
+    private static func search(_ text: String, in vm: SessionsViewModel) async {
+        vm.searchText = text
+        try? await Task.sleep(nanoseconds: 400_000_000)
+    }
+
     private static func makeFixture() async -> (root: URL, store: SessionStore, projects: ProjectsStore) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
@@ -190,6 +197,29 @@ extension SmokeTestRunner {
             vm.checkAllSelectable()
             await expect(vm.checkedSessionIDs == [filed.id], "on a project page, select all stays inside the project")
 
+            vm.clearChecked()
+            await search("Filed", in: vm)
+            vm.selection = .home
+            vm.checkAllSelectable()
+            await expect(vm.checkedSessionIDs == [filed.id], "during a search, select all takes only the results")
+            vm.clearChecked()
+            let elsewhere = try await store.createSession(name: "Filed elsewhere")
+            await vm.refresh()
+            vm.selection = .project(project.id)
+            vm.checkAllSelectable()
+            await expect(vm.checkedSessionIDs == [filed.id], "on a project page, a search can't reach other projects")
+            vm.clearChecked()
+            await search("", in: vm)
+            try await store.deleteSession(elsewhere.id)
+            await vm.refresh()
+
+            vm.endSelectingSessions()
+            vm.selection = .session(loose.id)
+            vm.beginSelectingSessions()
+            await expect(vm.selection == .home, "selecting from a session's page goes back to the full list")
+
+            vm.selection = .project(project.id)
+            vm.checkAllSelectable()
             vm.selection = .home
             vm.toggleChecked(loose)
             try await store.deleteSession(loose.id)

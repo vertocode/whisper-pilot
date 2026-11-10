@@ -212,6 +212,8 @@ final class SessionsViewModel: ObservableObject {
 
     func beginSelectingSessions() {
         isSelectingSessions = true
+        // A single session's page has no list to pick from.
+        if case .session = selection { selection = .home }
     }
 
     func endSelectingSessions() {
@@ -233,19 +235,19 @@ final class SessionsViewModel: ObservableObject {
         }
     }
 
-    /// What "Select all" adds: the search results, or the open project's sessions, or
-    /// everything. Never more than the user is looking at.
+    /// The rows on the current page: the open project's sessions or every session,
+    /// narrowed by the search.
+    var sessionsOnPage: [SessionMeta] {
+        var visible = sessions
+        if case .project(let id) = selection { visible = sessions(in: id) }
+        if isSearching { visible = visible.filter { matchesSearch($0) } }
+        return visible
+    }
+
+    /// What "Select all" adds. Never more than the user is looking at.
     var selectableSessions: [SessionMeta] {
-        let visible: [SessionMeta]
-        if isSearching {
-            visible = searchResults
-        } else if case .project(let id) = selection {
-            visible = sessions(in: id)
-        } else {
-            visible = sessions
-        }
         let open = openSessionID?()
-        return visible.filter { $0.id != open }
+        return sessionsOnPage.filter { $0.id != open }
     }
 
     func checkAllSelectable() {
