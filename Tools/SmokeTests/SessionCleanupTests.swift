@@ -12,8 +12,8 @@ extension SmokeTestRunner {
         ISO8601DateFormatter().date(from: iso)!
     }
 
-    private static func meta(_ name: String, lastUsed: Date, created: Date? = nil, project: UUID? = nil) -> SessionMeta {
-        SessionMeta(folderName: name, displayName: name, createdAt: created ?? lastUsed, lastUsedAt: lastUsed, projectID: project)
+    private static func meta(_ name: String, lastUsed: Date, created: Date? = nil, project: UUID? = nil, readableDates: Bool = true) -> SessionMeta {
+        SessionMeta(folderName: name, displayName: name, createdAt: created ?? lastUsed, lastUsedAt: lastUsed, projectID: project, hasReadableDates: readableDates)
     }
 
     private static func names(_ sessions: [SessionMeta]) -> [String] {
@@ -75,7 +75,7 @@ extension SmokeTestRunner {
                 meta("just-after", lastUsed: cutoff.addingTimeInterval(1)),
                 meta("in-project", lastUsed: date("2025-01-01T00:00:00Z"), project: project),
                 meta("old-but-reused", lastUsed: now, created: date("2020-01-01T00:00:00Z")),
-                meta("unknown-age", lastUsed: .distantPast),
+                meta("unknown-age", lastUsed: date("2020-01-01T00:00:00Z"), readableDates: false),
             ]
             let match = SessionCleanup.match(.oneMonth, in: sessions, openSessions: [], now: now, calendar: utc)
             await expect(names(match.sessions) == ["just-before", "in-project"],
@@ -147,6 +147,33 @@ extension SmokeTestRunner {
                 await expect(failed.deleted == [second.id], "one failure does not stop the batch")
             } catch {
                 await expect(false, "mid-run fixture threw: \(error)")
+            }
+        }
+
+        await suite("SessionCleanup: damaged metadata never counts as old") {
+            let (root, store, _) = await makeFixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            do {
+                let healthy = try await store.createSession(name: "Healthy")
+                let damaged = try await store.createSession(name: "Damaged")
+                let missing = try await store.createSession(name: "Missing")
+                let damagedURL = await store.sessionFolder(for: damaged.id).appendingPathComponent("metadata.json")
+                try Data("not json".utf8).write(to: damagedURL)
+                let missingURL = await store.sessionFolder(for: missing.id).appendingPathComponent("metadata.json")
+                try FileManager.default.removeItem(at: missingURL)
+
+                let listed = await store.listSessions()
+                await expect(listed.count == 3, "damaged sessions stay listed")
+                await expect(listed.first { $0.id == healthy.id }?.hasReadableDates == true, "healthy metadata is trusted")
+                await expect(listed.first { $0.id == damaged.id }?.hasReadableDates == false, "damaged metadata is flagged")
+                await expect(listed.first { $0.id == missing.id }?.hasReadableDates == false, "missing metadata is flagged")
+
+                // Far enough ahead that every folder date is past the cutoff.
+                let future = Date().addingTimeInterval(60 * 60 * 24 * 800)
+                let match = SessionCleanup.match(.oneYear, in: listed, openSessions: [], now: future)
+                await expect(names(match.sessions) == [healthy.folderName], "only the session with real dates can be old: \(names(match.sessions))")
+            } catch {
+                await expect(false, "damaged metadata fixture threw: \(error)")
             }
         }
 

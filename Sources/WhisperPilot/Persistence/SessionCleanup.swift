@@ -50,8 +50,8 @@ enum SessionCleanup {
         calendar: Calendar = .current
     ) -> AgeMatch {
         let cutoff = limit.cutoff(from: now, calendar: calendar)
-        // `distantPast` means the folder had no readable dates, so its age is unknown.
-        let old = sessions.filter { $0.lastUsedAt < cutoff && $0.lastUsedAt != .distantPast }
+        // Without readable dates the age is only a guess, and a guess must not delete anything.
+        let old = sessions.filter { $0.hasReadableDates && $0.lastUsedAt < cutoff }
         return AgeMatch(
             sessions: old.filter { !openSessions.contains($0.id) },
             keptOpenSession: old.first { openSessions.contains($0.id) }

@@ -33,6 +33,9 @@ struct SessionMeta: Identifiable, Sendable, Codable, Equatable {
     /// Filled in on every list refresh — not persisted.
     var transcriptLineCount: Int = 0
     var chatTurnCount: Int = 0
+    /// False when `metadata.json` is missing or damaged, so the dates are only guessed from
+    /// the folder. Not persisted.
+    var hasReadableDates: Bool = true
 
     var id: SessionID { SessionID(folderName: folderName) }
 
@@ -732,7 +735,8 @@ actor SessionStore {
             folderName: folderName,
             displayName: folderName,
             createdAt: createdAt,
-            lastUsedAt: lastUsedAt
+            lastUsedAt: lastUsedAt,
+            hasReadableDates: false
         )
     }
 
