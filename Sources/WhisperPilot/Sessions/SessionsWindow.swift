@@ -167,6 +167,7 @@ final class SessionsViewModel: ObservableObject {
                 projectID: projectID
             )
             if name == nil { newSessionName = "" }
+            endSelectingSessions()
             onStartNew?(meta)
             await refresh()
         } catch {
@@ -175,6 +176,7 @@ final class SessionsViewModel: ObservableObject {
     }
 
     func resume(_ meta: SessionMeta) {
+        endSelectingSessions()
         onResume?(meta)
     }
 
@@ -365,8 +367,11 @@ final class SessionsViewModel: ObservableObject {
 }
 
 @MainActor
-final class SessionsWindowController: NSWindowController {
+final class SessionsWindowController: NSWindowController, NSWindowDelegate {
+    private let viewModel: SessionsViewModel
+
     init(viewModel: SessionsViewModel, globalContext: GlobalContextStore) {
+        self.viewModel = viewModel
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1020, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -387,9 +392,14 @@ final class SessionsWindowController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: SessionsView(vm: viewModel, globalContext: globalContext))
         super.init(window: window)
+        window.delegate = self
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unsupported") }
+
+    func windowWillClose(_ notification: Notification) {
+        viewModel.endSelectingSessions()
+    }
 }
 
 struct SessionsView: View {

@@ -272,6 +272,16 @@ extension SmokeTestRunner {
 
             vm.endSelectingSessions()
             await expect(!vm.isSelectingSessions && vm.checkedSessionIDs.isEmpty, "done leaves selection mode clean")
+
+            vm.beginSelectingSessions()
+            vm.toggleChecked(other)
+            vm.resume(other)
+            await expect(!vm.isSelectingSessions && vm.checkedSessionIDs.isEmpty, "resuming a session ends selection mode")
+
+            vm.beginSelectingSessions()
+            vm.toggleChecked(other)
+            await vm.createNew(name: "Fresh")
+            await expect(!vm.isSelectingSessions && vm.checkedSessionIDs.isEmpty, "starting a session ends selection mode")
         } catch {
             await expect(false, "selection fixture threw: \(error)")
         }
