@@ -8,6 +8,30 @@ struct SessionsSidebarActions {
     var requestNewProject: () -> Void
     var requestRenameProject: (Project) -> Void
     var requestDeleteProject: (Project) -> Void
+    var requestDeleteCheckedSessions: () -> Void
+    var requestDeleteOldSessions: () -> Void
+}
+
+/// The tick box shown on session rows while the user picks sessions to delete.
+struct SessionCheckbox: View {
+    let state: SessionCheckState
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 13))
+            .foregroundStyle(state == .checked ? Color.accentColor : Color.secondary)
+            .frame(width: 16)
+            .opacity(state == .open ? 0.5 : 1)
+            .help(state == .open ? "This session is open right now, so it can’t be deleted" : "")
+    }
+
+    private var symbol: String {
+        switch state {
+        case .unchecked: return "square"
+        case .checked: return "checkmark.square.fill"
+        case .open: return "lock.square"
+        }
+    }
 }
 
 /// "Move to project" submenu, shared by the session row menu and the sidebar context menu.
@@ -91,8 +115,63 @@ struct SessionsSidebar: View {
                 .padding(.horizontal, WP.Space.sm)
                 .padding(.bottom, WP.Space.md)
             }
+            if !vm.sessions.isEmpty {
+                Divider().opacity(0.4)
+                bulkActions
+                    .padding(WP.Space.md)
+            }
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+    }
+
+    // MARK: - Bulk delete
+
+    @ViewBuilder
+    private var bulkActions: some View {
+        if vm.isDeletingSessions {
+            HStack(spacing: WP.Space.sm) {
+                ProgressView().controlSize(.small)
+                Text("Moving to Trash…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+        } else if vm.isSelectingSessions {
+            selectionBar
+        } else {
+            HStack {
+                Button("Select") { vm.beginSelectingSessions() }
+                Spacer()
+                Button("Delete old…", action: actions.requestDeleteOldSessions)
+            }
+            .controlSize(.small)
+        }
+    }
+
+    private var selectionBar: some View {
+        let count = vm.checkedSessionIDs.count
+        return VStack(alignment: .leading, spacing: WP.Space.sm) {
+            HStack(spacing: WP.Space.sm) {
+                Text("\(count) selected")
+                    .font(.system(size: 11, weight: .medium))
+                Spacer(minLength: 0)
+                Button("Select all (\(vm.selectableSessions.count))") { vm.checkAllSelectable() }
+                Button("Clear") { vm.clearChecked() }
+                    .disabled(count == 0)
+            }
+            .buttonStyle(.link)
+            .font(.system(size: 11))
+            HStack {
+                Button("Done") { vm.endSelectingSessions() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(role: .destructive, action: actions.requestDeleteCheckedSessions) {
+                    Text("Delete \(SessionCleanup.countLabel(count))")
+                }
+                .disabled(count == 0)
+            }
+            .controlSize(.small)
+        }
     }
 
     // MARK: - Search
@@ -354,17 +433,28 @@ struct SidebarSessionRow: View {
     let actions: SessionsSidebarActions
     let showsProject: Bool
 
-    private var isSelected: Bool { vm.selection == .session(session.id) }
+    private var checkState: SessionCheckState? { vm.checkState(for: session) }
+    private var isHighlighted: Bool {
+        checkState == nil ? vm.selection == .session(session.id) : checkState == .checked
+    }
 
     var body: some View {
         Button {
-            vm.selection = .session(session.id)
+            if checkState == nil {
+                vm.selection = .session(session.id)
+            } else {
+                vm.toggleChecked(session)
+            }
         } label: {
             HStack(spacing: WP.Space.sm) {
-                Image(systemName: "waveform")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 16)
+                if let checkState {
+                    SessionCheckbox(state: checkState)
+                } else {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 16)
+                }
                 VStack(alignment: .leading, spacing: 1) {
                     Text(session.displayName)
                         .font(.system(size: 12))
@@ -380,11 +470,12 @@ struct SidebarSessionRow: View {
             .padding(.vertical, 4)
             .background(
                 RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+                    .fill(isHighlighted ? Color.accentColor.opacity(0.14) : Color.clear)
             )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(checkState == .checked ? .isSelected : [])
         .onDrag { SessionDragPayload.provider(for: session) }
         .contextMenu {
             Button {
@@ -415,6 +506,7 @@ struct SidebarSessionRow: View {
     }
 
     private var caption: String {
+        if checkState == .open { return "Open now" }
         let relative = Self.relativeFormatter.localizedString(for: session.lastUsedAt, relativeTo: Date())
         if showsProject, let project = vm.project(of: session) {
             return "\(project.name) · \(relative)"

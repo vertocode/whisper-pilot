@@ -157,6 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vm.onSessionChanged = { [weak self] meta in
             Task { await self?.coordinator.sessionMetaDidChange(meta) }
         }
+        vm.openSessionID = { [weak self] in self?.coordinator.currentSession?.id }
         sessionsViewModel = vm
 
         let sessions = SessionsWindowController(viewModel: vm, globalContext: coordinator.globalContext)
