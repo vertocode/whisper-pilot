@@ -43,6 +43,33 @@ extension SmokeTestRunner {
             await expect(queue.drain().isEmpty, "draining twice writes nothing more")
         }
 
+        await suite("TranscriptPersistenceQueue: after a drain") {
+            var queue = TranscriptPersistenceQueue()
+            let fragment = finalUpdate("Okay", at: 0)
+            _ = queue.accept(fragment)
+            _ = queue.drain()
+            await expect(queue.accept(finalUpdate("Okay so the plan is ready for Friday.", at: 5)) == nil,
+                         "next line is accepted as pending")
+            await expect(queue.drain().map(\.text) == ["Okay so the plan is ready for Friday."],
+                         "next line containing the drained fragment is kept")
+
+            var streamCopy = TranscriptPersistenceQueue()
+            _ = streamCopy.accept(fragment)
+            _ = streamCopy.drain()
+            await expect(streamCopy.accept(finalUpdate("Okay", id: fragment.id, at: 1)) == nil
+                         && streamCopy.drain().isEmpty,
+                         "stream copy of the drained line is dropped by id")
+        }
+
+        await suite("TranscriptPersistenceQueue: older final after a newer one") {
+            var queue = TranscriptPersistenceQueue()
+            _ = queue.accept(finalUpdate("and then we should", at: 10))
+            let older = finalUpdate("The budget was approved yesterday afternoon.", at: 8)
+            await expect(queue.accept(older)?.text == "and then we should",
+                         "older final is not rolled into the newer open line")
+            await expect(queue.drain().map(\.text) == [older.text], "older final kept whole")
+        }
+
         await suite("TranscriptPersistenceQueue: merge rules") {
             var queue = TranscriptPersistenceQueue()
             let id = UUID()
@@ -74,6 +101,7 @@ extension SmokeTestRunner {
             var queue = TranscriptPersistenceQueue()
             let id = UUID()
             _ = queue.accept(finalUpdate(first, id: id, at: 0))
+            _ = queue.accept(finalUpdate(second, at: 1))
             _ = queue.drain()
             await expect(queue.accept(finalUpdate(first + " And more.", id: id, at: 1)) == nil,
                          "late re-final of a written id is ignored")

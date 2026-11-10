@@ -19,6 +19,7 @@ struct TranscriptPersistenceQueue {
 
     private var pendingByChannel: [AudioChannel: Line] = [:]
     private var lastPersistedByChannel: [AudioChannel: Line] = [:]
+    private var drainedIDByChannel: [AudioChannel: UUID] = [:]
 
     /// Takes in one transcript update. Returns the line that must now be
     /// written, if this update proved the previous one finished.
@@ -30,6 +31,7 @@ struct TranscriptPersistenceQueue {
         // utterance pushed it out before the recognizer's own final landed)
         // can't be merged into the file — drop it instead of appending a
         // duplicate line.
+        if update.id == drainedIDByChannel[channel] { return nil }
         if let flushed = lastPersistedByChannel[channel],
            update.id == flushed.id
             || (update.timestamp.timeIntervalSince(flushed.timestamp) <= TranscriptDedup.mergeWindowSeconds
@@ -61,7 +63,8 @@ struct TranscriptPersistenceQueue {
         // Continuation of the same speaker turn (task churn finalized
         // mid-sentence) ⇒ append to the pending line, mirroring the display
         // buffer's roll-up, instead of flushing a fragment row.
-        if TranscriptDedup.shouldRollUp(
+        if update.timestamp >= pending.timestamp,
+           TranscriptDedup.shouldRollUp(
             previousText: pending.text,
             previousAt: pending.timestamp,
             incomingText: update.text,
@@ -77,17 +80,20 @@ struct TranscriptPersistenceQueue {
         return pending
     }
 
-    /// Empties every channel's pending line, oldest first.
+    /// Empties every channel's pending line, oldest first. Only the id is
+    /// remembered, so the stream's own copy is dropped but a new transcriber's
+    /// next line is never mistaken for a repeat of this one.
     mutating func drain() -> [Line] {
         let drained = pendingByChannel.values.sorted { $0.timestamp < $1.timestamp }
         pendingByChannel.removeAll()
-        for line in drained { lastPersistedByChannel[line.channel] = line }
+        for line in drained { drainedIDByChannel[line.channel] = line.id }
         return drained
     }
 
     /// The memory of what was written belongs to one session's file.
     mutating func forgetPersistedLines() {
         lastPersistedByChannel.removeAll()
+        drainedIDByChannel.removeAll()
     }
 
     private static func line(from update: TranscriptUpdate, text: String) -> Line {

@@ -2583,8 +2583,7 @@ final class AppCoordinator {
             var lastQuestionConsider: [AudioChannel: ContinuousClock.Instant] = [:]
             for await update in transcriber.transcripts {
                 // Before the first await below, so finals are decided in arrival
-                // order and a cancelled loop can't hand one over after Stop has
-                // already flushed.
+                // order.
                 self?.queueTranscriptPersistence(update)
                 await buffer.apply(update)
                 // Feed every system-channel partial straight to the trigger engine so
@@ -3077,13 +3076,6 @@ final class AppCoordinator {
 
     // MARK: - AI prompt filtering
 
-    /// Applies the user's "include transcript in prompt" and "include chat history
-    /// in prompt" toggles to the snapshot before it's handed to PromptBuilder.
-    /// Live transcript lines, extracted topics, and resumed prior transcript
-    /// markdown are gated on the transcript flag; resumed prior chat markdown is
-    /// gated on the chat-history flag. `entities` is kept either way — it's a tiny
-    /// derived list and useful for the model's continuity even when both sections
-    /// are otherwise excluded.
     private func queueTranscriptPersistence(_ update: TranscriptUpdate) {
         if let finished = transcriptPersistence.accept(update) {
             enqueueTranscriptWrites([finished])
@@ -3192,6 +3184,13 @@ final class AppCoordinator {
         if overlayState.transcript != snapshot { overlayState.transcript = snapshot }
     }
 
+    /// Applies the user's "include transcript in prompt" and "include chat history
+    /// in prompt" toggles to the snapshot before it's handed to PromptBuilder.
+    /// Live transcript lines, extracted topics, and resumed prior transcript
+    /// markdown are gated on the transcript flag; resumed prior chat markdown is
+    /// gated on the chat-history flag. `entities` is kept either way — it's a tiny
+    /// derived list and useful for the model's continuity even when both sections
+    /// are otherwise excluded.
     private func filteredSnapshot(_ snapshot: ConversationSnapshot) -> ConversationSnapshot {
         let includeT = settings.includeTranscriptInPrompt
         let includeH = settings.includeChatHistoryInPrompt
