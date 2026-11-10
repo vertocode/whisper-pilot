@@ -52,7 +52,8 @@ final class SessionsViewModel: ObservableObject {
     @Published private(set) var activeQuery: String = ""
     @Published private(set) var isSelectingSessions = false
     @Published private(set) var checkedSessionIDs: Set<SessionID> = []
-    @Published private(set) var isDeletingSessions = false
+    /// How far a bulk delete has got. Nil when none is running.
+    @Published private(set) var deletionProgress: (done: Int, total: Int)?
     /// Shown after a delete that had to leave a session behind.
     @Published var deletionNotice: DeletionNotice?
 
@@ -245,6 +246,8 @@ final class SessionsViewModel: ObservableObject {
         checkedSessionIDs = []
     }
 
+    var isDeletingSessions: Bool { deletionProgress != nil }
+
     func isOpen(_ session: SessionMeta) -> Bool {
         openSessionIDs?().contains(session.id) ?? false
     }
@@ -307,9 +310,14 @@ final class SessionsViewModel: ObservableObject {
     /// Moves the sessions to the Trash. The list reloads once, after the whole batch.
     func deleteSessions(_ targets: [SessionMeta]) async {
         guard !isDeletingSessions, !targets.isEmpty else { return }
-        isDeletingSessions = true
-        defer { isDeletingSessions = false }
-        let outcome = await SessionCleanup.delete(targets, from: store) { openSessionIDs?() ?? [] }
+        deletionProgress = (0, targets.count)
+        defer { deletionProgress = nil }
+        let outcome = await SessionCleanup.delete(
+            targets,
+            from: store,
+            openSessions: { openSessionIDs?() ?? [] },
+            onProgress: { deletionProgress = ($0, targets.count) }
+        )
         if case .session(let id) = selection, outcome.deleted.contains(id) { selection = .home }
         await refresh()
         report(outcome)

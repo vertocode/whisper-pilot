@@ -144,10 +144,10 @@ struct SessionsSidebar: View {
 
     @ViewBuilder
     private var bulkActions: some View {
-        if vm.isDeletingSessions {
+        if let progress = vm.deletionProgress {
             HStack(spacing: WP.Space.sm) {
                 ProgressView().controlSize(.small)
-                Text("Moving to Trash…")
+                Text("Moving to Trash… \(progress.done) of \(progress.total)")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)

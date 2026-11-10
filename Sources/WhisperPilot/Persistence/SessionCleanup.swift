@@ -66,10 +66,12 @@ enum SessionCleanup {
     static func delete(
         _ sessions: [SessionMeta],
         from store: SessionStore,
-        openSessions: () -> Set<SessionID>
+        openSessions: () -> Set<SessionID>,
+        onProgress: (Int) -> Void = { _ in }
     ) async -> Outcome {
         var outcome = Outcome()
-        for session in sessions {
+        for (index, session) in sessions.enumerated() {
+            defer { onProgress(index + 1) }
             if openSessions().contains(session.id) {
                 outcome.skippedOpen.append(session)
                 continue

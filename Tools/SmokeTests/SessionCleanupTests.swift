@@ -132,10 +132,12 @@ extension SmokeTestRunner {
                 let first = try await store.createSession(name: "First")
                 let second = try await store.createSession(name: "Second")
                 var calls = 0
-                let opened = await SessionCleanup.delete([first, second], from: store) {
+                var progress: [Int] = []
+                let opened = await SessionCleanup.delete([first, second], from: store, openSessions: {
                     calls += 1
                     return calls == 1 ? [] : [second.id]
-                }
+                }, onProgress: { progress.append($0) })
+                await expect(progress == [1, 2], "progress counts skipped sessions too: \(progress)")
                 await expect(opened.deleted == [first.id], "the session before it is deleted")
                 await expect(names(opened.skippedOpen) == [second.folderName], "a session opened during the run survives")
                 let secondStillThere = await exists(store, second)
