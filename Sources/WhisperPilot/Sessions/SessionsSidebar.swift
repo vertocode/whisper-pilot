@@ -168,6 +168,8 @@ struct SessionsSidebar: View {
                 Button(role: .destructive, action: actions.requestDeleteCheckedSessions) {
                     Text("Delete \(SessionCleanup.countLabel(count))")
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
                 .disabled(count == 0)
             }
             .controlSize(.small)

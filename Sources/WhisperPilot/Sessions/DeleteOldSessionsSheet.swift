@@ -83,10 +83,10 @@ struct DeleteOldSessionsSheet: View {
         let current = match
         return VStack(alignment: .leading, spacing: WP.Space.xs) {
             Text(current.sessions.isEmpty
-                 ? "No sessions are this old."
+                 ? (current.keptOpenSession == nil ? "No sessions are this old." : "No other sessions are this old.")
                  : "\(SessionCleanup.countLabel(current.sessions.count)) will move to the Trash with their transcripts, chats, and recaps. Sessions inside projects are included.")
             if let kept = current.keptOpenSession {
-                Text("“\(kept.displayName)” also matches, but it’s open right now, so it will be kept.")
+                Text("“\(kept.displayName)” is this old too, but it’s open right now, so it will be kept.")
             }
         }
         .font(.system(size: 12))

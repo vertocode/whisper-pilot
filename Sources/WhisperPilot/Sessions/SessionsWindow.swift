@@ -906,10 +906,7 @@ struct SessionRow: View {
                 .strokeBorder(.separator.opacity(isHovered ? 0.5 : 0.25), lineWidth: 0.5)
         )
         .animation(.easeOut(duration: 0.12), value: isHovered)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if checkState != nil { vm.toggleChecked(session) }
-        }
+        .gesture(checkState == nil ? nil : TapGesture().onEnded { vm.toggleChecked(session) })
     }
 
     /// Vendor-colored badge content for the model this session uses. Nil when
