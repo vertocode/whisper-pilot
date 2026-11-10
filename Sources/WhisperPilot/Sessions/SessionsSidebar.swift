@@ -506,6 +506,7 @@ struct SidebarSessionRow: View {
             } label: {
                 Label("Delete session", systemImage: "trash")
             }
+            .disabled(vm.isOpen(session))
         }
     }
 

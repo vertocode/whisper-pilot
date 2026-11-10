@@ -9,6 +9,23 @@ enum SessionsSelection: Hashable {
     case session(SessionID)
 }
 
+struct DeletionNotice: Equatable {
+    let title: String
+    let message: String
+
+    /// Nil when nothing was kept.
+    init?(keptOpen sessions: [SessionMeta]) {
+        guard let only = sessions.first else { return nil }
+        if sessions.count == 1 {
+            title = "A session was kept"
+            message = "“\(only.displayName)” was kept because it’s open right now."
+        } else {
+            title = "Some sessions were kept"
+            message = "\(SessionCleanup.countLabel(sessions.count)) were kept because they were open."
+        }
+    }
+}
+
 /// How a session's checkbox looks while the user is picking sessions to delete.
 enum SessionCheckState: Equatable {
     case unchecked
@@ -36,8 +53,8 @@ final class SessionsViewModel: ObservableObject {
     @Published private(set) var isSelectingSessions = false
     @Published private(set) var checkedSessionIDs: Set<SessionID> = []
     @Published private(set) var isDeletingSessions = false
-    /// Shown after a bulk delete that had to leave a session behind.
-    @Published var deletionNotice: String?
+    /// Shown after a delete that had to leave a session behind.
+    @Published var deletionNotice: DeletionNotice?
 
     let projects: ProjectsStore
     private let store: SessionStore
@@ -161,6 +178,10 @@ final class SessionsViewModel: ObservableObject {
     }
 
     func delete(_ meta: SessionMeta) async {
+        guard !isOpen(meta) else {
+            deletionNotice = DeletionNotice(keptOpen: [meta])
+            return
+        }
         do {
             try await store.deleteSession(meta.id)
             if selection == .session(meta.id) { selection = .home }
@@ -282,20 +303,23 @@ final class SessionsViewModel: ObservableObject {
 
     private func report(_ outcome: SessionCleanup.Outcome) {
         checkedSessionIDs.subtract(outcome.skippedOpen.map(\.id))
-        var kept: String?
-        if let only = outcome.skippedOpen.first {
-            kept = outcome.skippedOpen.count == 1
-                ? "“\(only.displayName)” was kept because it’s open right now."
-                : "\(SessionCleanup.countLabel(outcome.skippedOpen.count)) were kept because they were open."
-        }
-        guard let failure = outcome.failed.first else {
-            endSelectingSessions()
-            deletionNotice = kept
-            return
-        }
         // Failed sessions stay checked so the user can try again.
-        let failed = "Couldn’t move \(SessionCleanup.countLabel(outcome.failed.count)) to Trash: \(failure.error.localizedDescription)"
-        errorMessage = [failed, kept].compactMap { $0 }.joined(separator: " ")
+        if outcome.failed.isEmpty { endSelectingSessions() }
+        announce(outcome)
+    }
+
+    private func announce(_ outcome: SessionCleanup.Outcome) {
+        let kept = DeletionNotice(keptOpen: outcome.skippedOpen)
+        if let failed = failureMessage(outcome) {
+            errorMessage = [failed, kept?.message].compactMap { $0 }.joined(separator: " ")
+        } else {
+            deletionNotice = kept
+        }
+    }
+
+    private func failureMessage(_ outcome: SessionCleanup.Outcome) -> String? {
+        guard let failure = outcome.failed.first else { return nil }
+        return "Couldn’t move \(SessionCleanup.countLabel(outcome.failed.count)) to Trash: \(failure.error.localizedDescription)"
     }
 
     // MARK: - Projects
@@ -315,13 +339,9 @@ final class SessionsViewModel: ObservableObject {
     func deleteProject(_ id: UUID, deleteSessions: Bool) async {
         if deleteSessions {
             await refresh()
-            for member in sessions(in: id) {
-                do {
-                    try await store.deleteSession(member.id)
-                } catch {
-                    errorMessage = "Couldn’t move \(member.displayName) to Trash: \(error.localizedDescription)"
-                }
-            }
+            let outcome = await SessionCleanup.delete(sessions(in: id), from: store) { openSessionIDs?() ?? [] }
+            if case .session(let shown) = selection, outcome.deleted.contains(shown) { selection = .home }
+            announce(outcome)
         }
         // Whatever is left (all of them when keeping sessions) becomes ungrouped.
         await store.clearProject(id)
@@ -406,7 +426,7 @@ struct SessionsView: View {
                 sessionPendingDeletion = nil
             }
         } message: { session in
-            Text("This permanently removes the transcript, chat, and metadata folder for “\(session.displayName)” from disk. This action cannot be undone.")
+            Text("“\(session.displayName)” moves to the Trash with its transcript, chat, and recap.")
         }
         .alert(
             "Delete \(SessionCleanup.countLabel(vm.checkedSessions.count))?",
@@ -424,7 +444,7 @@ struct SessionsView: View {
             DeleteOldSessionsSheet(vm: vm)
         }
         .alert(
-            "Some sessions were kept",
+            vm.deletionNotice?.title ?? "",
             isPresented: Binding(
                 get: { vm.deletionNotice != nil },
                 set: { if !$0 { vm.deletionNotice = nil } }
@@ -432,7 +452,7 @@ struct SessionsView: View {
         ) {
             Button("OK", role: .cancel) { vm.deletionNotice = nil }
         } message: {
-            Text(vm.deletionNotice ?? "")
+            Text(vm.deletionNotice?.message ?? "")
         }
         .alert(
             "Rename session",
@@ -887,6 +907,7 @@ struct SessionRow: View {
                     Button(role: .destructive, action: onRequestDelete) {
                         Label("Delete session", systemImage: "trash")
                     }
+                    .disabled(vm.isOpen(session))
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 13, weight: .semibold))

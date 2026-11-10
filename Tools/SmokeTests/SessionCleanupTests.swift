@@ -281,6 +281,36 @@ extension SmokeTestRunner {
             let closedStillThere = await exists(store, closed)
             await expect(openingStillThere, "a session still opening is never deleted")
             await expect(!closedStillThere, "the closed session is deleted")
+            await expect(vm.deletionNotice?.title == "A session was kept", "one kept session gets a singular title")
+            vm.deletionNotice = nil
+
+            await vm.delete(current)
+            await vm.delete(opening)
+            let currentAfterSingle = await exists(store, current)
+            let openingAfterSingle = await exists(store, opening)
+            await expect(currentAfterSingle && openingAfterSingle, "single delete keeps open and opening sessions")
+            await expect(vm.deletionNotice?.message.contains("Opening") == true, "single delete says why it did nothing")
+            await expect(vm.errorMessage == nil, "keeping a session is not an error")
+
+            guard let doomed = projects.create(name: "Doomed") else {
+                await expect(false, "project was created")
+                return
+            }
+            _ = try await store.setProject(doomed.id, for: current.id)
+            _ = try await store.setProject(doomed.id, for: opening.id)
+            let member = try await store.createSession(name: "Member", projectID: doomed.id)
+            await vm.refresh()
+            vm.deletionNotice = nil
+            await vm.deleteProject(doomed.id, deleteSessions: true)
+            let currentAfterProject = await exists(store, current)
+            let openingAfterProject = await exists(store, opening)
+            let memberAfterProject = await exists(store, member)
+            await expect(currentAfterProject && openingAfterProject, "deleting a project keeps its open and opening sessions")
+            await expect(!memberAfterProject, "the project's other sessions are deleted")
+            await expect(projects.project(id: doomed.id) == nil, "the project itself is gone")
+            await expect(vm.deletionNotice?.title == "Some sessions were kept", "two kept sessions get a plural title")
+            let unfiled = await store.listSessions().filter { [current.id, opening.id].contains($0.id) }
+            await expect(unfiled.allSatisfy { $0.projectID == nil }, "kept sessions become ungrouped")
         } catch {
             await expect(false, "opening fixture threw: \(error)")
         }
@@ -334,7 +364,7 @@ extension SmokeTestRunner {
             await vm.deleteSessions(targets)
             let openStillThere = await exists(store, oldOpen)
             await expect(openStillThere, "a session opened after picking survives")
-            await expect(vm.deletionNotice?.contains("Old open") == true, "the user is told it was kept")
+            await expect(vm.deletionNotice?.message.contains("Old open") == true, "the user is told it was kept")
 
             let ghost = meta("no-such-folder", lastUsed: longAgo)
             vm.beginSelectingSessions()
