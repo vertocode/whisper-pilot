@@ -2898,6 +2898,15 @@ final class AppCoordinator {
         overlayState.status = .streaming
         let task = Task { [weak self] in
             guard let self else { return }
+            var replacesOldText = replacingAnswer != nil
+            let pacer = StreamDeltaPacer(interval: .milliseconds(100)) { text in
+                if replacesOldText {
+                    replacesOldText = false
+                    self.overlayState.replaceText(of: messageId, with: text)
+                } else {
+                    self.overlayState.appendDelta(to: messageId, text)
+                }
+            }
             do {
                 var deltaCount = 0
                 // If the provider never sends a `.finish(reason)`, the stream
@@ -2906,18 +2915,19 @@ final class AppCoordinator {
                 // instead of a silently-truncated bubble.
                 var finishReason: AIFinishReason = .other(nil)
                 var receivedFinish = false
-                for try await event in ai.streamCompletion(prompt: prompt) {
-                    switch event {
-                    case .delta(let text):
-                        deltaCount += 1
-                        if deltaCount == 1, replacingAnswer != nil {
-                            self.overlayState.replaceText(of: messageId, with: text)
-                        } else {
-                            self.overlayState.appendDelta(to: messageId, text)
+                do {
+                    // Runs on every way out of the stream, including errors, so
+                    // everything below reads the full text of the bubble.
+                    defer { pacer.flush() }
+                    for try await event in ai.streamCompletion(prompt: prompt) {
+                        switch event {
+                        case .delta(let text):
+                            deltaCount += 1
+                            pacer.add(text)
+                        case .finish(let reason):
+                            finishReason = reason
+                            receivedFinish = true
                         }
-                    case .finish(let reason):
-                        finishReason = reason
-                        receivedFinish = true
                     }
                 }
                 // A cancelled stream ends quietly with no finish event. That is a

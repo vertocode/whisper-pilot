@@ -343,7 +343,7 @@ final class OverlayState: ObservableObject {
     }
 
     func appendDelta(to id: UUID, _ delta: String) {
-        guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
+        guard let idx = messages.lastIndex(where: { $0.id == id }) else { return }
         messages[idx].text.append(delta)
     }
 

@@ -1755,18 +1755,22 @@ private struct LogRow: View {
 }
 
 private struct TypingIndicator: View {
-    @State private var phase: Int = 0
-    private let timer = Timer.publish(every: 0.35, on: .main, in: .common).autoconnect()
+    // A fixed start date keeps the schedule identical across parent redraws, so
+    // streaming text can't restart the tick and freeze the dots.
+    private static let start = Date()
+    private static let step: TimeInterval = 0.35
 
     var body: some View {
-        HStack(spacing: 2) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .frame(width: 4, height: 4)
-                    .opacity(phase == i ? 1.0 : 0.3)
+        TimelineView(.periodic(from: Self.start, by: Self.step)) { context in
+            let phase = Int(context.date.timeIntervalSince(Self.start) / Self.step) % 3
+            HStack(spacing: 2) {
+                ForEach(0..<3, id: \.self) { i in
+                    Circle()
+                        .frame(width: 4, height: 4)
+                        .opacity(phase == i ? 1.0 : 0.3)
+                }
             }
+            .foregroundStyle(.secondary)
         }
-        .foregroundStyle(.secondary)
-        .onReceive(timer) { _ in phase = (phase + 1) % 3 }
     }
 }
