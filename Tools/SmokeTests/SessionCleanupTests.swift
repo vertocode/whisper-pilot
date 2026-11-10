@@ -244,6 +244,32 @@ extension SmokeTestRunner {
             await vm.refresh()
             await expect(vm.checkedSessionIDs == [filed.id], "a session that disappeared drops out of the selection")
 
+            await expect(vm.checkedDeletionMessage.hasPrefix("It moves"), "one ticked session reads in the singular")
+            vm.clearChecked()
+
+            // Ticked while closed, then opened: the count must drop it before any refresh.
+            var openIDs: Set<SessionID> = []
+            vm.openSessionIDs = { openIDs }
+            let other = try await store.createSession(name: "Other")
+            await vm.refresh()
+            vm.toggleChecked(other)
+            vm.toggleChecked(filed)
+            openIDs = [other.id]
+            await expect(vm.checkedSessions.map(\.id) == [filed.id], "an already-ticked session that opens drops out of what gets deleted")
+            await expect(vm.checkedDeletionMessage.hasPrefix("It moves"), "the dialog counts the same sessions as the button")
+            await vm.refresh()
+            await expect(vm.checkedSessionIDs == [filed.id], "a refresh clears the tick on the open session")
+            openIDs = []
+
+            vm.toggleChecked(other)
+            vm.selection = .project(project.id)
+            await expect(vm.checkedDeletionMessage.contains("Includes 1 not shown here"), "ticks off this page are called out")
+            vm.selection = .home
+            await expect(!vm.checkedDeletionMessage.contains("not shown"), "no warning when every tick is on the page")
+            await search("Filed", in: vm)
+            await expect(vm.checkedDeletionMessage.contains("Includes 1 not shown here"), "ticks hidden by a search are called out")
+            await search("", in: vm)
+
             vm.endSelectingSessions()
             await expect(!vm.isSelectingSessions && vm.checkedSessionIDs.isEmpty, "done leaves selection mode clean")
         } catch {

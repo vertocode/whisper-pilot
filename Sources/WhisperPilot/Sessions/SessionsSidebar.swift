@@ -149,13 +149,15 @@ struct SessionsSidebar: View {
     }
 
     private var selectionBar: some View {
-        let count = vm.checkedSessionIDs.count
+        let count = vm.checkedSessions.count
+        let selectable = vm.selectableSessions.count
         return VStack(alignment: .leading, spacing: WP.Space.sm) {
             HStack(spacing: WP.Space.sm) {
                 Text("\(count) selected")
                     .font(.system(size: 11, weight: .medium))
                 Spacer(minLength: 0)
-                Button("Select all (\(vm.selectableSessions.count))") { vm.checkAllSelectable() }
+                Button("Select all (\(selectable))") { vm.checkAllSelectable() }
+                    .disabled(selectable == 0)
                 Button("Clear") { vm.clearChecked() }
                     .disabled(count == 0)
             }

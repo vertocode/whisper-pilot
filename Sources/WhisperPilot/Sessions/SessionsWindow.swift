@@ -92,6 +92,7 @@ final class SessionsViewModel: ObservableObject {
         sessions = await store.listSessions()
         if !checkedSessionIDs.isEmpty {
             checkedSessionIDs.formIntersection(sessions.map(\.id))
+            checkedSessionIDs.subtract(openSessionIDs?() ?? [])
         }
     }
 
@@ -286,6 +287,17 @@ final class SessionsViewModel: ObservableObject {
         sessions.filter { checkedSessionIDs.contains($0.id) && !isOpen($0) }
     }
 
+    /// The body of the "Delete N sessions?" dialog. Ticks survive a search or a page
+    /// change, so it says when some of what will go is off screen.
+    var checkedDeletionMessage: String {
+        let checked = checkedSessions
+        var message = "\(checked.count == 1 ? "It moves" : "They move") to the Trash with \(checked.count == 1 ? "its transcript, chat, and recap" : "their transcripts, chats, and recaps")."
+        let onPage = Set(sessionsOnPage.map(\.id))
+        let hidden = checked.filter { !onPage.contains($0.id) }.count
+        if hidden > 0 { message += " Includes \(hidden) not shown here." }
+        return message
+    }
+
     func oldSessions(_ limit: SessionAgeLimit, now: Date) -> SessionCleanup.AgeMatch {
         SessionCleanup.match(limit, in: sessions, openSessions: openSessionIDs?() ?? [], now: now)
     }
@@ -438,7 +450,7 @@ struct SessionsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("They move to the Trash with their transcripts, chats, and recaps.")
+            Text(vm.checkedDeletionMessage)
         }
         .sheet(isPresented: $showingDeleteOld) {
             DeleteOldSessionsSheet(vm: vm)
