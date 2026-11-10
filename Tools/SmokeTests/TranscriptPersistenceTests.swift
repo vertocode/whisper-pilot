@@ -91,6 +91,36 @@ extension SmokeTestRunner {
             await expect(queue.drain().map(\.id) == [id], "a new session's file starts with no memory")
         }
 
+        await suite("TranscriptPersistenceQueue: open line at stop") {
+            var queue = TranscriptPersistenceQueue()
+            let previous = finalUpdate(first, at: 0)
+            let open = finalUpdate(second, at: 5)
+            _ = queue.accept(previous)
+
+            // Stop takes the open line directly, and the same line also comes
+            // through the transcript stream.
+            let released = queue.accept(open)
+            await expect(released?.id == previous.id, "open line releases the finished line before it")
+            await expect(queue.accept(open) == nil, "the stream's copy before the flush adds nothing")
+            let drained = queue.drain()
+            await expect(drained.map(\.id) == [open.id] && drained.map(\.text) == [second],
+                         "the flush writes the open line once")
+
+            await expect(queue.accept(open) == nil, "the stream's copy after the flush adds nothing")
+            await expect(queue.accept(finalUpdate(second + " Plus words decoded later.", id: open.id, at: 6)) == nil,
+                         "the engine's last final for that id adds nothing")
+            await expect(queue.drain().isEmpty, "nothing is left to write twice")
+        }
+
+        await suite("TranscriptPersistenceQueue: open line on both channels at stop") {
+            var queue = TranscriptPersistenceQueue()
+            let mic = finalUpdate(first, channel: .microphone, at: 2)
+            let system = finalUpdate(second, channel: .system, at: 1)
+            _ = queue.accept(mic)
+            _ = queue.accept(system)
+            await expect(queue.drain().map(\.id) == [system.id, mic.id], "both channels keep their open line")
+        }
+
         await suite("TranscriptPersistenceQueue: channels and filtering") {
             var queue = TranscriptPersistenceQueue()
             let mic = finalUpdate(first, channel: .microphone, at: 0)

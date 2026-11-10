@@ -415,6 +415,7 @@ final class AppCoordinator {
     /// hangs, `HardCeilingMonitor` ends the process on its own after a short deadline.
     private func emergencyShutdown(reason: HardCeilingReason, sample: ResourceSample) async {
         wpError("[Coordinator] Hard ceiling crossed (\(reason.label)): cpu=\(Int(sample.cpuPercent.rounded()))%, footprint=\(sample.memoryBytes / 1_000_000) MB. Saving the session and quitting.")
+        captureOpenUtterances()
         await flushPendingContextSave()
         await flushPendingTranscriptLines()
         await projects.flush()
@@ -1373,6 +1374,9 @@ final class AppCoordinator {
         }
         sessionGeneration += 1
         log.info("⏹ stopListening")
+        // Nothing reads the transcriber's stream once the consumers are
+        // cancelled, so take the line still being spoken first.
+        let openUtterances = captureOpenUtterances()
         for task in consumerTasks { task.cancel() }
         consumerTasks.removeAll()
         for task in pendingBoundaryTasks.values { task.cancel() }
@@ -1388,6 +1392,7 @@ final class AppCoordinator {
         // Persist any in-flight context edit before tearing the session down so the
         // last few keystrokes of the user's notes don't disappear on stop.
         await flushPendingContextSave()
+        await commitOpenUtterances(openUtterances)
         // Same idea for transcript.md: the deferred-write scheme only flushes a
         // pending utterance when the *next* segment arrives, so the very last
         // utterance of the session needs an explicit flush here or it would
@@ -3138,8 +3143,11 @@ final class AppCoordinator {
     /// after this call to include the freshly-flushed lines.
     private func absorbPendingTranscripts() async {
         guard let transcriber else { return }
-        let pendings = transcriber.collectPendingFinals()
-        for update in pendings {
+        await absorbIntoContext(transcriber.collectPendingFinals())
+    }
+
+    private func absorbIntoContext(_ updates: [TranscriptUpdate]) async {
+        for update in updates {
             // Respect the same per-channel inclusion gates the normal consumer
             // applies — system-audio prompt inclusion can be toggled off in
             // Settings, in which case the model shouldn't see system lines.
@@ -3153,6 +3161,35 @@ final class AppCoordinator {
                 await context.absorb(update)
             }
         }
+    }
+
+    /// Queues the lines the transcriber is still holding open for transcript.md.
+    /// Synchronous, and it doesn't touch the audio going into the engine, so
+    /// Stop and the emergency exit never wait on speech recognition. Words the
+    /// engine hasn't decoded yet are not included. A copy of each line also
+    /// goes through the transcript stream, which is harmless: the queue
+    /// recognizes the same id and keeps one line.
+    @discardableResult
+    private func captureOpenUtterances() -> [TranscriptUpdate] {
+        guard let transcriber else { return [] }
+        let open = transcriber.collectPendingFinals()
+        for update in open { queueTranscriptPersistence(update) }
+        return open
+    }
+
+    /// The consumer that would normally do this is already cancelled. Without
+    /// it the row stays gray, and an automatic restart would erase it from the
+    /// screen and from the AI's context even though it is saved on disk.
+    private func commitOpenUtterances(_ updates: [TranscriptUpdate]) async {
+        guard !updates.isEmpty else { return }
+        for update in updates { await transcriptBuffer.apply(update) }
+        await absorbIntoContext(updates)
+        let snapshot = await transcriptBuffer.snapshot()
+        let evicted = await transcriptBuffer.takeEvicted()
+        if !evicted.isEmpty {
+            overlayState.transcriptHistory = TranscriptHistoryCap.capped(overlayState.transcriptHistory + evicted)
+        }
+        if overlayState.transcript != snapshot { overlayState.transcript = snapshot }
     }
 
     private func filteredSnapshot(_ snapshot: ConversationSnapshot) -> ConversationSnapshot {
