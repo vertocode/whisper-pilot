@@ -39,9 +39,10 @@ enum SessionCleanup {
         var failed: [(session: SessionMeta, error: Error)] = []
     }
 
-    /// Sessions last used before the cutoff. Uses `lastUsedAt` because that is the date
-    /// each row shows, and a session reopened last week is not old however long ago it
-    /// was created. A session used exactly at the cutoff is kept.
+    /// Sessions whose last activity was before the cutoff. Uses `lastUsedAt` because that
+    /// is the date each row shows. It moves on new transcript lines, chat turns, and model
+    /// changes, so reopening a session just to read it usually leaves it as old as it was.
+    /// A session active exactly at the cutoff is kept.
     static func match(
         _ limit: SessionAgeLimit,
         in sessions: [SessionMeta],
