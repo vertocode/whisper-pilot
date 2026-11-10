@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import WhisperPilot
 
@@ -205,6 +206,54 @@ extension SmokeTestRunner {
 
         await suite("Sessions window: deleting picked and old sessions") {
             await runDeletionChecks()
+        }
+
+        await suite("Sessions window: deleting a project locks the window") {
+            await runProjectDeleteLockChecks()
+        }
+    }
+
+    @MainActor
+    private static func runProjectDeleteLockChecks() async {
+        let (root, store, projects) = await makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            guard let doomed = projects.create(name: "Doomed") else {
+                await expect(false, "project was created")
+                return
+            }
+            _ = try await store.createSession(name: "First", projectID: doomed.id)
+            _ = try await store.createSession(name: "Second", projectID: doomed.id)
+            let bystander = try await store.createSession(name: "Bystander")
+            let vm = SessionsViewModel(projects: projects, store: store)
+            await vm.refresh()
+
+            var progressSeen: [(done: Int, total: Int)?] = []
+            var secondDelete: Task<Void, Never>?
+            // Called just before each session is deleted, so this is mid-run.
+            vm.openSessionIDs = {
+                progressSeen.append(vm.deletionProgress)
+                if secondDelete == nil {
+                    secondDelete = Task { await vm.deleteSessions([bystander]) }
+                }
+                return []
+            }
+            var lockedAtReload: [Bool] = []
+            let reloads = vm.$sessions.dropFirst().sink { _ in lockedAtReload.append(vm.isDeletingSessions) }
+
+            await vm.deleteProject(doomed.id, deleteSessions: true)
+            await secondDelete?.value
+            reloads.cancel()
+
+            await expect(progressSeen.map { $0?.done } == [0, 1], "project delete reports progress: \(progressSeen)")
+            await expect(progressSeen.map { $0?.total } == [2, 2], "progress counts the project's sessions")
+            await expect(lockedAtReload == [true, true], "the window stays locked through both list reloads: \(lockedAtReload)")
+            let bystanderStillThere = await exists(store, bystander)
+            await expect(bystanderStillThere, "a bulk delete can't start during a project delete")
+            await expect(vm.sessions.map(\.id) == [bystander.id], "the list reloads without the project's sessions")
+            await expect(!vm.isDeletingSessions, "the lock clears when the project is gone")
+        } catch {
+            await expect(false, "project lock fixture threw: \(error)")
         }
     }
 

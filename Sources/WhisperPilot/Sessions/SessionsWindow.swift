@@ -310,17 +310,21 @@ final class SessionsViewModel: ObservableObject {
     /// Moves the sessions to the Trash. The list reloads once, after the whole batch.
     func deleteSessions(_ targets: [SessionMeta]) async {
         guard !isDeletingSessions, !targets.isEmpty else { return }
-        deletionProgress = (0, targets.count)
         defer { deletionProgress = nil }
-        let outcome = await SessionCleanup.delete(
+        let outcome = await moveToTrash(targets)
+        if case .session(let id) = selection, outcome.deleted.contains(id) { selection = .home }
+        await refresh()
+        report(outcome)
+    }
+
+    private func moveToTrash(_ targets: [SessionMeta]) async -> SessionCleanup.Outcome {
+        deletionProgress = (0, targets.count)
+        return await SessionCleanup.delete(
             targets,
             from: store,
             openSessions: { openSessionIDs?() ?? [] },
             onProgress: { deletionProgress = ($0, targets.count) }
         )
-        if case .session(let id) = selection, outcome.deleted.contains(id) { selection = .home }
-        await refresh()
-        report(outcome)
     }
 
     private func report(_ outcome: SessionCleanup.Outcome) {
@@ -359,12 +363,22 @@ final class SessionsViewModel: ObservableObject {
     /// Deletes the project. Its sessions stay and move to ungrouped, unless `deleteSessions`
     /// is true (the caller has asked the user to confirm), in which case they go to the Trash.
     func deleteProject(_ id: UUID, deleteSessions: Bool) async {
-        if deleteSessions {
-            await refresh()
-            let outcome = await SessionCleanup.delete(sessions(in: id), from: store) { openSessionIDs?() ?? [] }
-            if case .session(let shown) = selection, outcome.deleted.contains(shown) { selection = .home }
-            announce(outcome)
+        guard deleteSessions else {
+            await removeProject(id)
+            return
         }
+        guard !isDeletingSessions else { return }
+        // Held until the last reload, because rows already in the Trash still show Resume.
+        deletionProgress = (0, sessions(in: id).count)
+        defer { deletionProgress = nil }
+        await refresh()
+        let outcome = await moveToTrash(sessions(in: id))
+        if case .session(let shown) = selection, outcome.deleted.contains(shown) { selection = .home }
+        announce(outcome)
+        await removeProject(id)
+    }
+
+    private func removeProject(_ id: UUID) async {
         // Whatever is left (all of them when keeping sessions) becomes ungrouped.
         await store.clearProject(id)
         projects.delete(id)
