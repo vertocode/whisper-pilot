@@ -110,6 +110,13 @@ enum OverlayStatus: Equatable, Sendable {
     case needsAPIKey
     case error(String)
 
+    /// Header state once no AI reply is left running. During startup it must go back
+    /// to `.starting`, the only state the first audio frame promotes to `.listening`.
+    static func afterAIReply(isRunning: Bool, isStartupWanted: Bool) -> OverlayStatus {
+        if isRunning { return .listening }
+        return isStartupWanted ? .starting : .idle
+    }
+
     var isActive: Bool {
         switch self {
         case .starting, .listening, .thinking, .streaming: return true

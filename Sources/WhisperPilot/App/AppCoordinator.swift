@@ -224,7 +224,11 @@ final class AppCoordinator {
     /// Set for the duration of `startListening`. Prevents the user from double-clicking
     /// Play (or the disabled-but-still-clickable stop affordance) from re-entering startup
     /// while audio capture is mid-setup, which would leave duplicate captures running.
-    private var isStartingUp = false
+    private var isStartingUp: Bool { inProgressStartupGeneration != nil }
+    /// Stop bumps `sessionGeneration` but can't interrupt a model load, so a startup can
+    /// outlive its Stop. A mismatch with `sessionGeneration` means nobody wants it anymore.
+    private var inProgressStartupGeneration: Int?
+    private var isStartupWanted: Bool { inProgressStartupGeneration == sessionGeneration }
     private(set) var currentSession: SessionMeta?
     /// Summaries of earlier sessions in the current session's project, loaded when the
     /// session opens. Nil when the session has no project or the project has no history.
@@ -490,10 +494,15 @@ final class AppCoordinator {
             wpInfo("[Coordinator] startListening: already running/starting, skipping")
             return
         }
-        isStartingUp = true
-        defer { isStartingUp = false }
         sessionGeneration += 1
         let startupGeneration = sessionGeneration
+        inProgressStartupGeneration = startupGeneration
+        defer {
+            inProgressStartupGeneration = nil
+            // A reply finishing during a startup that then failed would otherwise
+            // leave "Starting…" up forever: only the first audio frame clears it.
+            if !isRunning, overlayState.status == .starting { overlayState.status = .idle }
+        }
         wpInfo("[Coordinator] ▶ startListening")
         // Fresh AsyncStream instances per session — see the property declarations
         // for why. Doing this here (rather than at `stopListening` time) keeps the
@@ -1892,7 +1901,7 @@ final class AppCoordinator {
                 // Nothing to answer without the screen — drop back out of the
                 // thinking state so the pill doesn't hang.
                 if self.overlayState.status == .thinking {
-                    self.overlayState.status = self.isRunning ? .listening : .idle
+                    self.overlayState.status = .afterAIReply(isRunning: self.isRunning, isStartupWanted: self.isStartupWanted)
                 }
                 return
             }
@@ -2957,7 +2966,6 @@ final class AppCoordinator {
                    case let GeminiError.http(status, _) = error,
                    status == 404,
                    let (fromModel, newAI) = self.migrateToFallbackModel() {
-                    self.overlayState.finishAssistant(id: messageId)
                     let note = "ℹ️ Model \(fromModel) is unavailable on your API key. Auto-switched to \(self.settings.activeModel) and retrying."
                     self.overlayState.appendSystemNote(note, category: .ai)
                     wpInfo("AI model fallback: \(fromModel) → \(self.settings.activeModel)")
@@ -2966,12 +2974,15 @@ final class AppCoordinator {
                     // the outer cleanup-on-exit below to fire twice for one logical
                     // request.
                     self.inFlightCompletions[messageId] = nil
+                    // Retry in the same bubble, or the failed attempt stays on screen as an empty "…".
                     await self.runCompletion(
                         prompt: prompt,
                         ai: newAI,
                         origin: origin,
                         sessionID: sessionID,
-                        hasAttemptedFallback: true
+                        hasAttemptedFallback: true,
+                        replacingAnswer: messageId,
+                        onStart: onStart
                     )
                     return
                 }
@@ -3023,7 +3034,7 @@ final class AppCoordinator {
         guard inFlightCompletions.isEmpty else { return }
         switch overlayState.status {
         case .streaming, .thinking, .error:
-            overlayState.status = isRunning ? .listening : .idle
+            overlayState.status = .afterAIReply(isRunning: isRunning, isStartupWanted: isStartupWanted)
         default:
             break
         }
