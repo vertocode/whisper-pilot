@@ -22,6 +22,7 @@ struct SmokeTestRunner {
         await runMinIntervalGateSuite()
         await runStreamDeltaCoalescerSuite()
         await runStreamDeltaPacerSuite()
+        await runStreamPumpSuite()
         await runAppendDeltaSuite()
         await runTranscriptBufferSuite()
         await runReplayOverlapTrimmerSuite()
@@ -2043,14 +2044,51 @@ struct SmokeTestRunner {
             }
             await expect(applied == ["first", " held"], "held text shows during a pause with no new delta")
 
+            pacer.add(" again")
+            for _ in 0..<200 where applied.count < 3 {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            await expect(applied.last == " again", "a second pause in the same stream also shows held text")
+
             try? await Task.sleep(for: .milliseconds(40))
             pacer.add(" a")
             pacer.add(" b")
             pacer.flush()
             let afterFlush = applied
-            await expect(afterFlush.joined() == "first held a b", "flush shows everything at once")
+            await expect(afterFlush.joined() == "first held again a b", "flush shows everything at once")
             try? await Task.sleep(for: .milliseconds(80))
             await expect(applied == afterFlush, "timer adds nothing after a flush")
+        }
+    }
+
+    @MainActor
+    static func runStreamPumpSuite() async {
+        await suite("StreamDeltaPacer.pump") {
+            struct Boom: Error {}
+            var applied: [String] = []
+            let pacer = StreamDeltaPacer(interval: .milliseconds(500)) { applied.append($0) }
+            let failing = AsyncThrowingStream<AIStreamEvent, Error> { continuation in
+                continuation.yield(.delta("one "))
+                continuation.yield(.delta("two"))
+                continuation.finish(throwing: Boom())
+            }
+            var threw = false
+            do { _ = try await pacer.pump(failing) } catch { threw = error is Boom }
+            await expect(threw, "the stream error reaches the caller")
+            await expect(applied.joined() == "one two", "all text is applied before the error reaches the caller")
+
+            applied = []
+            let ok = StreamDeltaPacer(interval: .milliseconds(500)) { applied.append($0) }
+            let finishing = AsyncThrowingStream<AIStreamEvent, Error> { continuation in
+                continuation.yield(.delta("a"))
+                continuation.yield(.delta("b"))
+                continuation.yield(.delta("c"))
+                continuation.yield(.finish(.stop))
+                continuation.finish()
+            }
+            let result = try? await ok.pump(finishing)
+            await expect(applied.joined() == "abc", "a normal finish applies all text")
+            await expect(result?.deltaCount == 3 && result?.receivedFinish == true, "counts deltas and the finish event")
         }
     }
 

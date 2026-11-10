@@ -65,3 +65,30 @@ final class StreamDeltaPacer {
         if let text = coalescer.drain(at: .now) { apply(text) }
     }
 }
+
+struct StreamPumpResult {
+    var deltaCount = 0
+    // A stream with no `.finish` ended without a clean terminal event.
+    var finishReason: AIFinishReason = .other(nil)
+    var receivedFinish = false
+}
+
+extension StreamDeltaPacer {
+    /// Feeds a stream into the pacer. Held text is flushed on every way out,
+    /// including a thrown error, so the caller always sees the full text.
+    func pump(_ stream: AsyncThrowingStream<AIStreamEvent, Error>) async throws -> StreamPumpResult {
+        var result = StreamPumpResult()
+        defer { flush() }
+        for try await event in stream {
+            switch event {
+            case .delta(let text):
+                result.deltaCount += 1
+                add(text)
+            case .finish(let reason):
+                result.finishReason = reason
+                result.receivedFinish = true
+            }
+        }
+        return result
+    }
+}

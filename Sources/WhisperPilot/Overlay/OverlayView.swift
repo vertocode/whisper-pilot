@@ -1762,7 +1762,7 @@ private struct TypingIndicator: View {
 
     var body: some View {
         TimelineView(.periodic(from: Self.start, by: Self.step)) { context in
-            let phase = Int(context.date.timeIntervalSince(Self.start) / Self.step) % 3
+            let phase = Int((context.date.timeIntervalSince(Self.start) / Self.step).rounded()) % 3
             HStack(spacing: 2) {
                 ForEach(0..<3, id: \.self) { i in
                     Circle()
