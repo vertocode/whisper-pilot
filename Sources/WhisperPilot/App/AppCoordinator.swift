@@ -1567,6 +1567,7 @@ final class AppCoordinator {
         lastPersistedLineByChannel.removeAll()
 
         currentSession = session
+        overlayState.sessionContextOwner = session.id
         overlayState.transcript = []
         overlayState.transcriptHistory = []
         overlayState.clearChat()

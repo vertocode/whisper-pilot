@@ -22,6 +22,29 @@ enum ContextFileReader {
         }
     }
 
+    /// One read at a time, so attaching several big PDFs can't pile up CPU and memory during a meeting.
+    private static let readQueue = DispatchQueue(
+        label: "com.whisperpilot.context-file-reader",
+        qos: .utility,
+        autoreleaseFrequency: .workItem
+    )
+
+    /// Runs `read` away from the main thread, because a large PDF can take long enough to stall
+    /// the overlay and live captions. Returns `nil` if `currentTarget` changed during the read:
+    /// the user has moved on, so the file must not land in whatever is open now.
+    @MainActor
+    static func readInBackground(
+        _ url: URL,
+        ifTargetStays currentTarget: () -> SessionID?,
+        reader: @escaping @Sendable (URL) -> Result<ContextFile, ReadError> = { read($0) }
+    ) async -> Result<ContextFile, ReadError>? {
+        let target = currentTarget()
+        let result: Result<ContextFile, ReadError> = await withCheckedContinuation { continuation in
+            readQueue.async { continuation.resume(returning: reader(url)) }
+        }
+        return currentTarget() == target ? result : nil
+    }
+
     static func read(_ url: URL) -> Result<ContextFile, ReadError> {
         let ext = url.pathExtension.lowercased()
         guard acceptedExtensions.contains(ext) else { return .failure(.unsupported(ext)) }

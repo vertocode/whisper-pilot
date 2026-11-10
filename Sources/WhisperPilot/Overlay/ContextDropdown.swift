@@ -27,10 +27,15 @@ struct ContextDropdown: View {
     var notesLabel: String = "Notes"
     /// Opens the panel the first time it appears. The toggle still works afterwards.
     var startExpanded: Bool = false
+    /// Which session the binding points at right now. The overlay reuses one binding for
+    /// every session, so a slow file read has to check this before saving its result.
+    /// Panels whose binding always means the same thing can leave the default.
+    var currentOwner: () -> SessionID? = { nil }
 
     @State private var isExpanded: Bool = false
     @State private var isDropTargeted: Bool = false
     @State private var lastError: String?
+    @State private var pendingReads: Int = 0
 
     /// File types we accept via drag-drop and the open panel. Plain text covers
     /// `.txt` and most code files; markdown / html / json are called out explicitly
@@ -188,7 +193,7 @@ struct ContextDropdown: View {
             }
             .buttonStyle(.plain)
 
-            Text(isDropTargeted ? "Drop to attach" : "or drag & drop .md / .html / .json / .txt / .pdf")
+            Text(isDropTargeted ? "Drop to attach" : pendingReads > 0 ? "Reading…" : "or drag & drop .md / .html / .json / .txt / .pdf")
                 .font(WP.TextStyle.micro)
                 .foregroundStyle(isDropTargeted ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.tertiary))
             Spacer(minLength: 0)
@@ -236,17 +241,23 @@ struct ContextDropdown: View {
         }
     }
 
+    @MainActor
     private func attach(_ url: URL) {
-        switch ContextFileReader.read(url) {
-        case .failure(let error):
-            lastError = error.message
-        case .success(let file):
-            if let existingIndex = context.files.firstIndex(where: { $0.sourcePath == file.sourcePath }) {
-                context.files[existingIndex] = file
-            } else {
-                context.files.append(file)
+        pendingReads += 1
+        Task { @MainActor in
+            defer { pendingReads -= 1 }
+            guard let result = await ContextFileReader.readInBackground(url, ifTargetStays: currentOwner) else { return }
+            switch result {
+            case .failure(let error):
+                lastError = error.message
+            case .success(let file):
+                if let existingIndex = context.files.firstIndex(where: { $0.sourcePath == file.sourcePath }) {
+                    context.files[existingIndex] = file
+                } else {
+                    context.files.append(file)
+                }
+                lastError = nil
             }
-            lastError = nil
         }
     }
 
