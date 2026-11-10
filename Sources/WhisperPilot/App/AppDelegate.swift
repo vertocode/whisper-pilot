@@ -457,6 +457,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             await coordinator.useSession(meta, resumed: resumed)
             coordinator.openingSessions.end(meta.id)
+            // Hiding the window doesn't count as closing it, so the close handler won't do this.
+            sessionsViewModel?.endSelectingSessions()
             sessionsWindow?.window?.orderOut(nil)
             overlay?.showWindow(nil)
             overlay?.window?.orderFrontRegardless()
