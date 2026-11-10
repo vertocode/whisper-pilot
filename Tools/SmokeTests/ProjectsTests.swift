@@ -397,7 +397,7 @@ extension SmokeTestRunner {
                     .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
                 defer { try? FileManager.default.removeItem(at: root) }
                 let sessionsDir = root.appendingPathComponent("sessions", isDirectory: true)
-                let store = SessionStore(baseURL: sessionsDir)
+                let store = SessionStore(baseURL: sessionsDir, removeItem: removeWithoutTrash)
                 let storage = ProjectStorage(directory: root, sessionsDirectory: sessionsDir)
                 let label = deleteSessions ? "checked" : "unchecked"
                 do {

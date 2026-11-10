@@ -36,11 +36,14 @@ extension SmokeTestRunner {
         try encoder.encode(old).write(to: url, options: .atomic)
     }
 
+    /// Keeps fake test sessions out of the real Trash.
+    static let removeWithoutTrash: @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
+
     private static func makeFixture() async -> (root: URL, store: SessionStore, projects: ProjectsStore) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("whisper-pilot-smoke-\(UUID().uuidString)", isDirectory: true)
         let sessionsDir = root.appendingPathComponent("sessions", isDirectory: true)
-        let store = SessionStore(baseURL: sessionsDir)
+        let store = SessionStore(baseURL: sessionsDir, removeItem: removeWithoutTrash)
         let projects = await ProjectsStore(storage: ProjectStorage(directory: root, sessionsDirectory: sessionsDir))
         return (root, store, projects)
     }
