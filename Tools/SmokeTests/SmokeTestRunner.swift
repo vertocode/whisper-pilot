@@ -448,11 +448,11 @@ struct SmokeTestRunner {
             let sessionB = SessionID(folderName: "session-b")
             let origin = DetectedQuestionOrigin(generation: 3, sessionID: sessionA)
             await expect(origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: false), "same run and session can answer")
-            await expect(!origin.canAnswer(generation: 4, sessionID: sessionA, isAIPaused: false), "stop during the check blocks the answer")
-            await expect(!origin.canAnswer(generation: 5, sessionID: sessionB, isAIPaused: false), "another session opened during the check blocks the answer")
-            await expect(!origin.canAnswer(generation: 3, sessionID: sessionB, isAIPaused: false), "a session change alone blocks the answer")
-            await expect(!origin.canAnswer(generation: 3, sessionID: nil, isAIPaused: false), "losing the session blocks the answer")
-            await expect(!origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: true), "paused AI blocks the answer")
+            await expect(!origin.canAnswer(generation: 4, sessionID: sessionA, isAIPaused: false), "a different generation blocks the answer")
+            await expect(!origin.canAnswer(generation: 5, sessionID: sessionB, isAIPaused: false), "a different generation and session together block the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: sessionB, isAIPaused: false), "a different session id alone blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: nil, isAIPaused: false), "a nil session id blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: true), "isAIPaused blocks the answer")
         }
 
         await suite("TranscriptHistoryCap") {

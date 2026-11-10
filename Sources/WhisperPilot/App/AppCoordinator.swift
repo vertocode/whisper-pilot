@@ -1565,6 +1565,8 @@ final class AppCoordinator {
         await flushPendingTranscriptLines()
         // The just-persisted dedup memory belongs to the old session's file.
         lastPersistedLineByChannel.removeAll()
+        detectedBubbles.removeAll()
+        supersededQuestions.removeAll()
 
         currentSession = session
         overlayState.transcript = []
@@ -2757,6 +2759,7 @@ final class AppCoordinator {
             do {
                 guard try await ai.isQuestionToAnswer(trigger.text) else {
                     wpInfo("[Coordinator] possible question rejected by the AI check — skipping")
+                    supersededQuestions.removeAll { $0 == trigger.text }
                     return
                 }
             } catch {

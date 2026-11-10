@@ -1,7 +1,7 @@
 import Foundation
 
 /// The listening run and session that heard a detected question.
-struct DetectedQuestionOrigin: Equatable {
+struct DetectedQuestionOrigin {
     let generation: Int
     let sessionID: SessionID?
 
