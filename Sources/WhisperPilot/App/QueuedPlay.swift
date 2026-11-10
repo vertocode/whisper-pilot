@@ -4,12 +4,14 @@
 /// the new start has to wait for the old one to return.
 struct QueuedPlay {
     enum Action: Equatable {
-        case start, stop, queueStart, cancelQueuedStart
+        case start, stop, queueStart, cancelQueuedStart, ignore
     }
 
     private(set) var isQueued = false
 
-    mutating func press(isRunning: Bool, isStartingUp: Bool, isStartupLive: Bool) -> Action {
+    mutating func press(isRunning: Bool, isStartingUp: Bool, isStartupLive: Bool, isStopping: Bool) -> Action {
+        // The button still shows Stop during teardown, so this press can't mean Play.
+        if isStopping { return .ignore }
         if isQueued {
             isQueued = false
             return .cancelQueuedStart

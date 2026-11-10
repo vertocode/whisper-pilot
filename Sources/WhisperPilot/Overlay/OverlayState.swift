@@ -117,6 +117,13 @@ enum OverlayStatus: Equatable, Sendable {
         return isStartupWanted ? .starting : .idle
     }
 
+    /// Header state once a startup has returned. A reply finishing during a startup that
+    /// then failed would otherwise leave "Starting…" up forever, because only the first
+    /// audio frame clears it.
+    static func afterStartupReturned(current: OverlayStatus, isRunning: Bool, isPlayQueued: Bool) -> OverlayStatus {
+        current == .starting && !isRunning && !isPlayQueued ? .idle : current
+    }
+
     var isActive: Bool {
         switch self {
         case .starting, .listening, .thinking, .streaming: return true

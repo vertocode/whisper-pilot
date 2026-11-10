@@ -221,7 +221,7 @@ final class AppCoordinator {
     /// capture-path switch) preserves the user's in-session mute instead of
     /// resetting it to the `alwaysTranscribeMic` default.
     private var pendingMicMuteRestore: Bool?
-    /// Set for the duration of `startListening`. Prevents the user from double-clicking
+    /// True while `runStartup` is in progress. Prevents the user from double-clicking
     /// Play (or the disabled-but-still-clickable stop affordance) from re-entering startup
     /// while audio capture is mid-setup, which would leave duplicate captures running.
     private var isStartingUp: Bool { inProgressStartupGeneration != nil }
@@ -232,6 +232,9 @@ final class AppCoordinator {
     private var isStartupWanted: Bool { isStartupLive || queuedPlay.isQueued }
     private var queuedPlay = QueuedPlay()
     private var queuedPlayNoteID: UUID?
+    /// A count, not a flag, because quit, the Sessions button and the resource valve can
+    /// each be stopping at the same time.
+    private var stopsInFlight = 0
     private(set) var currentSession: SessionMeta?
     /// Summaries of earlier sessions in the current session's project, loaded when the
     /// session opens. Nil when the session has no project or the project has no history.
@@ -434,6 +437,7 @@ final class AppCoordinator {
     /// The app is about to freeze the Mac: write what we have to disk and quit. If this
     /// hangs, `HardCeilingMonitor` ends the process on its own after a short deadline.
     private func emergencyShutdown(reason: HardCeilingReason, sample: ResourceSample) async {
+        queuedPlay.clear()
         wpError("[Coordinator] Hard ceiling crossed (\(reason.label)): cpu=\(Int(sample.cpuPercent.rounded()))%, footprint=\(sample.memoryBytes / 1_000_000) MB. Saving the session and quitting.")
         await flushPendingContextSave()
         await flushPendingTranscriptLines()
@@ -509,9 +513,11 @@ final class AppCoordinator {
         inProgressStartupGeneration = startupGeneration
         defer {
             inProgressStartupGeneration = nil
-            // A reply finishing during a startup that then failed would otherwise
-            // leave "Starting…" up forever: only the first audio frame clears it.
-            if !isRunning, !queuedPlay.isQueued, overlayState.status == .starting { overlayState.status = .idle }
+            overlayState.status = .afterStartupReturned(
+                current: overlayState.status,
+                isRunning: isRunning,
+                isPlayQueued: queuedPlay.isQueued
+            )
         }
         wpInfo("[Coordinator] ▶ startListening")
         // Fresh AsyncStream instances per session — see the property declarations
@@ -1408,6 +1414,8 @@ final class AppCoordinator {
             await flushPendingTranscriptLines()
             return
         }
+        stopsInFlight += 1
+        defer { stopsInFlight -= 1 }
         sessionGeneration += 1
         log.info("⏹ stopListening")
         for task in consumerTasks { task.cancel() }
@@ -1545,7 +1553,14 @@ final class AppCoordinator {
     }
 
     func toggleListening() async {
-        switch queuedPlay.press(isRunning: isRunning, isStartingUp: isStartingUp, isStartupLive: isStartupLive) {
+        switch queuedPlay.press(
+            isRunning: isRunning,
+            isStartingUp: isStartingUp,
+            isStartupLive: isStartupLive,
+            isStopping: stopsInFlight > 0
+        ) {
+        case .ignore:
+            return
         case .start:
             await startListening()
         case .stop:
@@ -1598,6 +1613,12 @@ final class AppCoordinator {
         // The just-persisted dedup memory belongs to the old session's file.
         lastPersistedLineByChannel.removeAll()
 
+        // A remembered Play belongs to the session it was pressed in. Left queued, the
+        // meeting would be recorded into this one. No await may sit between this and the swap.
+        if queuedPlay.take() {
+            dismissStartupNotes()
+            if overlayState.status == .starting { overlayState.status = .idle }
+        }
         currentSession = session
         overlayState.transcript = []
         overlayState.transcriptHistory = []
@@ -1612,6 +1633,7 @@ final class AppCoordinator {
         saveFailureNoteID = nil
         slowStartupNoteID = nil
         stuckStartupNoteID = nil
+        queuedPlayNoteID = nil
         // The Tier-1 alert lives in the chat that `clearChat()` just wiped; drop
         // the stale ID and latch so the valve can re-alert cleanly in the new session.
         tier1NoteID = nil
@@ -3048,8 +3070,8 @@ final class AppCoordinator {
 
     /// Called by every non-fallback exit path of `runCompletion`. Removes the task
     /// from the in-flight map and, only when nothing else is still streaming, flips
-    /// the status pill back to `.listening` (or `.idle` if we've been stopped in
-    /// the meantime). With concurrent completions, we can't just unconditionally
+    /// the status pill back to `.listening` (`.starting` during a wanted startup, or
+    /// `.idle` if we've been stopped in the meantime). With concurrent completions, we can't just unconditionally
     /// flip after each one — that would prematurely declare "done" while another
     /// stream is still arriving.
     private func completionFinished(messageId: UUID) {
