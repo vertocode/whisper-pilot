@@ -66,8 +66,8 @@ final class SessionsViewModel: ObservableObject {
     /// bar — discoverability fix for first-time users who haven't found the
     /// menu bar icon yet.
     var onOpenSettings: (() -> Void)?
-    /// Set by the AppDelegate. The session open in the overlay, which bulk delete must keep.
-    var openSessionID: (() -> SessionID?)?
+    /// Set by the AppDelegate. The sessions open or still opening, which delete must keep.
+    var openSessionIDs: (() -> Set<SessionID>)?
 
     func refresh() async {
         isLoading = true
@@ -221,10 +221,14 @@ final class SessionsViewModel: ObservableObject {
         checkedSessionIDs = []
     }
 
+    func isOpen(_ session: SessionMeta) -> Bool {
+        openSessionIDs?().contains(session.id) ?? false
+    }
+
     /// Nil when the user is not picking sessions.
     func checkState(for session: SessionMeta) -> SessionCheckState? {
         guard isSelectingSessions else { return nil }
-        if session.id == openSessionID?() { return .open }
+        if isOpen(session) { return .open }
         return checkedSessionIDs.contains(session.id) ? .checked : .unchecked
     }
 
@@ -246,8 +250,7 @@ final class SessionsViewModel: ObservableObject {
 
     /// What "Select all" adds. Never more than the user is looking at.
     var selectableSessions: [SessionMeta] {
-        let open = openSessionID?()
-        return sessionsOnPage.filter { $0.id != open }
+        sessionsOnPage.filter { !isOpen($0) }
     }
 
     func checkAllSelectable() {
@@ -259,12 +262,11 @@ final class SessionsViewModel: ObservableObject {
     }
 
     var checkedSessions: [SessionMeta] {
-        let open = openSessionID?()
-        return sessions.filter { checkedSessionIDs.contains($0.id) && $0.id != open }
+        sessions.filter { checkedSessionIDs.contains($0.id) && !isOpen($0) }
     }
 
     func oldSessions(_ limit: SessionAgeLimit, now: Date) -> SessionCleanup.AgeMatch {
-        SessionCleanup.match(limit, in: sessions, openSession: openSessionID?(), now: now)
+        SessionCleanup.match(limit, in: sessions, openSessions: openSessionIDs?() ?? [], now: now)
     }
 
     /// Moves the sessions to the Trash. The list reloads once, after the whole batch.
@@ -272,7 +274,7 @@ final class SessionsViewModel: ObservableObject {
         guard !isDeletingSessions, !targets.isEmpty else { return }
         isDeletingSessions = true
         defer { isDeletingSessions = false }
-        let outcome = await SessionCleanup.delete(targets, from: store) { openSessionID?() }
+        let outcome = await SessionCleanup.delete(targets, from: store) { openSessionIDs?() ?? [] }
         if case .session(let id) = selection, outcome.deleted.contains(id) { selection = .home }
         await refresh()
         report(outcome)

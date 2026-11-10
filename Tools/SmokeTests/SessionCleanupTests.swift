@@ -77,22 +77,22 @@ extension SmokeTestRunner {
                 meta("old-but-reused", lastUsed: now, created: date("2020-01-01T00:00:00Z")),
                 meta("unknown-age", lastUsed: .distantPast),
             ]
-            let match = SessionCleanup.match(.oneMonth, in: sessions, openSession: nil, now: now, calendar: utc)
+            let match = SessionCleanup.match(.oneMonth, in: sessions, openSessions: [], now: now, calendar: utc)
             await expect(names(match.sessions) == ["just-before", "in-project"],
                          "only sessions last used before the cutoff match, inside projects too: \(names(match.sessions))")
             await expect(match.keptOpenSession == nil, "nothing is reported kept without an open session")
 
-            let year = SessionCleanup.match(.oneYear, in: sessions, openSession: nil, now: now, calendar: utc)
+            let year = SessionCleanup.match(.oneYear, in: sessions, openSessions: [], now: now, calendar: utc)
             await expect(names(year.sessions) == ["in-project"], "a longer limit matches fewer sessions")
 
-            let openOld = SessionCleanup.match(.oneMonth, in: sessions, openSession: sessions[3].id, now: now, calendar: utc)
+            let openOld = SessionCleanup.match(.oneMonth, in: sessions, openSessions: [sessions[3].id], now: now, calendar: utc)
             await expect(names(openOld.sessions) == ["just-before"], "the open session never matches")
             await expect(openOld.keptOpenSession?.folderName == "in-project", "the open session is reported as kept")
 
-            let openRecent = SessionCleanup.match(.oneMonth, in: sessions, openSession: sessions[2].id, now: now, calendar: utc)
+            let openRecent = SessionCleanup.match(.oneMonth, in: sessions, openSessions: [sessions[2].id], now: now, calendar: utc)
             await expect(openRecent.keptOpenSession == nil, "an open session too new to match is not mentioned")
 
-            let none = SessionCleanup.match(.oneYear, in: [meta("new", lastUsed: now)], openSession: nil, now: now, calendar: utc)
+            let none = SessionCleanup.match(.oneYear, in: [meta("new", lastUsed: now)], openSessions: [], now: now, calendar: utc)
             await expect(none.sessions.isEmpty, "zero matches when everything is recent")
         }
 
@@ -108,7 +108,7 @@ extension SmokeTestRunner {
                 await store.saveContext(SessionContext(), to: second.id)
                 await store.appendTranscriptLine(channel: .system, text: "still here", at: Date(), to: open.id)
 
-                let outcome = await SessionCleanup.delete([first, open, second], from: store) { open.id }
+                let outcome = await SessionCleanup.delete([first, open, second], from: store) { [open.id] }
 
                 await expect(Set(outcome.deleted) == [first.id, second.id], "the two closed sessions are deleted")
                 await expect(names(outcome.skippedOpen) == [open.folderName], "the open session is reported as skipped")
@@ -134,7 +134,7 @@ extension SmokeTestRunner {
                 var calls = 0
                 let opened = await SessionCleanup.delete([first, second], from: store) {
                     calls += 1
-                    return calls == 1 ? nil : second.id
+                    return calls == 1 ? [] : [second.id]
                 }
                 await expect(opened.deleted == [first.id], "the session before it is deleted")
                 await expect(names(opened.skippedOpen) == [second.folderName], "a session opened during the run survives")
@@ -142,12 +142,30 @@ extension SmokeTestRunner {
                 await expect(secondStillThere, "its folder is still there")
 
                 let missing = meta("no-such-folder", lastUsed: Date())
-                let failed = await SessionCleanup.delete([missing, second], from: store) { nil }
+                let failed = await SessionCleanup.delete([missing, second], from: store) { [] }
                 await expect(names(failed.failed.map(\.session)) == ["no-such-folder"], "the failure is reported")
                 await expect(failed.deleted == [second.id], "one failure does not stop the batch")
             } catch {
                 await expect(false, "mid-run fixture threw: \(error)")
             }
+        }
+
+        await suite("SessionCleanup: tracking sessions still opening") {
+            let id = SessionID(folderName: "opening")
+            var opening = SessionCleanup.OpeningSessions()
+            opening.begin(id)
+            opening.begin(id)
+            opening.end(id)
+            await expect(opening.ids == [id], "a session opened twice stays protected until both opens finish")
+            opening.end(id)
+            await expect(opening.ids.isEmpty, "finished opens are forgotten")
+            opening.end(id)
+            opening.begin(id)
+            await expect(opening.ids == [id], "an extra finish can't cancel out a later open")
+        }
+
+        await suite("Sessions window: a session still opening is protected like the open one") {
+            await runOpeningChecks()
         }
 
         await suite("Sessions window: picking sessions") {
@@ -172,7 +190,7 @@ extension SmokeTestRunner {
             let filed = try await store.createSession(name: "Filed", projectID: project.id)
             let open = try await store.createSession(name: "Open")
             let vm = SessionsViewModel(projects: projects, store: store)
-            vm.openSessionID = { open.id }
+            vm.openSessionIDs = { [open.id] }
             await vm.refresh()
 
             await expect(vm.checkState(for: loose) == nil, "rows have no checkbox outside selection mode")
@@ -234,6 +252,41 @@ extension SmokeTestRunner {
     }
 
     @MainActor
+    private static func runOpeningChecks() async {
+        let (root, store, projects) = await makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let current = try await store.createSession(name: "Current")
+            let opening = try await store.createSession(name: "Opening")
+            let closed = try await store.createSession(name: "Closed")
+            for session in [current, opening, closed] {
+                try await backdate(session, to: date("2024-01-01T00:00:00Z"), in: store)
+            }
+            let vm = SessionsViewModel(projects: projects, store: store)
+            vm.openSessionIDs = { [current.id, opening.id] }
+            await vm.refresh()
+
+            vm.beginSelectingSessions()
+            await expect(vm.checkState(for: opening) == .open, "a session still opening shows as open")
+            vm.toggleChecked(opening)
+            await expect(vm.checkedSessionIDs.isEmpty, "a session still opening can't be ticked")
+            vm.checkAllSelectable()
+            await expect(vm.checkedSessionIDs == [closed.id], "select all skips both the open and the opening session")
+
+            let match = vm.oldSessions(.oneYear, now: Date())
+            await expect(names(match.sessions) == [closed.folderName], "delete old skips both")
+
+            await vm.deleteSessions([opening, closed])
+            let openingStillThere = await exists(store, opening)
+            let closedStillThere = await exists(store, closed)
+            await expect(openingStillThere, "a session still opening is never deleted")
+            await expect(!closedStillThere, "the closed session is deleted")
+        } catch {
+            await expect(false, "opening fixture threw: \(error)")
+        }
+    }
+
+    @MainActor
     private static func runDeletionChecks() async {
         let (root, store, projects) = await makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -251,9 +304,9 @@ extension SmokeTestRunner {
             for session in [old, oldFiled, oldOpen] {
                 try await backdate(session, to: longAgo, in: store)
             }
-            var openID: SessionID? = oldOpen.id
+            var openIDs: Set<SessionID> = [oldOpen.id]
             let vm = SessionsViewModel(projects: projects, store: store)
-            vm.openSessionID = { openID }
+            vm.openSessionIDs = { openIDs }
             await vm.refresh()
 
             let match = vm.oldSessions(.oneYear, now: Date())
@@ -273,11 +326,11 @@ extension SmokeTestRunner {
             await expect(projects.project(id: project.id) != nil, "the project itself stays")
 
             // Picked while closed, then opened before Delete ran.
-            openID = nil
+            openIDs = []
             vm.beginSelectingSessions()
             vm.toggleChecked(oldOpen)
             let targets = vm.checkedSessions
-            openID = oldOpen.id
+            openIDs = [oldOpen.id]
             await vm.deleteSessions(targets)
             let openStillThere = await exists(store, oldOpen)
             await expect(openStillThere, "a session opened after picking survives")

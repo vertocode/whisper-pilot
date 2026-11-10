@@ -480,10 +480,12 @@ struct SidebarSessionRow: View {
         .accessibilityAddTraits(checkState == .checked ? .isSelected : [])
         .onDrag { SessionDragPayload.provider(for: session) }
         .contextMenu {
-            Button {
-                vm.resume(session)
-            } label: {
-                Label("Resume", systemImage: "play.fill")
+            if checkState == nil {
+                Button {
+                    vm.resume(session)
+                } label: {
+                    Label("Resume", systemImage: "play.fill")
+                }
             }
             Button {
                 actions.requestRenameSession(session)

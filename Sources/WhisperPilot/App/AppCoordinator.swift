@@ -226,6 +226,13 @@ final class AppCoordinator {
     /// while audio capture is mid-setup, which would leave duplicate captures running.
     private var isStartingUp = false
     private(set) var currentSession: SessionMeta?
+    var openingSessions = SessionCleanup.OpeningSessions()
+    /// Sessions that must not be deleted: the current one and any still opening.
+    var sessionIDsInUse: Set<SessionID> {
+        var ids = openingSessions.ids
+        if let current = currentSession?.id { ids.insert(current) }
+        return ids
+    }
     /// Summaries of earlier sessions in the current session's project, loaded when the
     /// session opens. Nil when the session has no project or the project has no history.
     private var projectHistory: ProjectHistoryCache?

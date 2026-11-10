@@ -157,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vm.onSessionChanged = { [weak self] meta in
             Task { await self?.coordinator.sessionMetaDidChange(meta) }
         }
-        vm.openSessionID = { [weak self] in self?.coordinator.currentSession?.id }
+        vm.openSessionIDs = { [weak self] in self?.coordinator.sessionIDsInUse ?? [] }
         sessionsViewModel = vm
 
         let sessions = SessionsWindowController(viewModel: vm, globalContext: coordinator.globalContext)
@@ -447,12 +447,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openSession(_ meta: SessionMeta, resumed: Bool) {
+        // Marked before any waiting, because the Sessions window stays usable until this
+        // finishes and the session must not be deleted in the meantime.
+        coordinator.openingSessions.begin(meta.id)
         Task {
             // If a different session is already running, stop it first so we don't mix audio.
             if coordinator.isRunning, coordinator.currentSession?.id != meta.id {
                 await coordinator.stopListening()
             }
             await coordinator.useSession(meta, resumed: resumed)
+            coordinator.openingSessions.end(meta.id)
             sessionsWindow?.window?.orderOut(nil)
             overlay?.showWindow(nil)
             overlay?.window?.orderFrontRegardless()

@@ -29,7 +29,7 @@ enum SessionAgeLimit: Int, CaseIterable, Identifiable, Sendable {
 enum SessionCleanup {
     struct AgeMatch: Equatable {
         var sessions: [SessionMeta]
-        /// The open session, when it is old enough to match but has to stay.
+        /// A session in use, when it is old enough to match but has to stay.
         var keptOpenSession: SessionMeta?
     }
 
@@ -45,7 +45,7 @@ enum SessionCleanup {
     static func match(
         _ limit: SessionAgeLimit,
         in sessions: [SessionMeta],
-        openSession: SessionID?,
+        openSessions: Set<SessionID>,
         now: Date,
         calendar: Calendar = .current
     ) -> AgeMatch {
@@ -53,23 +53,23 @@ enum SessionCleanup {
         // `distantPast` means the folder had no readable dates, so its age is unknown.
         let old = sessions.filter { $0.lastUsedAt < cutoff && $0.lastUsedAt != .distantPast }
         return AgeMatch(
-            sessions: old.filter { $0.id != openSession },
-            keptOpenSession: old.first { $0.id == openSession }
+            sessions: old.filter { !openSessions.contains($0.id) },
+            keptOpenSession: old.first { openSessions.contains($0.id) }
         )
     }
 
     /// Deletes one session per store call, so a long batch never blocks a live session
-    /// from saving its transcript. The open session is checked before every deletion
+    /// from saving its transcript. Open sessions are checked before every deletion
     /// because the user can open one while this runs.
     @MainActor
     static func delete(
         _ sessions: [SessionMeta],
         from store: SessionStore,
-        openSession: () -> SessionID?
+        openSessions: () -> Set<SessionID>
     ) async -> Outcome {
         var outcome = Outcome()
         for session in sessions {
-            if session.id == openSession() {
+            if openSessions().contains(session.id) {
                 outcome.skippedOpen.append(session)
                 continue
             }
@@ -81,6 +81,23 @@ enum SessionCleanup {
             }
         }
         return outcome
+    }
+
+    /// Sessions the user asked to open that aren't the current session yet. Counted per
+    /// session because the same one can be opened twice before the first open finishes.
+    struct OpeningSessions {
+        private var counts: [SessionID: Int] = [:]
+
+        var ids: Set<SessionID> { Set(counts.keys) }
+
+        mutating func begin(_ id: SessionID) {
+            counts[id, default: 0] += 1
+        }
+
+        mutating func end(_ id: SessionID) {
+            guard let count = counts[id] else { return }
+            counts[id] = count > 1 ? count - 1 : nil
+        }
     }
 
     static func countLabel(_ count: Int) -> String {
