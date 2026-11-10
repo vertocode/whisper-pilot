@@ -24,6 +24,7 @@ struct SmokeTestRunner {
         await runReplayOverlapTrimmerSuite()
         await runTranscriptStreamSegmenterSuite()
         await runTranscriptDedupSuite()
+        await runTranscriptPersistenceQueueSuite()
         await runTranscriptRobustnessSuite()
         await runResourceGovernorSuite()
         await runSessionStoreParsingSuite()
