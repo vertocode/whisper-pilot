@@ -61,6 +61,7 @@ struct SmokeTestRunner {
         await runChatScrollSuite()
         await runTranscriptHistoryCapSuite()
         await runAudioDropTrackingSuite()
+        await runContextFileReaderSuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count

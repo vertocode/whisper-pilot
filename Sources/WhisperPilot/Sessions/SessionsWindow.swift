@@ -360,6 +360,7 @@ struct SessionsView: View {
         case .project(let id):
             if let project = vm.projects.project(id: id) {
                 ProjectDetailView(vm: vm, projects: vm.projects, project: project, actions: sidebarActions, sessionActions: sessionRowActions)
+                    .id(project.id)
             } else {
                 EmptyProjectSelection()
             }

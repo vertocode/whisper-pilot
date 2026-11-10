@@ -583,6 +583,7 @@ struct OverlayView: View {
                 onDismissMessage: actions.dismissMessage,
                 onRunAction: actions.runChatAction,
                 sessionContext: $state.sessionContext,
+                sessionContextOwner: { state.sessionContextOwner },
                 activeModel: settings.activeModel,
                 availableVendors: settings.availableVendors,
                 onSelectModel: actions.selectModel,
@@ -599,6 +600,7 @@ struct OverlayView: View {
                     onDismissMessage: actions.dismissMessage,
                     onRunAction: actions.runChatAction,
                     sessionContext: $state.sessionContext,
+                    sessionContextOwner: { state.sessionContextOwner },
                     activeModel: settings.activeModel,
                     availableVendors: settings.availableVendors,
                     onSelectModel: actions.selectModel,
@@ -617,6 +619,7 @@ struct OverlayView: View {
                             onDismissMessage: actions.dismissMessage,
                             onRunAction: actions.runChatAction,
                             sessionContext: $state.sessionContext,
+                            sessionContextOwner: { state.sessionContextOwner },
                             activeModel: settings.activeModel,
                             availableVendors: settings.availableVendors,
                             onSelectModel: actions.selectModel,
@@ -1226,6 +1229,7 @@ private struct ChatLane: View {
     /// files). Edits flow through `OverlayState.sessionContext`; the coordinator
     /// debounces saves to disk.
     @Binding var sessionContext: SessionContext
+    let sessionContextOwner: () -> SessionID?
     /// Currently-active model id. Drives the picker's selection.
     let activeModel: String
     /// Vendors whose key is configured right now. Used to disable picker rows
@@ -1303,7 +1307,7 @@ private struct ChatLane: View {
                                         onSelect: onSelectModel
                                     )
                                 }
-                                ContextDropdown(context: $sessionContext, title: "Session context")
+                                ContextDropdown(context: $sessionContext, title: "Session context", currentOwner: sessionContextOwner)
                             }
                             .padding(WP.Space.lg)
                             .frame(width: 340)
@@ -1318,7 +1322,7 @@ private struct ChatLane: View {
 
             if !isCollapsed && showContent {
                 if !overlayCompact {
-                    ContextDropdown(context: $sessionContext)
+                    ContextDropdown(context: $sessionContext, currentOwner: sessionContextOwner)
                 }
 
                 if messages.isEmpty {

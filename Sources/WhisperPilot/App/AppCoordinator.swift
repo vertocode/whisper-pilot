@@ -320,7 +320,9 @@ final class AppCoordinator {
     /// new session's `context.json`.
     private func scheduleContextSave(_ value: SessionContext) {
         if isLoadingSessionContext { return }
-        guard let id = currentSession?.id else { return }
+        // During a switch `currentSession` is already the new session but the panel still
+        // holds the old context, so saving it now would overwrite the new session's file.
+        guard let id = currentSession?.id, id == overlayState.sessionContextOwner else { return }
 
         if let pending = pendingContextSave {
             if pending.id == id {
@@ -1561,6 +1563,10 @@ final class AppCoordinator {
         supersededQuestions.removeAll()
 
         currentSession = session
+        // The panel still shows the old session's context until the load below finishes.
+        // A file read that ends in that gap must be dropped, even when switching back to
+        // the session it was attached to, or the old context would be saved over this one.
+        overlayState.sessionContextOwner = nil
         overlayState.transcript = []
         overlayState.transcriptHistory = []
         overlayState.clearChat()
@@ -1599,6 +1605,8 @@ final class AppCoordinator {
         isLoadingSessionContext = true
         overlayState.sessionContext = loadedContext
         isLoadingSessionContext = false
+        // A newer switch may have started during the load. It sets the owner when it finishes.
+        if currentSession?.id == session.id { overlayState.sessionContextOwner = session.id }
 
         if resumed {
             let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
