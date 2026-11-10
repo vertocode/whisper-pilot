@@ -499,6 +499,20 @@ struct SmokeTestRunner {
             let snap4 = await context4.snapshot()
             await expect(snap4.recentLines.isEmpty && snap4.topics.isEmpty, "reset clears state")
 
+            let resumedThenNew = ConversationContext()
+            await resumedThenNew.seedFromMarkdown(transcript: "Old meeting transcript", chat: "Old meeting chat")
+            await resumedThenNew.reset()
+            let newSessionSnapshot = await resumedThenNew.snapshotWithPrior()
+            await expect(newSessionSnapshot.priorTranscriptMarkdown == nil, "new session gets no prior transcript")
+            await expect(newSessionSnapshot.priorChatMarkdown == nil, "new session gets no prior chat")
+
+            // A resume runs reset first and seeds afterwards.
+            await resumedThenNew.reset()
+            await resumedThenNew.seedFromMarkdown(transcript: "Resumed transcript", chat: "Resumed chat")
+            let resumedSnapshot = await resumedThenNew.snapshotWithPrior()
+            await expect(resumedSnapshot.priorTranscriptMarkdown == "Resumed transcript", "resumed session keeps its prior transcript")
+            await expect(resumedSnapshot.priorChatMarkdown == "Resumed chat", "resumed session keeps its prior chat")
+
             // Containment-duplicate finals under different ids (synthetic
             // pre-flush + the recognizer's own final) merge into one line —
             // mirrors TranscriptBuffer so the AI sees what the user sees.
