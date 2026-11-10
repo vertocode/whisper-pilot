@@ -208,10 +208,20 @@ final class AppCoordinator {
     /// capture-path switch) preserves the user's in-session mute instead of
     /// resetting it to the `alwaysTranscribeMic` default.
     private var pendingMicMuteRestore: Bool?
-    /// Set for the duration of `startListening`. Prevents the user from double-clicking
+    /// True while `runStartup` is in progress. Prevents the user from double-clicking
     /// Play (or the disabled-but-still-clickable stop affordance) from re-entering startup
     /// while audio capture is mid-setup, which would leave duplicate captures running.
-    private var isStartingUp = false
+    private var isStartingUp: Bool { inProgressStartupGeneration != nil }
+    /// Stop bumps `sessionGeneration` but can't interrupt a model load, so a startup can
+    /// outlive its Stop. A mismatch with `sessionGeneration` means nobody wants it anymore.
+    private var inProgressStartupGeneration: Int?
+    private var isStartupLive: Bool { inProgressStartupGeneration == sessionGeneration }
+    private var isStartupWanted: Bool { isStartupLive || queuedPlay.isQueued }
+    private var queuedPlay = QueuedPlay()
+    private var queuedPlayNoteID: UUID?
+    /// A count, not a flag, because quit, the Sessions button and the resource valve can
+    /// each be stopping at the same time.
+    private var stopsInFlight = 0
     private(set) var currentSession: SessionMeta?
     /// Summaries of earlier sessions in the current session's project, loaded when the
     /// session opens. Nil when the session has no project or the project has no history.
@@ -416,6 +426,7 @@ final class AppCoordinator {
     /// The app is about to freeze the Mac: write what we have to disk and quit. If this
     /// hangs, `HardCeilingMonitor` ends the process on its own after a short deadline.
     private func emergencyShutdown(reason: HardCeilingReason, sample: ResourceSample) async {
+        queuedPlay.clear()
         wpError("[Coordinator] Hard ceiling crossed (\(reason.label)): cpu=\(Int(sample.cpuPercent.rounded()))%, footprint=\(sample.memoryBytes / 1_000_000) MB. Saving the session and quitting.")
         captureOpenUtterances()
         await flushPendingContextSave()
@@ -480,10 +491,24 @@ final class AppCoordinator {
             wpInfo("[Coordinator] startListening: already running/starting, skipping")
             return
         }
-        isStartingUp = true
-        defer { isStartingUp = false }
+        await runStartup()
+        guard queuedPlay.take() else { return }
+        dismissStartupNotes()
+        await startListening()
+    }
+
+    private func runStartup() async {
         sessionGeneration += 1
         let startupGeneration = sessionGeneration
+        inProgressStartupGeneration = startupGeneration
+        defer {
+            inProgressStartupGeneration = nil
+            overlayState.status = .afterStartupReturned(
+                current: overlayState.status,
+                isRunning: isRunning,
+                isPlayQueued: queuedPlay.isQueued
+            )
+        }
         wpInfo("[Coordinator] ▶ startListening")
         // Fresh AsyncStream instances per session — see the property declarations
         // for why. Doing this here (rather than at `stopListening` time) keeps the
@@ -1287,6 +1312,10 @@ final class AppCoordinator {
     /// (status leaves `.starting`). Called from the mixer-output consumer's
     /// first-frame branch and from any startup-failure path.
     private func dismissStartupNotes() {
+        if let id = queuedPlayNoteID {
+            overlayState.removeMessage(id: id)
+            queuedPlayNoteID = nil
+        }
         if let id = slowStartupNoteID {
             overlayState.removeMessage(id: id)
             slowStartupNoteID = nil
@@ -1366,6 +1395,7 @@ final class AppCoordinator {
 
     /// `endsSession` is false for automatic restarts, which are not the user finishing a session.
     func stopListening(endsSession: Bool = true) async {
+        queuedPlay.clear()
         let hasActivePipeline = isRunning || isStartingUp || transcriber != nil || processTapStop != nil
         guard hasActivePipeline else {
             // Context can be edited before Play or after Stop. Quitting while idle
@@ -1374,6 +1404,8 @@ final class AppCoordinator {
             await flushPendingTranscriptLines()
             return
         }
+        stopsInFlight += 1
+        defer { stopsInFlight -= 1 }
         sessionGeneration += 1
         log.info("⏹ stopListening")
         // Nothing reads the transcriber's stream once the consumers are
@@ -1515,10 +1547,25 @@ final class AppCoordinator {
     }
 
     func toggleListening() async {
-        if isRunning || isStartingUp {
-            await stopListening()
-        } else {
+        switch queuedPlay.press(
+            isRunning: isRunning,
+            isStartingUp: isStartingUp,
+            isStartupLive: isStartupLive,
+            isStopping: stopsInFlight > 0
+        ) {
+        case .ignore:
+            return
+        case .start:
             await startListening()
+        case .stop:
+            await stopListening()
+        case .queueStart:
+            wpInfo("[Coordinator] Play pressed while a cancelled startup finishes; starting when it returns")
+            overlayState.status = .starting
+            queuedPlayNoteID = overlayState.appendSystemNote("ℹ️ Finishing the previous start. Listening will begin right after.", category: .general)
+        case .cancelQueuedStart:
+            if overlayState.status == .starting { overlayState.status = .idle }
+            dismissStartupNotes()
         }
     }
 
@@ -1562,6 +1609,12 @@ final class AppCoordinator {
         detectedBubbles.removeAll()
         supersededQuestions.removeAll()
 
+        // A remembered Play belongs to the session it was pressed in. Left queued, the
+        // meeting would be recorded into this one. No await may sit between this and the swap.
+        if queuedPlay.take() {
+            dismissStartupNotes()
+            if overlayState.status == .starting { overlayState.status = .idle }
+        }
         currentSession = session
         // The panel still shows the old session's context until the load below finishes.
         // A file read that ends in that gap must be dropped, even when switching back to
@@ -1580,6 +1633,7 @@ final class AppCoordinator {
         saveFailureNoteID = nil
         slowStartupNoteID = nil
         stuckStartupNoteID = nil
+        queuedPlayNoteID = nil
         // The Tier-1 alert lives in the chat that `clearChat()` just wiped; drop
         // the stale ID and latch so the valve can re-alert cleanly in the new session.
         tier1NoteID = nil
@@ -1894,7 +1948,7 @@ final class AppCoordinator {
                 // Nothing to answer without the screen — drop back out of the
                 // thinking state so the pill doesn't hang.
                 if self.overlayState.status == .thinking {
-                    self.overlayState.status = self.isRunning ? .listening : .idle
+                    self.overlayState.status = .afterAIReply(isRunning: self.isRunning, isStartupWanted: self.isStartupWanted)
                 }
                 return
             }
@@ -2959,7 +3013,6 @@ final class AppCoordinator {
                    case let GeminiError.http(status, _) = error,
                    status == 404,
                    let (fromModel, newAI) = self.migrateToFallbackModel() {
-                    self.overlayState.finishAssistant(id: messageId)
                     let note = "ℹ️ Model \(fromModel) is unavailable on your API key. Auto-switched to \(self.settings.activeModel) and retrying."
                     self.overlayState.appendSystemNote(note, category: .ai)
                     wpInfo("AI model fallback: \(fromModel) → \(self.settings.activeModel)")
@@ -2968,12 +3021,15 @@ final class AppCoordinator {
                     // the outer cleanup-on-exit below to fire twice for one logical
                     // request.
                     self.inFlightCompletions[messageId] = nil
+                    // Retry in the same bubble, or the failed attempt stays on screen as an empty "…".
                     await self.runCompletion(
                         prompt: prompt,
                         ai: newAI,
                         origin: origin,
                         sessionID: sessionID,
-                        hasAttemptedFallback: true
+                        hasAttemptedFallback: true,
+                        replacingAnswer: messageId,
+                        onStart: onStart
                     )
                     return
                 }
@@ -3016,8 +3072,8 @@ final class AppCoordinator {
 
     /// Called by every non-fallback exit path of `runCompletion`. Removes the task
     /// from the in-flight map and, only when nothing else is still streaming, flips
-    /// the status pill back to `.listening` (or `.idle` if we've been stopped in
-    /// the meantime). With concurrent completions, we can't just unconditionally
+    /// the status pill back to `.listening` (`.starting` during a wanted startup, or
+    /// `.idle` if we've been stopped in the meantime). With concurrent completions, we can't just unconditionally
     /// flip after each one — that would prematurely declare "done" while another
     /// stream is still arriving.
     private func completionFinished(messageId: UUID) {
@@ -3025,7 +3081,7 @@ final class AppCoordinator {
         guard inFlightCompletions.isEmpty else { return }
         switch overlayState.status {
         case .streaming, .thinking, .error:
-            overlayState.status = isRunning ? .listening : .idle
+            overlayState.status = .afterAIReply(isRunning: isRunning, isStartupWanted: isStartupWanted)
         default:
             break
         }
