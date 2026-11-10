@@ -23,11 +23,14 @@ struct DeleteOldSessionsSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            VStack(spacing: WP.Space.xs) {
+            Picker("Age", selection: $limit) {
                 ForEach(SessionAgeLimit.allCases) { option in
-                    optionRow(option)
+                    Text("\(option.title) (\(vm.oldSessions(option, now: now).sessions.count))")
+                        .tag(option)
                 }
             }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
 
             summary(match)
 
@@ -54,34 +57,6 @@ struct DeleteOldSessionsSheet: View {
             await vm.refresh()
             isReady = true
         }
-    }
-
-    private func optionRow(_ option: SessionAgeLimit) -> some View {
-        let isChosen = option == limit
-        return Button {
-            limit = option
-        } label: {
-            HStack(spacing: WP.Space.sm) {
-                Image(systemName: isChosen ? "largecircle.fill.circle" : "circle")
-                    .font(.system(size: 13))
-                    .foregroundStyle(isChosen ? Color.accentColor : Color.secondary)
-                Text(option.title)
-                    .font(.system(size: 13))
-                Spacer(minLength: 0)
-                Text("\(vm.oldSessions(option, now: now).sessions.count)")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, WP.Space.md)
-            .padding(.vertical, WP.Space.sm)
-            .background(
-                RoundedRectangle(cornerRadius: WP.Radius.md, style: .continuous)
-                    .fill(isChosen ? Color.accentColor.opacity(0.12) : Color.clear)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(isChosen ? .isSelected : [])
     }
 
     private func summary(_ current: SessionCleanup.AgeMatch) -> some View {

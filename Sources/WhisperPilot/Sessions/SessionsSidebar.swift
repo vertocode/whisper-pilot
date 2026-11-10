@@ -17,12 +17,28 @@ struct SessionCheckbox: View {
     let state: SessionCheckState
 
     var body: some View {
+        if state == .open {
+            icon.help("This session is open right now, so it can’t be deleted")
+        } else {
+            icon
+        }
+    }
+
+    private var icon: some View {
         Image(systemName: symbol)
             .font(.system(size: 13))
             .foregroundStyle(state == .checked ? Color.accentColor : Color.secondary)
             .frame(width: 16)
             .opacity(state == .open ? 0.5 : 1)
-            .help(state == .open ? "This session is open right now, so it can’t be deleted" : "")
+            .accessibilityLabel(accessibilityText)
+    }
+
+    private var accessibilityText: String {
+        switch state {
+        case .unchecked: return "Not selected"
+        case .checked: return "Selected"
+        case .open: return "Open now, can’t be deleted"
+        }
     }
 
     private var symbol: String {
@@ -479,6 +495,7 @@ struct SidebarSessionRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(checkState == .open)
         .accessibilityAddTraits(checkState == .checked ? .isSelected : [])
         .onDrag { SessionDragPayload.provider(for: session) }
         .contextMenu {

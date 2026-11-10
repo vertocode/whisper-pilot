@@ -954,6 +954,7 @@ struct SessionRow: View {
         )
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .gesture(checkState == nil ? nil : TapGesture().onEnded { vm.toggleChecked(session) })
+        .modifier(CheckableRowAccessibility(state: checkState) { vm.toggleChecked(session) })
     }
 
     /// Vendor-colored badge content for the model this session uses. Nil when
@@ -984,6 +985,32 @@ struct SessionRow: View {
     }()
 }
 
+
+/// Lets VoiceOver tick a row while the user picks sessions. Normal rows are left alone,
+/// so their Resume button and menu stay separately reachable.
+private struct CheckableRowAccessibility: ViewModifier {
+    let state: SessionCheckState?
+    let toggle: () -> Void
+
+    func body(content: Content) -> some View {
+        if let state {
+            content
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(traits(for: state))
+                .accessibilityAction(.default, toggle)
+        } else {
+            content
+        }
+    }
+
+    private func traits(for state: SessionCheckState) -> AccessibilityTraits {
+        switch state {
+        case .unchecked: return .isButton
+        case .checked: return [.isButton, .isSelected]
+        case .open: return []
+        }
+    }
+}
 
 /// The "Delete project?" dialog. SwiftUI alerts can't hold a checkbox, so this is an `NSAlert`.
 @MainActor
