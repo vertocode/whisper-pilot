@@ -2898,28 +2898,22 @@ final class AppCoordinator {
         overlayState.status = .streaming
         let task = Task { [weak self] in
             guard let self else { return }
-            do {
-                var deltaCount = 0
-                // If the provider never sends a `.finish(reason)`, the stream
-                // ended without a clean terminal event — treat that as an unknown
-                // / dropped-connection finish so the user gets a diagnostic note
-                // instead of a silently-truncated bubble.
-                var finishReason: AIFinishReason = .other(nil)
-                var receivedFinish = false
-                for try await event in ai.streamCompletion(prompt: prompt) {
-                    switch event {
-                    case .delta(let text):
-                        deltaCount += 1
-                        if deltaCount == 1, replacingAnswer != nil {
-                            self.overlayState.replaceText(of: messageId, with: text)
-                        } else {
-                            self.overlayState.appendDelta(to: messageId, text)
-                        }
-                    case .finish(let reason):
-                        finishReason = reason
-                        receivedFinish = true
-                    }
+            var replacesOldText = replacingAnswer != nil
+            let pacer = StreamDeltaPacer(interval: .milliseconds(100)) { text in
+                if replacesOldText {
+                    replacesOldText = false
+                    self.overlayState.replaceText(of: messageId, with: text)
+                } else {
+                    self.overlayState.appendDelta(to: messageId, text)
                 }
+            }
+            do {
+                // Flushes on every way out of the stream, including errors, so
+                // everything below reads the full text of the bubble.
+                let pumped = try await pacer.pump(ai.streamCompletion(prompt: prompt))
+                let deltaCount = pumped.deltaCount
+                let finishReason = pumped.finishReason
+                let receivedFinish = pumped.receivedFinish
                 // A cancelled stream ends quietly with no finish event. That is a
                 // cancel, not a cut-off reply, so it must not raise the warning.
                 if Task.isCancelled, !receivedFinish { throw CancellationError() }

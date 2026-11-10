@@ -20,6 +20,10 @@ struct SmokeTestRunner {
         await runSystemAudioGainSuite()
         await runAudioFrameCoalescerSuite()
         await runMinIntervalGateSuite()
+        await runStreamDeltaCoalescerSuite()
+        await runStreamDeltaPacerSuite()
+        await runStreamPumpSuite()
+        await runAppendDeltaSuite()
         await runTranscriptBufferSuite()
         await runReplayOverlapTrimmerSuite()
         await runTranscriptStreamSegmenterSuite()
@@ -2014,6 +2018,120 @@ struct SmokeTestRunner {
             await expect(!gate.allow(at: t0 + .seconds(4)), "interval restarts from the last pass")
             gate.reset()
             await expect(gate.allow(at: t0 + .seconds(4)), "reset lets the next call pass")
+        }
+    }
+
+    static func runStreamDeltaCoalescerSuite() async {
+        await suite("StreamDeltaCoalescer") {
+            var coalescer = StreamDeltaCoalescer(interval: .milliseconds(100))
+            let t0 = ContinuousClock.now
+            await expect(coalescer.add("a", at: t0) == "a", "first delta shows at once")
+            await expect(coalescer.add("b", at: t0 + .milliseconds(40)) == nil, "delta inside the interval is held")
+            await expect(
+                coalescer.remainingWait(at: t0 + .milliseconds(40)) == .milliseconds(60),
+                "wait runs to the end of the interval"
+            )
+            await expect(coalescer.add("c", at: t0 + .milliseconds(99)) == nil, "just inside the interval is held")
+            await expect(coalescer.add("d", at: t0 + .milliseconds(100)) == "bcd", "held text comes out joined and in order")
+            await expect(coalescer.drain(at: t0 + .milliseconds(101)) == nil, "nothing left to drain")
+
+            _ = coalescer.add("e", at: t0 + .milliseconds(150))
+            await expect(coalescer.drain(at: t0 + .milliseconds(160)) == "e", "drain returns the held rest before the interval ends")
+            await expect(coalescer.add("f", at: t0 + .milliseconds(200)) == nil, "drain restarts the interval")
+
+            var long = StreamDeltaCoalescer(interval: .milliseconds(100))
+            let pieces = (0..<297).map { i in i % 50 == 0 ? "\n\n# Título \(i) 🎤 " : "tok\(i) " }
+            var shown = ""
+            var flushes = 0
+            for (i, piece) in pieces.enumerated() {
+                if let text = long.add(piece, at: t0 + .milliseconds(i * 10)) {
+                    shown += text
+                    flushes += 1
+                }
+            }
+            if let text = long.drain(at: t0 + .milliseconds(2_970)) {
+                shown += text
+                flushes += 1
+            }
+            await expect(flushes <= 31, "297 deltas over 3 s make at most 31 redraws, got \(flushes)")
+            await expect(shown == pieces.joined(), "shown text equals the streamed text exactly")
+        }
+    }
+
+    @MainActor
+    static func runStreamDeltaPacerSuite() async {
+        await suite("StreamDeltaPacer") {
+            var applied: [String] = []
+            let pacer = StreamDeltaPacer(interval: .milliseconds(30)) { applied.append($0) }
+            pacer.add("first")
+            pacer.add(" held")
+            await expect(applied == ["first"], "second delta waits for the interval")
+            for _ in 0..<200 where applied.count < 2 {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            await expect(applied == ["first", " held"], "held text shows during a pause with no new delta")
+
+            pacer.add(" again")
+            for _ in 0..<200 where applied.count < 3 {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            await expect(applied.last == " again", "a second pause in the same stream also shows held text")
+
+            try? await Task.sleep(for: .milliseconds(40))
+            pacer.add(" a")
+            pacer.add(" b")
+            pacer.flush()
+            let afterFlush = applied
+            await expect(afterFlush.joined() == "first held again a b", "flush shows everything at once")
+            try? await Task.sleep(for: .milliseconds(80))
+            await expect(applied == afterFlush, "timer adds nothing after a flush")
+        }
+    }
+
+    @MainActor
+    static func runStreamPumpSuite() async {
+        await suite("StreamDeltaPacer.pump") {
+            struct Boom: Error {}
+            var applied: [String] = []
+            let pacer = StreamDeltaPacer(interval: .milliseconds(500)) { applied.append($0) }
+            let failing = AsyncThrowingStream<AIStreamEvent, Error> { continuation in
+                continuation.yield(.delta("one "))
+                continuation.yield(.delta("two"))
+                continuation.finish(throwing: Boom())
+            }
+            var threw = false
+            do { _ = try await pacer.pump(failing) } catch { threw = error is Boom }
+            await expect(threw, "the stream error reaches the caller")
+            await expect(applied.joined() == "one two", "all text is applied before the error reaches the caller")
+
+            applied = []
+            let ok = StreamDeltaPacer(interval: .milliseconds(500)) { applied.append($0) }
+            let finishing = AsyncThrowingStream<AIStreamEvent, Error> { continuation in
+                continuation.yield(.delta("a"))
+                continuation.yield(.delta("b"))
+                continuation.yield(.delta("c"))
+                continuation.yield(.finish(.stop))
+                continuation.finish()
+            }
+            let result = try? await ok.pump(finishing)
+            await expect(applied.joined() == "abc", "a normal finish applies all text")
+            await expect(result?.deltaCount == 3 && result?.receivedFinish == true, "counts deltas and the finish event")
+        }
+    }
+
+    @MainActor
+    static func runAppendDeltaSuite() async {
+        await suite("OverlayState.appendDelta") {
+            let state = OverlayState()
+            let first = state.beginAssistantStream(origin: .userPrompt)
+            let second = state.beginAssistantStream(origin: .userPrompt)
+            state.appendDelta(to: first, "older")
+            state.appendDelta(to: second, "newer")
+            state.appendDelta(to: first, " reply")
+            await expect(state.messages.first { $0.id == first }?.text == "older reply", "text goes to the older bubble")
+            await expect(state.messages.first { $0.id == second }?.text == "newer", "text goes to the newer bubble")
+            state.appendDelta(to: UUID(), "lost")
+            await expect(state.messages.map(\.text) == ["older reply", "newer"], "unknown bubble changes nothing")
         }
     }
 
