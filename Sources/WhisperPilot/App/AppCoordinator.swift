@@ -71,23 +71,10 @@ final class AppCoordinator {
     ]
 
     private var consumerTasks: [Task<Void, Never>] = []
-    /// Per-channel pending transcript line waiting to be written to
-    /// `transcript.md`. Each finalized transcript update with a matching
-    /// segment id updates the entry in place; only when the next final
-    /// arrives with a *different* id (= a new utterance) do we flush the
-    /// previous one to disk. This is how we avoid the "same sentence
-    /// appears as N growing lines in transcript.md" bug — the pre-prompt
-    /// synthetic-final flush can emit isFinal=true repeatedly for one
-    /// utterance, and without this de-duplication every emission would
-    /// append a new (truncated) line to the file. The UI's TranscriptBuffer
-    /// and ConversationContext both already dedupe by id; this brings disk
-    /// persistence in line with that semantic.
-    private var pendingTranscriptLineByChannel: [AudioChannel: (id: UUID, text: String, timestamp: Date)] = [:]
-    /// The most recent line each channel actually wrote to `transcript.md`.
-    /// Lets `queueTranscriptPersistence` drop a late re-final of an utterance
-    /// that already hit the disk (same id, or containment-duplicate text within
-    /// the merge window) instead of appending it as a duplicate line.
-    private var lastPersistedLineByChannel: [AudioChannel: (id: UUID, text: String, timestamp: Date)] = [:]
+    private var transcriptPersistence = TranscriptPersistenceQueue()
+    /// The newest `transcript.md` write. Each write waits for this one, so
+    /// lines reach the file in the order they were decided.
+    private var lastTranscriptWrite: Task<Void, Never>?
     /// Currently-streaming AI completions, keyed by the assistant message ID they
     /// render into. Tracked as a dictionary (not a single slot) because a follow-up
     /// detected question can arrive while the answer to the previous one is still
@@ -428,6 +415,7 @@ final class AppCoordinator {
     /// hangs, `HardCeilingMonitor` ends the process on its own after a short deadline.
     private func emergencyShutdown(reason: HardCeilingReason, sample: ResourceSample) async {
         wpError("[Coordinator] Hard ceiling crossed (\(reason.label)): cpu=\(Int(sample.cpuPercent.rounded()))%, footprint=\(sample.memoryBytes / 1_000_000) MB. Saving the session and quitting.")
+        captureOpenUtterances()
         await flushPendingContextSave()
         await flushPendingTranscriptLines()
         await projects.flush()
@@ -1386,6 +1374,9 @@ final class AppCoordinator {
         }
         sessionGeneration += 1
         log.info("⏹ stopListening")
+        // Nothing reads the transcriber's stream once the consumers are
+        // cancelled, so take the line still being spoken first.
+        let openUtterances = captureOpenUtterances()
         for task in consumerTasks { task.cancel() }
         consumerTasks.removeAll()
         for task in pendingBoundaryTasks.values { task.cancel() }
@@ -1401,6 +1392,7 @@ final class AppCoordinator {
         // Persist any in-flight context edit before tearing the session down so the
         // last few keystrokes of the user's notes don't disappear on stop.
         await flushPendingContextSave()
+        await commitOpenUtterances(openUtterances)
         // Same idea for transcript.md: the deferred-write scheme only flushes a
         // pending utterance when the *next* segment arrives, so the very last
         // utterance of the session needs an explicit flush here or it would
@@ -1564,7 +1556,7 @@ final class AppCoordinator {
         // the in-flight utterance would land in the new session's file.
         await flushPendingTranscriptLines()
         // The just-persisted dedup memory belongs to the old session's file.
-        lastPersistedLineByChannel.removeAll()
+        transcriptPersistence.forgetPersistedLines()
 
         currentSession = session
         overlayState.transcript = []
@@ -2590,6 +2582,9 @@ final class AppCoordinator {
             // a second without the per-partial CPU churn.
             var lastQuestionConsider: [AudioChannel: ContinuousClock.Instant] = [:]
             for await update in transcriber.transcripts {
+                // Before the first await below, so finals are decided in arrival
+                // order.
+                self?.queueTranscriptPersistence(update)
                 await buffer.apply(update)
                 // Feed every system-channel partial straight to the trigger engine so
                 // `pendingCandidate` is kept fresh as the recognizer hypothesizes. By
@@ -2681,25 +2676,6 @@ final class AppCoordinator {
                         case .system: self.overlayState.systemTranscriptCount += 1
                         case .microphone: self.overlayState.microphoneTranscriptCount += 1
                         }
-                    }
-                }
-
-                // Persist finalized transcript lines to the active session's
-                // transcript.md — but DEFER the actual append. Each finalized
-                // update with the same segment id replaces the in-memory
-                // "pending" entry for its channel; only when the next final
-                // arrives with a different id (= a new utterance) do we flush
-                // the previous one to disk. `stopListening` flushes anything
-                // still pending. This dedupes the file in the face of the
-                // pre-prompt synthetic-final flush, which legitimately emits
-                // isFinal=true multiple times for one utterance as the
-                // recognizer's hypothesis grows.
-                if update.isFinal,
-                   !update.text.trimmingCharacters(in: .whitespaces).isEmpty {
-                    let updateCopy = update
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        await self.queueTranscriptPersistence(updateCopy)
                     }
                 }
             }
@@ -3100,100 +3076,33 @@ final class AppCoordinator {
 
     // MARK: - AI prompt filtering
 
-    /// Applies the user's "include transcript in prompt" and "include chat history
-    /// in prompt" toggles to the snapshot before it's handed to PromptBuilder.
-    /// Live transcript lines, extracted topics, and resumed prior transcript
-    /// markdown are gated on the transcript flag; resumed prior chat markdown is
-    /// gated on the chat-history flag. `entities` is kept either way — it's a tiny
-    /// derived list and useful for the model's continuity even when both sections
-    /// are otherwise excluded.
-    /// Enqueue a finalized transcript update for persistence to `transcript.md`.
-    /// Same-segment updates (same `update.id`) replace the pending entry in
-    /// place; a new segment id flushes the previous one to disk before
-    /// tracking the new one. Net effect: one line in transcript.md per
-    /// utterance, with the latest (most complete) text.
-    private func queueTranscriptPersistence(_ update: TranscriptUpdate) async {
-        let channel = update.channel
-        // A late re-final of a line that already went to disk (the next
-        // utterance pushed it out before the recognizer's own final landed)
-        // can't be merged into the file — drop it instead of appending a
-        // duplicate line.
-        if let flushed = lastPersistedLineByChannel[channel],
-           update.id == flushed.id
-            || (update.timestamp.timeIntervalSince(flushed.timestamp) <= TranscriptDedup.mergeWindowSeconds
-                && TranscriptDedup.merged(previous: flushed.text, incoming: update.text) != nil) {
-            return
+    private func queueTranscriptPersistence(_ update: TranscriptUpdate) {
+        if let finished = transcriptPersistence.accept(update) {
+            enqueueTranscriptWrites([finished])
         }
-        if let pending = pendingTranscriptLineByChannel[channel] {
-            if pending.id == update.id {
-                // Same utterance grew (or the pre-prompt flush emitted again).
-                // Update the in-memory record; don't touch disk yet.
-                // Containment-guarded: the pending line may already be a
-                // merged/rolled-up composite that a fragment must not clobber.
-                pendingTranscriptLineByChannel[channel] = (
-                    id: update.id,
-                    text: TranscriptDedup.merged(previous: pending.text, incoming: update.text) ?? pending.text,
-                    timestamp: update.timestamp
-                )
-                return
-            }
-            // Different id but containment-duplicate text shortly after ⇒ the
-            // same utterance finalized twice (synthetic pre-flush + the
-            // recognizer's own final). Merge into the pending record — same
-            // rule as `TranscriptBuffer` and `ConversationContext`, so the
-            // saved transcript.md matches what the user saw on screen.
-            if update.timestamp.timeIntervalSince(pending.timestamp) <= TranscriptDedup.mergeWindowSeconds,
-               let mergedText = TranscriptDedup.merged(previous: pending.text, incoming: update.text) {
-                pendingTranscriptLineByChannel[channel] = (
-                    id: update.id,
-                    text: mergedText,
-                    timestamp: update.timestamp
-                )
-                return
-            }
-            // Continuation of the same speaker turn (task churn finalized
-            // mid-sentence) ⇒ append to the pending line, mirroring the
-            // display buffer's roll-up, instead of flushing a fragment row.
-            if TranscriptDedup.shouldRollUp(
-                previousText: pending.text,
-                previousAt: pending.timestamp,
-                incomingText: update.text,
-                incomingAt: update.timestamp
-            ) {
-                pendingTranscriptLineByChannel[channel] = (
-                    id: update.id,
-                    text: TranscriptDedup.rolledUp(previousText: pending.text, incomingText: update.text),
-                    timestamp: update.timestamp
-                )
-                return
-            }
-            // Genuinely new utterance ⇒ the previous one is done. Flush it.
-            await persistPendingTranscriptLine(channel: channel, pending: pending)
-        }
-        pendingTranscriptLineByChannel[channel] = (
-            id: update.id,
-            text: update.text,
-            timestamp: update.timestamp
-        )
     }
 
-    /// Flush every channel's pending transcript line to disk. Called on stop
-    /// so the last utterance of a session — which by definition has no
-    /// "next segment" to push it out — still makes it into transcript.md.
+    /// Flush every channel's pending transcript line to disk and wait for all
+    /// writes to land. Called on stop so the last utterance of a session —
+    /// which by definition has no "next segment" to push it out — still makes
+    /// it into transcript.md.
     private func flushPendingTranscriptLines() async {
-        let drained = pendingTranscriptLineByChannel
-        pendingTranscriptLineByChannel.removeAll()
-        for (channel, pending) in drained {
-            await persistPendingTranscriptLine(channel: channel, pending: pending)
+        enqueueTranscriptWrites(transcriptPersistence.drain())
+        await lastTranscriptWrite?.value
+    }
+
+    private func enqueueTranscriptWrites(_ lines: [TranscriptPersistenceQueue.Line]) {
+        guard !lines.isEmpty, let sessionID = currentSession?.id else { return }
+        let previousWrite = lastTranscriptWrite
+        lastTranscriptWrite = Task { [weak self] in
+            await previousWrite?.value
+            for line in lines {
+                await self?.writeTranscriptLine(line, to: sessionID)
+            }
         }
     }
 
-    private func persistPendingTranscriptLine(
-        channel: AudioChannel,
-        pending: (id: UUID, text: String, timestamp: Date)
-    ) async {
-        guard let sessionID = currentSession?.id else { return }
-        lastPersistedLineByChannel[channel] = pending
+    private func writeTranscriptLine(_ line: TranscriptPersistenceQueue.Line, to sessionID: SessionID) async {
         // Record whatever translation exists at flush time. Flushing is
         // deferred until the *next* utterance arrives, which is typically
         // seconds after the 400 ms debounce has landed, so in practice the
@@ -3202,13 +3111,13 @@ final class AppCoordinator {
         // silently rewrites itself is worse than one line without a mirror.
         let translation = translationQueue == nil
             ? nil
-            : await transcriptBuffer.translation(forID: pending.id)
+            : await transcriptBuffer.translation(forID: line.id)
         let result = await SessionStore.shared.appendTranscriptLine(
-            channel: channel,
-            text: pending.text,
+            channel: line.channel,
+            text: line.text,
             translation: translation,
             translationLanguage: translation == nil ? nil : settings.translationTargetIdentifier,
-            at: pending.timestamp,
+            at: line.timestamp,
             to: sessionID
         )
         recordSaveResult(result)
@@ -3226,8 +3135,11 @@ final class AppCoordinator {
     /// after this call to include the freshly-flushed lines.
     private func absorbPendingTranscripts() async {
         guard let transcriber else { return }
-        let pendings = transcriber.collectPendingFinals()
-        for update in pendings {
+        await absorbIntoContext(transcriber.collectPendingFinals())
+    }
+
+    private func absorbIntoContext(_ updates: [TranscriptUpdate]) async {
+        for update in updates {
             // Respect the same per-channel inclusion gates the normal consumer
             // applies — system-audio prompt inclusion can be toggled off in
             // Settings, in which case the model shouldn't see system lines.
@@ -3243,6 +3155,42 @@ final class AppCoordinator {
         }
     }
 
+    /// Queues the lines the transcriber is still holding open for transcript.md.
+    /// Synchronous, and it doesn't touch the audio going into the engine, so
+    /// Stop and the emergency exit never wait on speech recognition. Words the
+    /// engine hasn't decoded yet are not included. A copy of each line also
+    /// goes through the transcript stream, which is harmless: the queue
+    /// recognizes the same id and keeps one line.
+    @discardableResult
+    private func captureOpenUtterances() -> [TranscriptUpdate] {
+        guard let transcriber else { return [] }
+        let open = transcriber.collectPendingFinals()
+        for update in open { queueTranscriptPersistence(update) }
+        return open
+    }
+
+    /// The consumer that would normally do this is already cancelled. Without
+    /// it the row stays gray, and an automatic restart would erase it from the
+    /// screen and from the AI's context even though it is saved on disk.
+    private func commitOpenUtterances(_ updates: [TranscriptUpdate]) async {
+        guard !updates.isEmpty else { return }
+        for update in updates { await transcriptBuffer.apply(update) }
+        await absorbIntoContext(updates)
+        let snapshot = await transcriptBuffer.snapshot()
+        let evicted = await transcriptBuffer.takeEvicted()
+        if !evicted.isEmpty {
+            overlayState.transcriptHistory = TranscriptHistoryCap.capped(overlayState.transcriptHistory + evicted)
+        }
+        if overlayState.transcript != snapshot { overlayState.transcript = snapshot }
+    }
+
+    /// Applies the user's "include transcript in prompt" and "include chat history
+    /// in prompt" toggles to the snapshot before it's handed to PromptBuilder.
+    /// Live transcript lines, extracted topics, and resumed prior transcript
+    /// markdown are gated on the transcript flag; resumed prior chat markdown is
+    /// gated on the chat-history flag. `entities` is kept either way — it's a tiny
+    /// derived list and useful for the model's continuity even when both sections
+    /// are otherwise excluded.
     private func filteredSnapshot(_ snapshot: ConversationSnapshot) -> ConversationSnapshot {
         let includeT = settings.includeTranscriptInPrompt
         let includeH = settings.includeChatHistoryInPrompt
