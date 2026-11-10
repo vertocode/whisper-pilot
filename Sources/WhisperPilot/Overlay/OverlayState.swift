@@ -288,7 +288,8 @@ final class OverlayState: ObservableObject {
     /// coordinator on every change. Surfaces in every AI prompt as authoritative
     /// background material above the live transcript.
     @Published var sessionContext: SessionContext = SessionContext()
-    /// The session `sessionContext` belongs to. Not published because nothing draws it.
+    /// The session `sessionContext` belongs to, or `nil` while a switch is still loading it.
+    /// Not published because nothing draws it.
     var sessionContextOwner: SessionID?
 
     nonisolated let statusStream: AsyncStream<OverlayStatus>

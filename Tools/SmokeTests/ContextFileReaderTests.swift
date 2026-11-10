@@ -117,6 +117,10 @@ extension SmokeTestRunner {
             let stale = await ContextFileReader.readInBackground(text, ifTargetStays: { switched.removeFirst() })
             await expect(stale == nil, "session switched during the read: result is dropped")
 
+            var loading: [SessionID?] = [before, nil]
+            let midSwitch = await ContextFileReader.readInBackground(text, ifTargetStays: { loading.removeFirst() })
+            await expect(midSwitch == nil, "read ends while a switch is still loading: result is dropped")
+
             var same: [SessionID] = [before, before]
             let kept = await ContextFileReader.readInBackground(text, ifTargetStays: { same.removeFirst() })
             await expect(sameOutcome(kept, ContextFileReader.read(text)), "same session: result is kept")

@@ -1567,7 +1567,10 @@ final class AppCoordinator {
         lastPersistedLineByChannel.removeAll()
 
         currentSession = session
-        overlayState.sessionContextOwner = session.id
+        // The panel still shows the old session's context until the load below finishes.
+        // A file read that ends in that gap must be dropped, even when switching back to
+        // the session it was attached to, or the old context would be saved over this one.
+        overlayState.sessionContextOwner = nil
         overlayState.transcript = []
         overlayState.transcriptHistory = []
         overlayState.clearChat()
@@ -1606,6 +1609,7 @@ final class AppCoordinator {
         isLoadingSessionContext = true
         overlayState.sessionContext = loadedContext
         isLoadingSessionContext = false
+        overlayState.sessionContextOwner = session.id
 
         if resumed {
             let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
