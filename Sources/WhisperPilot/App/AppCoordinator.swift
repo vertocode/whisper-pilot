@@ -228,7 +228,10 @@ final class AppCoordinator {
     /// Stop bumps `sessionGeneration` but can't interrupt a model load, so a startup can
     /// outlive its Stop. A mismatch with `sessionGeneration` means nobody wants it anymore.
     private var inProgressStartupGeneration: Int?
-    private var isStartupWanted: Bool { inProgressStartupGeneration == sessionGeneration }
+    private var isStartupLive: Bool { inProgressStartupGeneration == sessionGeneration }
+    private var isStartupWanted: Bool { isStartupLive || queuedPlay.isQueued }
+    private var queuedPlay = QueuedPlay()
+    private var queuedPlayNoteID: UUID?
     private(set) var currentSession: SessionMeta?
     /// Summaries of earlier sessions in the current session's project, loaded when the
     /// session opens. Nil when the session has no project or the project has no history.
@@ -494,6 +497,13 @@ final class AppCoordinator {
             wpInfo("[Coordinator] startListening: already running/starting, skipping")
             return
         }
+        await runStartup()
+        guard queuedPlay.take() else { return }
+        dismissStartupNotes()
+        await startListening()
+    }
+
+    private func runStartup() async {
         sessionGeneration += 1
         let startupGeneration = sessionGeneration
         inProgressStartupGeneration = startupGeneration
@@ -501,7 +511,7 @@ final class AppCoordinator {
             inProgressStartupGeneration = nil
             // A reply finishing during a startup that then failed would otherwise
             // leave "Starting…" up forever: only the first audio frame clears it.
-            if !isRunning, overlayState.status == .starting { overlayState.status = .idle }
+            if !isRunning, !queuedPlay.isQueued, overlayState.status == .starting { overlayState.status = .idle }
         }
         wpInfo("[Coordinator] ▶ startListening")
         // Fresh AsyncStream instances per session — see the property declarations
@@ -1306,6 +1316,10 @@ final class AppCoordinator {
     /// (status leaves `.starting`). Called from the mixer-output consumer's
     /// first-frame branch and from any startup-failure path.
     private func dismissStartupNotes() {
+        if let id = queuedPlayNoteID {
+            overlayState.removeMessage(id: id)
+            queuedPlayNoteID = nil
+        }
         if let id = slowStartupNoteID {
             overlayState.removeMessage(id: id)
             slowStartupNoteID = nil
@@ -1385,6 +1399,7 @@ final class AppCoordinator {
 
     /// `endsSession` is false for automatic restarts, which are not the user finishing a session.
     func stopListening(endsSession: Bool = true) async {
+        queuedPlay.clear()
         let hasActivePipeline = isRunning || isStartingUp || transcriber != nil || processTapStop != nil
         guard hasActivePipeline else {
             // Context can be edited before Play or after Stop. Quitting while idle
@@ -1530,10 +1545,18 @@ final class AppCoordinator {
     }
 
     func toggleListening() async {
-        if isRunning || isStartingUp {
-            await stopListening()
-        } else {
+        switch queuedPlay.press(isRunning: isRunning, isStartingUp: isStartingUp, isStartupLive: isStartupLive) {
+        case .start:
             await startListening()
+        case .stop:
+            await stopListening()
+        case .queueStart:
+            wpInfo("[Coordinator] Play pressed while a cancelled startup finishes; starting when it returns")
+            overlayState.status = .starting
+            queuedPlayNoteID = overlayState.appendSystemNote("ℹ️ Finishing the previous start. Listening will begin right after.", category: .general)
+        case .cancelQueuedStart:
+            if overlayState.status == .starting { overlayState.status = .idle }
+            dismissStartupNotes()
         }
     }
 

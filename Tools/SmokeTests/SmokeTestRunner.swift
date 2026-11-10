@@ -57,6 +57,7 @@ struct SmokeTestRunner {
         await runTranscriptHistoryCapSuite()
         await runAudioDropTrackingSuite()
         await runAIExitStateSuite()
+        await runQueuedPlaySuite()
 
         let snapshot = await stats.snapshot()
         let total = snapshot.passed + snapshot.failures.count
