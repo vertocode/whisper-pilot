@@ -39,11 +39,13 @@ extension SmokeTestRunner {
     /// Keeps fake test sessions out of the real Trash.
     static let removeWithoutTrash: @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
 
-    /// Waits out the pause the search box leaves after typing.
+    /// Waits for the search box's pause after typing, which a busy machine can stretch.
     @MainActor
     private static func search(_ text: String, in vm: SessionsViewModel) async {
         vm.searchText = text
-        try? await Task.sleep(nanoseconds: 400_000_000)
+        for _ in 0..<500 where vm.activeQuery != text {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 
     private static func makeFixture() async -> (root: URL, store: SessionStore, projects: ProjectsStore) {
