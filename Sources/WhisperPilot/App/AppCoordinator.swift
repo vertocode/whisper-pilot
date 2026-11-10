@@ -98,6 +98,8 @@ final class AppCoordinator {
     private var translationQueue: TranslationQueue?
     /// Re-checks a language pack that macOS reported as missing at start.
     private var translationRetryTask: Task<Void, Never>?
+    private var transcriptPublishThrottle = TrailingPublishThrottle(interval: .milliseconds(250))
+    private var translationPublishTask: Task<Void, Never>?
     private var translationMissingNoteID: UUID?
     /// The macOS 15.0-25.x service awaiting a session from the overlay's
     /// SwiftUI host. Held as the un-gated protocol type because a stored
@@ -824,8 +826,7 @@ final class AppCoordinator {
             // transcript consumer's own publish is driven by incoming audio; a
             // translation that lands during a pause would otherwise sit
             // invisible until the next word was spoken.
-            let snapshot = await buffer.snapshot()
-            await MainActor.run { [weak self] in self?.overlayState.transcript = snapshot }
+            await MainActor.run { [weak self] in self?.requestTranslationPublish() }
         }
         // Rows already on screen are never translated — enabling mid-session
         // applies forward only, so the toggle can't fire a burst of up to 150
@@ -910,6 +911,36 @@ final class AppCoordinator {
         guard let queue = translationQueue else { return }
         translationQueue = nil
         await queue.stop()
+        await flushPendingTranslationPublish()
+    }
+
+    private func requestTranslationPublish() {
+        guard transcriptPublishThrottle.requestPublish() else { return }
+        translationPublishTask = Task { [weak self] in
+            while let remaining = self?.transcriptPublishThrottle.remaining(at: .now), remaining > .zero {
+                try? await Task.sleep(for: remaining)
+                if Task.isCancelled { return }
+            }
+            guard let self, self.transcriptPublishThrottle.takePending(at: .now) else { return }
+            let snapshot = await self.transcriptBuffer.snapshot()
+            guard !Task.isCancelled else { return }
+            self.showTranscriptSnapshot(snapshot)
+        }
+    }
+
+    /// Stopping would otherwise cancel a waiting publish and leave a translation
+    /// that already arrived off the screen for good.
+    private func flushPendingTranslationPublish() async {
+        guard transcriptPublishThrottle.takePending(at: .now) else { return }
+        translationPublishTask?.cancel()
+        translationPublishTask = nil
+        showTranscriptSnapshot(await transcriptBuffer.snapshot())
+    }
+
+    private func showTranscriptSnapshot(_ snapshot: [TranscriptSegment]) {
+        // Assigning an @Published value always redraws the overlay, even when
+        // nothing changed.
+        if overlayState.transcript != snapshot { overlayState.transcript = snapshot }
     }
 
     /// Receives the `TranslationSession` produced by the overlay's SwiftUI host
@@ -1620,6 +1651,9 @@ final class AppCoordinator {
         // A file read that ends in that gap must be dropped, even when switching back to
         // the session it was attached to, or the old context would be saved over this one.
         overlayState.sessionContextOwner = nil
+        translationPublishTask?.cancel()
+        translationPublishTask = nil
+        transcriptPublishThrottle.reset()
         overlayState.transcript = []
         overlayState.transcriptHistory = []
         overlayState.clearChat()
@@ -2638,7 +2672,6 @@ final class AppCoordinator {
 
         consumerTasks.append(Task { [weak self] in
             var transcriptsSeen = 0
-            var lastTranscriptUIPublish: ContinuousClock.Instant = .now
             // Per-channel throttle for live question scoring. Feeding the trigger
             // engine on every partial re-scores the same growing hypothesis dozens
             // of times a second; debouncing to ~0.5 s of new speech (while still
@@ -2699,7 +2732,7 @@ final class AppCoordinator {
                 // Republish the live transcript at ~3–4 Hz (was 10 Hz). Finals still
                 // publish immediately so a completed line never waits on the timer.
                 let now = ContinuousClock.now
-                if update.isFinal || now - lastTranscriptUIPublish >= .milliseconds(250) {
+                if update.isFinal || self?.transcriptPublishThrottle.isDue(at: now) ?? true {
                     let snapshot = await buffer.snapshot()
                     let evicted = await buffer.takeEvicted()
                     if !evicted.isEmpty, let state = self?.overlayState {
@@ -2711,7 +2744,7 @@ final class AppCoordinator {
                         if state.transcript != snapshot { state.transcript = snapshot }
                         state.transcriptCount = transcriptsSeen + 1
                     }
-                    lastTranscriptUIPublish = now
+                    self?.transcriptPublishThrottle.recordPublish(at: now)
                     // Feed the same snapshot to the translation queue. Diffing
                     // it against what was last translated is what makes
                     // containment merges and roll-ups — which rewrite rows

@@ -2021,6 +2021,41 @@ struct SmokeTestRunner {
             await expect(!gate.allow(at: t0 + .seconds(4)), "interval restarts from the last pass")
             gate.reset()
             await expect(gate.allow(at: t0 + .seconds(4)), "reset lets the next call pass")
+            await expect(gate.remaining(at: t0 + .seconds(5)) == .seconds(2), "remaining counts down from the last pass")
+            await expect(gate.remaining(at: t0 + .seconds(9)) == .zero, "remaining stops at zero")
+            gate.record(at: t0 + .seconds(9))
+            await expect(!gate.allow(at: t0 + .seconds(10)), "record starts a new interval")
+        }
+        await suite("TrailingPublishThrottle") {
+            let t0 = ContinuousClock.now
+            var throttle = TrailingPublishThrottle(interval: .milliseconds(250))
+            await expect(throttle.isDue(at: t0), "nothing published yet, so due at once")
+            await expect(!throttle.takePending(at: t0), "nothing to claim before a request")
+
+            await expect(throttle.requestPublish(), "change after a quiet spell asks for a publish")
+            await expect(throttle.remaining(at: t0) == .zero, "change after a quiet spell needs no wait")
+            await expect(throttle.takePending(at: t0), "publish is claimed")
+
+            await expect(throttle.requestPublish(), "change right after a publish still asks for one")
+            await expect(!throttle.requestPublish(), "second change joins the waiting publish")
+            await expect(!throttle.requestPublish(), "third change joins the waiting publish")
+            await expect(throttle.remaining(at: t0 + .milliseconds(100)) == .milliseconds(150), "trailing publish waits out the interval")
+            await expect(!throttle.isDue(at: t0 + .milliseconds(249)), "not due just inside the interval")
+
+            throttle.recordPublish(at: t0 + .milliseconds(200))
+            await expect(throttle.remaining(at: t0 + .milliseconds(250)) == .milliseconds(200), "a transcript publish pushes the trailing one back")
+            await expect(throttle.isDue(at: t0 + .milliseconds(450)), "due once a full interval has passed")
+            await expect(throttle.takePending(at: t0 + .milliseconds(450)), "trailing publish survives a transcript publish")
+            await expect(!throttle.takePending(at: t0 + .milliseconds(450)), "trailing publish happens once")
+
+            await expect(throttle.remaining(at: t0 + .milliseconds(460)) == .milliseconds(240), "claiming starts the interval")
+            await expect(throttle.requestPublish(), "change during the read asks for its own publish")
+            await expect(throttle.takePending(at: t0 + .milliseconds(460)), "stop can claim a waiting publish early")
+
+            _ = throttle.requestPublish()
+            throttle.reset()
+            await expect(!throttle.takePending(at: t0 + .milliseconds(470)), "reset drops the waiting publish")
+            await expect(throttle.isDue(at: t0 + .milliseconds(470)), "reset clears the interval")
         }
     }
 
