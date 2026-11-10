@@ -443,6 +443,18 @@ struct SmokeTestRunner {
     }
 
     static func runTranscriptHistoryCapSuite() async {
+        await suite("DetectedQuestionOrigin") {
+            let sessionA = SessionID(folderName: "session-a")
+            let sessionB = SessionID(folderName: "session-b")
+            let origin = DetectedQuestionOrigin(generation: 3, sessionID: sessionA)
+            await expect(origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: false), "same run and session can answer")
+            await expect(!origin.canAnswer(generation: 4, sessionID: sessionA, isAIPaused: false), "stop during the check blocks the answer")
+            await expect(!origin.canAnswer(generation: 5, sessionID: sessionB, isAIPaused: false), "another session opened during the check blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: sessionB, isAIPaused: false), "a session change alone blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: nil, isAIPaused: false), "losing the session blocks the answer")
+            await expect(!origin.canAnswer(generation: 3, sessionID: sessionA, isAIPaused: true), "paused AI blocks the answer")
+        }
+
         await suite("TranscriptHistoryCap") {
             await expect(TranscriptHistoryCap.capped([1, 2, 3], limit: 5) == [1, 2, 3], "under the limit stays whole")
             await expect(TranscriptHistoryCap.capped([1, 2, 3, 4, 5], limit: 3) == [3, 4, 5], "over the limit keeps the newest")
