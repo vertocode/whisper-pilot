@@ -196,6 +196,27 @@ extension SmokeTestRunner {
             await expect(opening.ids == [id], "an extra finish can't cancel out a later open")
         }
 
+        await suite("Session opens: only the newest open finishes") {
+            let b = SessionID(folderName: "b")
+            let c = SessionID(folderName: "c")
+            var gate = SessionOpenGate()
+            let openB = gate.begin()
+            await expect(gate.isCurrent(openB), "a lone open is current")
+            let openC = gate.begin()
+            await expect(!gate.isCurrent(openB), "opening C stops the earlier open of B")
+            await expect(gate.isCurrent(openC), "the newest open is current")
+            let openBAgain = gate.begin()
+            await expect(!gate.isCurrent(openB) && !gate.isCurrent(openC), "B then C then B: both earlier opens stop")
+            await expect(gate.isCurrent(openBAgain), "B then C then B: the last open of B wins")
+
+            await expect(gate.needsOpen(c, current: b), "a different session needs opening")
+            await expect(!gate.needsOpen(b, current: b), "the open session isn't reloaded")
+            gate.switched(to: b)
+            await expect(gate.needsOpen(b, current: b), "a session whose open stopped halfway is loaded again")
+            gate.finished()
+            await expect(!gate.needsOpen(b, current: b), "a fully opened session isn't reloaded")
+        }
+
         await suite("Sessions window: a session still opening is protected like the open one") {
             await runOpeningChecks()
         }

@@ -451,11 +451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // finishes and the session must not be deleted in the meantime.
         coordinator.openingSessions.begin(meta.id)
         Task {
-            // If a different session is already running, stop it first so we don't mix audio.
-            if coordinator.isRunning, coordinator.currentSession?.id != meta.id {
-                await coordinator.stopListening()
-            }
-            await coordinator.useSession(meta, resumed: resumed)
+            await coordinator.openSession(meta, resumed: resumed)
             coordinator.openingSessions.end(meta.id)
             // Hiding the window doesn't count as closing it, so the close handler won't do this.
             sessionsViewModel?.endSelectingSessions()

@@ -107,3 +107,27 @@ enum SessionCleanup {
         "\(count) session\(count == 1 ? "" : "s")"
     }
 }
+
+/// Keeps quick back-to-back session opens from mixing. Every open gets a number, and
+/// an older open stops at its next check once a newer one has been asked for.
+struct SessionOpenGate {
+    private(set) var latest = 0
+    /// Set while an open has switched to a session but not finished loading it. An open
+    /// that stops early leaves it set, so opening that session again loads it fully.
+    private var halfOpened: SessionID?
+
+    mutating func begin() -> Int {
+        latest += 1
+        return latest
+    }
+
+    func isCurrent(_ open: Int) -> Bool { open == latest }
+
+    func needsOpen(_ id: SessionID, current: SessionID?) -> Bool {
+        current != id || halfOpened == id
+    }
+
+    mutating func switched(to id: SessionID) { halfOpened = id }
+
+    mutating func finished() { halfOpened = nil }
+}

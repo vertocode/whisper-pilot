@@ -226,6 +226,9 @@ final class AppCoordinator {
     private var stopsInFlight = 0
     private(set) var currentSession: SessionMeta?
     var openingSessions = SessionCleanup.OpeningSessions()
+    private var openGate = SessionOpenGate()
+    /// The last open asked for. Each new open waits for it so two never run at once.
+    private var openTask: Task<Void, Never>?
     /// Sessions that must not be deleted: the current one and any still opening.
     var sessionIDsInUse: Set<SessionID> {
         var ids = openingSessions.ids
@@ -1621,16 +1624,35 @@ final class AppCoordinator {
         overlayState.isAIPaused.toggle()
     }
 
+    /// Opens a session from the Sessions window. Opens run one at a time, and an open
+    /// that a newer one has replaced stops at its next check instead of loading.
+    func openSession(_ session: SessionMeta, resumed: Bool) async {
+        let open = openGate.begin()
+        let previous = openTask
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, self.openGate.isCurrent(open) else { return }
+            // If a different session is already running, stop it first so we don't mix audio.
+            if self.isRunning, self.currentSession?.id != session.id {
+                await self.stopListening()
+            }
+            await self.useSession(session, resumed: resumed, open: open)
+        }
+        openTask = task
+        await task.value
+        if openGate.isCurrent(open) { openTask = nil }
+    }
+
     /// Activate a session — either fresh or resumed. Always wipes the overlay's live
     /// transcript and chat first so switching sessions never leaks the previous session's
     /// content into the new one's UI. On resume we then rehydrate both lanes from the
     /// session's `transcript.md` / `chat.md` and hand the raw markdown to the AI context
     /// so the model sees prior history on its next prompt.
-    func useSession(_ session: SessionMeta, resumed: Bool) async {
+    private func useSession(_ session: SessionMeta, resumed: Bool, open: Int) async {
         // Re-selecting the current session shouldn't wipe its in-memory state — that
         // would discard the live transcript the user is actively building. Just keep
         // running with whatever is already loaded.
-        if currentSession?.id == session.id { return }
+        guard openGate.needsOpen(session.id, current: currentSession?.id) else { return }
 
         // Flush any debounced session-context save BEFORE swapping `currentSession`.
         // Without this, a fast switch from A→B after typing in A would either lose
@@ -1642,6 +1664,7 @@ final class AppCoordinator {
         // session's transcript.md before we change `currentSession`, otherwise
         // the in-flight utterance would land in the new session's file.
         await flushPendingTranscriptLines()
+        guard openGate.isCurrent(open) else { return }
         // The just-persisted dedup memory belongs to the old session's file.
         transcriptPersistence.forgetPersistedLines()
         detectedBubbles.removeAll()
@@ -1654,6 +1677,7 @@ final class AppCoordinator {
             if overlayState.status == .starting { overlayState.status = .idle }
         }
         currentSession = session
+        openGate.switched(to: session.id)
         // The panel still shows the old session's context until the load below finishes.
         // A file read that ends in that gap must be dropped, even when switching back to
         // the session it was attached to, or the old context would be saved over this one.
@@ -1697,17 +1721,18 @@ final class AppCoordinator {
         // doesn't trigger a write back. Always set the published value, even when the
         // loaded context is empty, so the dropdown reflects the new session cleanly.
         let loadedContext = await SessionStore.shared.loadContext(session.id)
+        guard openGate.isCurrent(open) else { return }
         isLoadingSessionContext = true
         overlayState.sessionContext = loadedContext
         isLoadingSessionContext = false
-        // A newer switch may have started during the load. It sets the owner when it finishes.
-        if currentSession?.id == session.id { overlayState.sessionContextOwner = session.id }
+        overlayState.sessionContextOwner = session.id
 
         if resumed {
             let transcript = await SessionStore.shared.loadTranscriptMarkdown(session.id)
             let chat = await SessionStore.shared.loadChatMarkdown(session.id)
             let segments = await SessionStore.shared.loadTranscriptSegments(session.id)
             let messages = await SessionStore.shared.loadChatMessages(session.id)
+            guard openGate.isCurrent(open) else { return }
             // Saved lines go to the history list: the live list is replaced by the
             // buffer on every update, which would wipe them as soon as anyone spoke.
             overlayState.transcriptHistory = TranscriptHistoryCap.capped(segments)
@@ -1723,7 +1748,9 @@ final class AppCoordinator {
             await context.seedFromMarkdown(transcript: transcriptForAI, chat: chatForAI)
         }
 
+        guard openGate.isCurrent(open) else { return }
         await loadProjectHistory(for: session)
+        guard openGate.isCurrent(open) else { return }
 
         // Apply the session's stored model selection. On resume we honor the
         // value saved when the session was last used; on a brand-new session
@@ -1741,6 +1768,7 @@ final class AppCoordinator {
             await SessionStore.shared.setSelectedModel(settings.activeModel, for: session.id)
             currentSession?.selectedModel = settings.activeModel
         }
+        openGate.finished()
     }
 
     /// Called by the overlay's in-session model picker. Updates the global
