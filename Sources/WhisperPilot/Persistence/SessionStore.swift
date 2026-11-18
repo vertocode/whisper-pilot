@@ -300,6 +300,26 @@ actor SessionStore {
         }
     }
 
+    private func feedbackURL(_ id: SessionID) -> URL {
+        sessionFolder(for: id).appendingPathComponent("feedback.json")
+    }
+
+    func loadFeedback(_ id: SessionID) -> SessionFeedback? {
+        guard let data = try? Data(contentsOf: feedbackURL(id)) else { return nil }
+        return try? makeDecoder().decode(SessionFeedback.self, from: data)
+    }
+
+    func saveFeedback(_ feedback: SessionFeedback, for id: SessionID) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            try encoder.encode(feedback).write(to: feedbackURL(id), options: .atomic)
+        } catch {
+            log.error("Feedback save failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
     func transcriptByteCount(_ id: SessionID) -> Int {
         let url = sessionFolder(for: id).appendingPathComponent("transcript.md")
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)

@@ -84,6 +84,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("[WP] action.requestActionItems fired")
                 self?.coordinator.requestActionItems()
             },
+            requestPerformanceFeedback: { [weak self] regenerate in
+                self?.coordinator.requestPerformanceFeedback(regenerate: regenerate)
+            },
             goToSessions: { [weak self] in
                 print("[WP] action.goToSessions fired")
                 Task { [weak self] in

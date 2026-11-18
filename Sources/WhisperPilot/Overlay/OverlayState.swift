@@ -192,6 +192,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// default) — a screenshot of the current display is sent and the AI
         /// answers whatever question is visible.
         case answerScreen
+        /// User asked for feedback on their own performance in a finished session.
+        case performanceFeedback
         /// User-visible system note (e.g. "AI paused").
         case system
     }

@@ -1037,6 +1037,30 @@ struct OverlayView: View {
                     .help("Ask the AI to pull action items / commitments from the meeting. If none are found, it'll say so explicitly.")
                 }
 
+                // On-demand coaching on the user's own lines, once the session has ended.
+                if !state.status.isActive {
+                    Menu {
+                        Button("Feedback on my performance") { actions.requestPerformanceFeedback(false) }
+                        Button("Regenerate feedback") { actions.requestPerformanceFeedback(true) }
+                    } label: {
+                        HStack(spacing: WP.Space.xs) {
+                            Image(systemName: "person.wave.2")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("Feedback")
+                                .font(WP.TextStyle.micro)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.purple.opacity(0.18)))
+                        .overlay(Capsule().strokeBorder(Color.purple.opacity(0.45), lineWidth: 0.75))
+                        .foregroundStyle(Color.purple)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Ask the AI for feedback on how you did in this session. The result is saved with the session.")
+                }
+
                 Spacer(minLength: 0)
 
                 // Unobtrusive contribute link in the composer row. Compact form
@@ -1676,6 +1700,7 @@ private struct MessageBubble: View {
         case .summary: return "· summary"
         case .actionItems: return "· action items"
         case .answerScreen: return "· answer screen"
+        case .performanceFeedback: return "· my performance"
         case .userPrompt, .system: return nil
         }
     }

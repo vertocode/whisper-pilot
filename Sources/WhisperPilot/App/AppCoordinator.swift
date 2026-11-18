@@ -249,6 +249,9 @@ final class AppCoordinator {
     }
     /// Title-and-summary jobs started when a session ends, so one session never has two.
     private var wrapUpTasks: [SessionID: Task<Void, Never>] = [:]
+    /// The feedback reply being written, so a second click can't start another and a
+    /// session switch can stop it.
+    private var feedbackMessageID: UUID?
     /// Reopens onboarding. Set by `AppDelegate`; the coordinator calls it when
     /// something needs a permission, instead of asking macOS itself.
     var requestSetup: (() -> Void)?
@@ -1687,6 +1690,8 @@ final class AppCoordinator {
         transcriptPublishThrottle.reset()
         overlayState.transcript = []
         overlayState.transcriptHistory = []
+        if let id = feedbackMessageID { inFlightCompletions[id]?.cancel() }
+        feedbackMessageID = nil
         overlayState.clearChat()
         // `clearChat()` wipes the messages array but our tracked note IDs are
         // separate state — nil them out so the next `startListening` doesn't see
@@ -1971,6 +1976,55 @@ final class AppCoordinator {
                 history: self.filteredHistory(history)
             )
             await self.runCompletion(prompt: prompt, ai: ai, origin: .actionItems, sessionID: sessionID)
+        }
+    }
+
+    /// Feedback on the user's own lines for a finished session. Shows the saved feedback
+    /// when there is one; `regenerate` asks the model again and replaces it.
+    func requestPerformanceFeedback(regenerate: Bool) {
+        guard !isRunning, !isStartingUp, let session = currentSession else { return }
+        if let id = feedbackMessageID, inFlightCompletions[id] != nil { return }
+        let sessionID = session.id
+        Task { [weak self] in
+            guard let self else { return }
+            let store = SessionStore.shared
+            if !regenerate, let saved = await store.loadFeedback(sessionID), self.currentSession?.id == sessionID {
+                let id = self.overlayState.beginAssistantStream(origin: .performanceFeedback)
+                self.overlayState.replaceText(of: id, with: saved.text)
+                self.overlayState.finishAssistant(id: id)
+                return
+            }
+            guard let ai = self.aiProvider else {
+                self.overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
+                return
+            }
+            let bytes = await store.transcriptByteCount(sessionID)
+            let includeOther = self.settings.includeSystemAudioInPrompt
+            var transcript = await store.loadTranscriptMarkdown(sessionID)
+            if !includeOther { transcript = SessionStore.strippingOtherSpeaker(transcript) }
+            guard self.currentSession?.id == sessionID, !self.isRunning else { return }
+            guard let prompt = PerformanceFeedback.prompt(transcriptMarkdown: transcript) else {
+                self.overlayState.appendSystemNote("ℹ️ There is nothing from you in this session to give feedback on.", category: .ai)
+                return
+            }
+            wpInfo("[Coordinator] Performance feedback requested")
+            self.overlayState.status = .thinking
+            var messageID: UUID?
+            await self.runCompletion(
+                prompt: prompt, ai: ai, origin: .performanceFeedback, sessionID: sessionID,
+                onStart: { id in
+                    messageID = id
+                    self.feedbackMessageID = id
+                }
+            )
+            // The bubble is gone when another session opened meanwhile, so nothing is saved then.
+            guard let messageID,
+                  let text = self.overlayState.messages.first(where: { $0.id == messageID })?.text,
+                  PerformanceFeedback.isSavable(text) else { return }
+            await store.saveFeedback(
+                SessionFeedback(text: text, generatedAt: Date(), transcriptBytes: bytes, excludesOther: !includeOther),
+                for: sessionID
+            )
         }
     }
 

@@ -39,6 +39,7 @@ struct SmokeTestRunner {
         await runSaveHealthSuite()
         await runSessionCountCacheSuite()
         await runProjectsSuite()
+        await runPerformanceFeedbackSuite()
         await runFreezeSafetySuite()
         await runProjectDeletionSuite()
         await runSessionCleanupSuite()

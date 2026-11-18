@@ -25,6 +25,9 @@ struct OverlayActions {
     /// "Action items" button: AI pulls explicit commitments / TODOs from the
     /// transcript + AI chat, or reports that no action items are pending.
     var requestActionItems: () -> Void
+    /// Menu action for a finished session: AI feedback on the user's own lines.
+    /// `true` forces a new reply; `false` shows the saved one when there is one.
+    var requestPerformanceFeedback: (Bool) -> Void
     /// Stops listening, hides the overlay, brings the Sessions window back to front so
     /// the user can pick a different session or start a new one.
     var goToSessions: () -> Void
