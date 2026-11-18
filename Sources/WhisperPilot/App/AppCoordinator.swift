@@ -252,6 +252,7 @@ final class AppCoordinator {
     /// The feedback reply being written, so a second click can't start another and a
     /// session switch can stop it.
     private var feedbackMessageID: UUID?
+    private var feedbackRequestActive = false
     /// Reopens onboarding. Set by `AppDelegate`; the coordinator calls it when
     /// something needs a permission, instead of asking macOS itself.
     var requestSetup: (() -> Void)?
@@ -1983,12 +1984,19 @@ final class AppCoordinator {
     /// when there is one; `regenerate` asks the model again and replaces it.
     func requestPerformanceFeedback(regenerate: Bool) {
         guard !isRunning, !isStartingUp, let session = currentSession else { return }
-        if let id = feedbackMessageID, inFlightCompletions[id] != nil { return }
+        guard !feedbackRequestActive else { return }
+        feedbackRequestActive = true
         let sessionID = session.id
         Task { [weak self] in
             guard let self else { return }
+            defer { self.feedbackRequestActive = false }
             let store = SessionStore.shared
-            if !regenerate, let saved = await store.loadFeedback(sessionID), self.currentSession?.id == sessionID {
+            let includeOther = self.settings.includeSystemAudioInPrompt
+            let bytes = await store.transcriptByteCount(sessionID)
+            // Feedback written for an older transcript, or for different audio, is stale.
+            if !regenerate, let saved = await store.loadFeedback(sessionID),
+               saved.transcriptBytes == bytes, saved.excludesOther.map({ $0 == !includeOther }) ?? true,
+               self.currentSession?.id == sessionID {
                 let id = self.overlayState.beginAssistantStream(origin: .performanceFeedback)
                 self.overlayState.replaceText(of: id, with: saved.text)
                 self.overlayState.finishAssistant(id: id)
@@ -1998,8 +2006,6 @@ final class AppCoordinator {
                 self.overlayState.appendSystemNote(self.aiUnavailableNote, category: .ai)
                 return
             }
-            let bytes = await store.transcriptByteCount(sessionID)
-            let includeOther = self.settings.includeSystemAudioInPrompt
             var transcript = await store.loadTranscriptMarkdown(sessionID)
             if !includeOther { transcript = SessionStore.strippingOtherSpeaker(transcript) }
             guard self.currentSession?.id == sessionID, !self.isRunning else { return }
@@ -2010,15 +2016,18 @@ final class AppCoordinator {
             wpInfo("[Coordinator] Performance feedback requested")
             self.overlayState.status = .thinking
             var messageID: UUID?
+            var finishedCleanly = false
             await self.runCompletion(
                 prompt: prompt, ai: ai, origin: .performanceFeedback, sessionID: sessionID,
                 onStart: { id in
                     messageID = id
                     self.feedbackMessageID = id
-                }
+                },
+                onFinish: { finishedCleanly = true }
             )
             // The bubble is gone when another session opened meanwhile, so nothing is saved then.
-            guard let messageID,
+            // A cut-off or failed reply is not saved either.
+            guard finishedCleanly, let messageID,
                   let text = self.overlayState.messages.first(where: { $0.id == messageID })?.text,
                   PerformanceFeedback.isSavable(text) else { return }
             await store.saveFeedback(
@@ -3068,7 +3077,8 @@ final class AppCoordinator {
         sessionID: SessionID?,
         hasAttemptedFallback: Bool = false,
         replacingAnswer: UUID? = nil,
-        onStart: ((UUID) -> Void)? = nil
+        onStart: ((UUID) -> Void)? = nil,
+        onFinish: (() -> Void)? = nil
     ) async {
         // Reserve the assistant bubble + register the task BEFORE starting the stream
         // so concurrent completions each have their own slot in `inFlightCompletions`
@@ -3108,6 +3118,7 @@ final class AppCoordinator {
                     self.fillEmptyAssistant(messageId, with: "⚠️ The AI returned an empty reply.")
                 }
                 self.overlayState.finishAssistant(id: messageId)
+                if !emptyReply, finishReason.diagnosticMessage == nil { onFinish?() }
                 if let diagnostic = finishReason.diagnosticMessage {
                     // Non-clean finishes are loud failures the user needs to know
                     // about — otherwise a MAX_TOKENS cut looks like a model that
@@ -3151,7 +3162,8 @@ final class AppCoordinator {
                         sessionID: sessionID,
                         hasAttemptedFallback: true,
                         replacingAnswer: messageId,
-                        onStart: onStart
+                        onStart: onStart,
+                        onFinish: onFinish
                     )
                     return
                 }
