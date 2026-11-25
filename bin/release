@@ -177,10 +177,14 @@ command -v create-dmg >/dev/null || { echo "Missing create-dmg — run: brew ins
 
 # `xcodebuild` also ships with the Command Line Tools, so `command -v` passes even
 # without a full Xcode.app — but `xcodebuild archive` then dies deep into the run.
-# Detect that up front: if the active developer dir is a CommandLineTools instance
-# (or xcode-select can't resolve a real Xcode), fail here with a clear fix.
+# Detect that up front. Accept both /Applications/Xcode.app and the versioned
+# /Applications/Xcode_26.6.app layout used on GitHub-hosted runners. A previous
+# check looked for the literal substring "/Xcode.app/", which rejected the
+# versioned paths and aborted CI releases in seconds.
 XCODE_DEV_DIR="$(xcode-select -p 2>/dev/null || true)"
-if [[ "$XCODE_DEV_DIR" != *"/Xcode.app/"* ]] || ! xcodebuild -version >/dev/null 2>&1; then
+if [[ "$XCODE_DEV_DIR" == *CommandLineTools* ]] \
+    || [[ "$XCODE_DEV_DIR" != *".app/Contents/Developer" ]] \
+    || ! xcodebuild -version >/dev/null 2>&1; then
   echo "Error: full Xcode is required to archive, but the active developer directory is:" >&2
   echo "         ${XCODE_DEV_DIR:-<none>}" >&2
   echo "       Install Xcode, then point xcode-select at it:" >&2

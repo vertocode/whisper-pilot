@@ -52,16 +52,30 @@ If `gh auth login` is done once and you have push access to both `vertocode/whis
 9. *(unless `--build-only`)* **Creates GitHub Release** `v<version>` via `gh release create` and attaches the DMG
 10. *(unless `--skip-tap`)* **Clones the tap**, sed-bumps `version` + `sha256` in `Casks/whisper-pilot.rb`, commits, pushes
 
+## CI tests (no Mac required for day-to-day development)
+
+Code can be written on Linux or any machine. Full `swift build` + `swift run SmokeTests` run on a standard GitHub-hosted `macos-26` runner (free for this public repo) via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
+That workflow runs:
+
+- on pull requests into `main` (docs-only PRs are skipped)
+- when a `v*` tag is pushed (verification only — it does not publish a release)
+- on manual **Actions → CI → Run workflow**
+
+It does **not** run on every feature-branch push, so ordinary commits do not burn macOS minutes. Do not switch the job to a larger/paid runner label.
+
 ## CI release
 
-Identical behavior, but on a hosted macOS runner so you don't tie up your Mac for 5 minutes. Same `bin/release` script under the hood — see [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+Identical behavior to a local `./bin/release`, but on a hosted `macos-26` runner so you don't tie up a Mac. Same `bin/release` script under the hood — see [`.github/workflows/release.yml`](../.github/workflows/release.yml). Unsigned builds work with no signing secrets. The Homebrew tap update needs `TAP_REPO_TOKEN` (see below); without it the Release is still published and the tap step is skipped with a warning.
 
 Triggers:
 
 | How | What happens |
 | --- | --- |
-| Actions UI → Run workflow → type version | Workflow runs `./bin/release --version <input>` |
-| `git tag v0.2.0 && git push origin v0.2.0` | Same, version parsed from the tag |
+| Actions UI → Release → Run workflow → type version | Workflow runs `./bin/release --version <input>` |
+| `git tag v0.2.0 && git push origin v0.2.0` | Runs **CI tests only**. Does **not** publish a Release. |
+
+Tag-push used to trigger this same Release workflow, but that raced with a local `./bin/release`: the script's `gh release create` already created the `v*` tag, CI rebuilt a different binary, `--clobber`-ed the asset, and the tap SHA no longer matched. Keep publishing to the Actions button (or a local `./bin/release`).
 
 ## One-time setup
 
@@ -235,7 +249,8 @@ If you want Sparkle, add it later — it's a separate piece of work and isn't st
 - [ ] All wanted PRs merged to `main`.
 - [ ] Bump `CFBundleShortVersionString` in `Project.yml` if needed (the CI workflow passes `MARKETING_VERSION=<input>` to xcodebuild, so this is informational rather than required).
 - [ ] Update `docs/ROADMAP.md` (move shipped items out, add new ones).
-- [ ] Trigger the release: either **Actions → Release → Run workflow** with the version typed in, or `git tag vX.Y.Z && git push origin vX.Y.Z`.
-- [ ] Wait for the workflow to finish. It builds the DMG, creates the GitHub Release, and bumps the tap cask.
+- [ ] Confirm the CI workflow is green on the PR / on the commit you are shipping (`swift build` + SmokeTests on `macos-26`).
+- [ ] Trigger the release from **Actions → Release → Run workflow** with the version typed in. Do not rely on pushing a `v*` tag to publish — tags only run the test workflow, to avoid a race with local `./bin/release`.
+- [ ] Wait for the workflow to finish. It re-runs SmokeTests, builds the DMG, creates the GitHub Release, and bumps the tap cask (if `TAP_REPO_TOKEN` is set).
 - [ ] On a clean Mac (or after `brew uninstall --cask whisper-pilot`), verify:
       `brew install --cask vertocode/whisper-pilot/whisper-pilot` → the new version installs.

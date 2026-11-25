@@ -14,12 +14,14 @@ Run with ⌘R. The project does **not** require a paid Apple Developer account; 
 
 After every `git pull`, run `./bin/regenerate` so the `.xcodeproj` picks up any added or removed files. Skip it and Xcode will surface "Cannot find … in scope" errors for new types.
 
-You can also type-check and run smoke tests without Xcode:
+You can also type-check and run smoke tests without opening Xcode (a full Xcode / macOS SDK is still required to *compile* them):
 
 ```bash
 swift build                  # type-checks the whole module under Swift 6 strict concurrency
-swift run SmokeTests         # runs the pure-logic test suite (29 assertions)
+swift run SmokeTests         # runs the pure-logic test suite
 ```
+
+On a machine without macOS (for example Linux), write the code as usual and open a pull request into `main`. GitHub Actions runs `swift build` and the full smoke suite on a standard `macos-26` runner. That is the verification step; tests are not run on every push to a feature branch. A real `.app` / `.dmg` is produced only at release time (see [`RELEASE.md`](RELEASE.md)).
 
 `swift build` won't produce a runnable `.app` — entitlements and `Info.plist` live in `Project.yml`.
 
@@ -67,7 +69,7 @@ XCTest / swift-testing target is on the TODO list once Apple ships the Testing f
 
 - One concern per PR. A trigger heuristic tweak and a new LLM provider should not share a PR.
 - Update `docs/ARCHITECTURE.md` if you add a new module or change a public protocol.
-- Run `swift build` and `swift run SmokeTests` before submitting. If you touch a heuristic, add an assertion.
+- Run `swift build` and `swift run SmokeTests` before submitting if you have a Mac. Otherwise rely on the CI workflow on the PR. If you touch a heuristic, add an assertion.
 - Conventional commit message: `feat: …`, `fix: …`, `refactor: …`, `chore: …`, `docs: …`, `test: …`.
 
 ## Areas that especially need help

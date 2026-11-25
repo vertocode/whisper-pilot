@@ -37,7 +37,10 @@ jobs:
     # is gated at runtime with `@available(macOS 26.0, *)`. Older runners (macos-15
     # and below) ship an SDK that doesn't declare them, and the archive step fails
     # with "cannot find type 'SpeechAnalyzer' in scope".
+    # Standard hosted runner only (free on this public repo). Never use
+    # macos-*-large / *-xlarge / other paid labels.
     runs-on: macos-26
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
